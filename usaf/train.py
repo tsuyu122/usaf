@@ -1,240 +1,278 @@
 #!/usr/bin/env python3
-"""USAF: Ultra Sparse Adaptive Fine-Tuning — Universal MoE Trainer.
+"""USAF: Ultra Sparse Adaptive Fine-Tuning — Universal Training CLI.
 
-Supports: CUDA (NVIDIA), MPS (Apple), CPU fallback.
-Auto-detects MoE architecture from HuggingFace config.
+Supports any MoE model from HuggingFace. Auto-detects architecture and configures training.
 
 Usage:
     usaf train --model Qwen/Qwen3-30B-A3B --dataset data/train.jsonl
-    usaf train --config usaf_config.yaml
+    usaf train --model deepseek-ai/DeepSeek-MoE-16B --dataset data.jsonl --steps 360
+    python -m usaf.train --help
 """
-from __future__ import annotations
 import argparse, json, math, os, random, sys, time, gc
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
 
 import numpy as np
 import torch
+import torch.nn as nn
 import psutil
 
-# ── Device detection ──
-def get_device() -> torch.device:
-    """Auto-detect best available device: CUDA > MPS > CPU."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
-def get_device_count() -> int:
-    """Number of available GPUs."""
-    if torch.cuda.is_available():
-        return torch.cuda.device_count()
-    return 1
-
-# ── Model detection ──
-class ModelInfo:
-    """Extracted MoE architecture info from HuggingFace config."""
-    def __init__(self, model_path: str):
-        from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        
-        self.model_path = model_path
-        self.num_layers = getattr(cfg, 'num_hidden_layers', 0)
-        self.hidden_size = cfg.hidden_size
-        self.num_heads = getattr(cfg, 'num_attention_heads', 0)
-        self.num_kv_heads = getattr(cfg, 'num_key_value_heads', self.num_heads)
-        self.head_dim = getattr(cfg, 'head_dim', self.hidden_size // self.num_heads)
-        self.vocab_size = cfg.vocab_size
-        
-        # MoE-specific
-        self.num_experts = getattr(cfg, 'num_experts', 0)
-        self.num_experts_per_tok = getattr(cfg, 'num_experts_per_tok', 0)
-        self.expert_intermediate = getattr(cfg, 'moe_intermediate_size', 0)
-        self.is_moe = self.num_experts > 0
-        
-        # Memory estimation for training config
-        self._estimate_memory()
-    
-    def _estimate_memory(self):
-        """Estimate per-layer memory and auto-configure trainable layers."""
-        if not self.is_moe:
-            self.max_trainable_layers = 0
-            return
-        
-        # Estimate VRAM usage per trainable layer
-        expert_params = self.num_experts * (
-            self.hidden_size * self.expert_intermediate * 2 +  # gate_up + down
-            self.expert_intermediate * self.hidden_size
-        )
-        fp16_per_layer_gb = expert_params * 2 / 1e9
-        
-        # Available VRAM (conservative estimate)
-        if torch.cuda.is_available():
-            vram_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
-        else:
-            vram_gb = psutil.virtual_memory().total / 1e9
-        
-        # Reserve 60% for model + training
-        usable_gb = vram_gb * 0.6
-        
-        # Each trainable layer needs: q4 cache + resident fp16 + gradients + optimizer
-        per_layer_gb = fp16_per_layer_gb * 0.25 + 1.5  # ~1.5-2GB per layer
-        
-        self.max_trainable_layers = max(1, int(usable_gb / per_layer_gb))
-        self.estimated_vram_gb = vram_gb
-        self.estimated_per_layer_gb = per_layer_gb
+def ram() -> float:
+    return psutil.Process(os.getpid()).memory_info().rss / 1024**3
 
 
-# ── Config ──
-class USAFConfig:
-    """Training configuration with sensible defaults."""
-    def __init__(self, **kwargs):
-        # Model
-        self.model_path = kwargs.get("model_path", "Qwen/Qwen3-30B-A3B")
-        self.quant_path = kwargs.get("quant_path", "")
-        
-        # Training
-        self.seq_len = kwargs.get("seq_len", 512)
-        self.steps = kwargs.get("steps", 180)
-        self.epochs = kwargs.get("epochs", 0)
-        self.microbatch = kwargs.get("microbatch", 2)
-        self.accum = kwargs.get("accum", 1)
-        
-        # Sparsity
-        self.train_from = kwargs.get("train_from", 0)  # 0 = auto
-        self.frac = kwargs.get("frac", 0.005)
-        self.lr_peak = kwargs.get("lr_peak", 2e-4)
-        self.weight_decay = kwargs.get("weight_decay", 0.005)
-        
-        # RigL
-        self.reselect_every = kwargs.get("reselect_every", 50)
-        
-        # Features
-        self.use_frozen_cache = kwargs.get("use_frozen_cache", True)
-        self.frozen_cache_n = kwargs.get("frozen_cache_n", 0)
-        self.use_resident = kwargs.get("use_resident", True)
-        self.use_vk = kwargs.get("use_vk", False)  # Vulkan only on AMD
-        self.use_amp = kwargs.get("use_amp", True)  # CUDA mixed precision
-        
-        # Multi-GPU
-        self.multi_gpu = kwargs.get("multi_gpu", True)
-        
-        # Output
-        self.run_tag = kwargs.get("run_tag", "")
-        self.checkpoint_dir = kwargs.get("checkpoint_dir", "checkpoints")
-        self.log_dir = kwargs.get("log_dir", "logs")
+# ── CLI ──
+def build_parser():
+    p = argparse.ArgumentParser(description="USAF: Ultra Sparse Adaptive Fine-Tuning")
     
-    @classmethod
-    def from_cli(cls, args=None):
-        """Parse from command line or config file."""
-        if args is None:
-            parser = cls._build_parser()
-            args = parser.parse_args()
-        
-        if args.config:
-            with open(args.config) as f:
-                cfg_dict = json.load(f)
-        else:
-            cfg_dict = vars(args)
-        
-        return cls(**cfg_dict)
+    # Required
+    p.add_argument("--model", type=str, required=True,
+                   help="HuggingFace model ID or local path")
+    p.add_argument("--dataset", type=str, required=True,
+                   help="Path to JSONL dataset file")
     
-    @staticmethod
-    def _build_parser():
-        p = argparse.ArgumentParser(description="USAF: Ultra Sparse Adaptive Fine-Tuning")
-        p.add_argument("--config", type=str, help="JSON config file")
-        p.add_argument("--model-path", type=str, default="Qwen/Qwen3-30B-A3B")
-        p.add_argument("--dataset", type=str, default="data/train.jsonl")
-        p.add_argument("--quant-path", type=str, default="")
-        p.add_argument("--steps", type=int, default=180)
-        p.add_argument("--epochs", type=float, default=0)
-        p.add_argument("--seq-len", type=int, default=512)
-        p.add_argument("--microbatch", type=int, default=2)
-        p.add_argument("--accum", type=int, default=1)
-        p.add_argument("--frac", type=float, default=0.005)
-        p.add_argument("--lr-peak", type=float, default=2e-4)
-        p.add_argument("--train-from", type=int, default=0)
-        p.add_argument("--reselect-every", type=int, default=50)
-        p.add_argument("--run-tag", type=str, default="")
-        p.add_argument("--no-frozen-cache", action="store_true")
-        p.add_argument("--no-resident", action="store_true")
-        p.add_argument("--no-amp", action="store_true")
-        p.add_argument("--no-multi-gpu", action="store_true")
-        return p
+    # Quantization
+    p.add_argument("--quant-path", type=str, default="",
+                   help="Path to q4 experts file. Auto-detected if empty.")
+    
+    # Training
+    p.add_argument("--steps", type=int, default=180)
+    p.add_argument("--epochs", type=float, default=0,
+                   help="If >0, overrides --steps based on dataset size")
+    p.add_argument("--seq-len", type=int, default=512)
+    p.add_argument("--microbatch", type=int, default=2)
+    p.add_argument("--accum", type=int, default=1)
+    
+    # Sparsity
+    p.add_argument("--frac", type=float, default=0.005)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--wd", type=float, default=0.005)
+    p.add_argument("--train-from", type=int, default=0,
+                   help="First trainable layer (0=auto)")
+    p.add_argument("--reselect-every", type=int, default=50)
+    
+    # Features
+    p.add_argument("--no-frozen-cache", action="store_true")
+    p.add_argument("--no-resident", action="store_true")
+    p.add_argument("--frozen-cache-n", type=int, default=0)
+    p.add_argument("--eval-every", type=int, default=15)
+    
+    # Backend
+    p.add_argument("--cuda", action="store_true", default=None)
+    p.add_argument("--no-cuda", action="store_true", default=None)
+    p.add_argument("--no-amp", action="store_true")
+    p.add_argument("--no-multi-gpu", action="store_true")
+    
+    # Output
+    p.add_argument("--tag", type=str, default="")
+    p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    p.add_argument("--log-dir", type=str, default="logs")
+    
+    return p
 
 
-# ── Main training function ──
-def train(config: USAFConfig):
-    """Main USAF training loop."""
+# ── Configuration ──
+@dataclass
+class TrainConfig:
+    model_path: str
+    dataset_path: str
+    quant_path: str = ""
+    steps: int = 180
+    epochs: float = 0
+    seq_len: int = 512
+    microbatch: int = 2
+    accum: int = 1
+    frac: float = 0.005
+    lr_peak: float = 2e-4
+    weight_decay: float = 0.005
+    train_from: int = 0
+    reselect_every: int = 50
+    use_frozen_cache: bool = True
+    frozen_cache_n: int = 0
+    use_resident: bool = True
+    eval_every: int = 15
+    use_cuda: Optional[bool] = None
+    use_amp: bool = True
+    use_multi_gpu: bool = True
+    tag: str = ""
+    checkpoint_dir: str = "checkpoints"
+    log_dir: str = "logs"
+
+
+def parse_args(args=None) -> TrainConfig:
+    p = build_parser()
+    ns = p.parse_args(args)
     
-    # Device setup
-    device = get_device()
-    n_gpus = get_device_count()
-    use_multi_gpu = config.multi_gpu and n_gpus > 1 and device.type == "cuda"
+    # Resolve CUDA flag
+    use_cuda = ns.cuda
+    if use_cuda is None and ns.no_cuda:
+        use_cuda = False
+    if use_cuda is None:
+        use_cuda = torch.cuda.is_available()
     
-    print(f"=== USAF Universal Trainer ===")
-    print(f"Device: {device.type.upper()}" + (f" × {n_gpus}" if n_gpus > 1 else ""))
-    print(f"Model: {config.model_path}")
+    return TrainConfig(
+        model_path=ns.model,
+        dataset_path=ns.dataset,
+        quant_path=ns.quant_path,
+        steps=ns.steps,
+        epochs=ns.epochs,
+        seq_len=ns.seq_len,
+        microbatch=ns.microbatch,
+        accum=ns.accum,
+        frac=ns.frac,
+        lr_peak=ns.lr,
+        weight_decay=ns.wd,
+        train_from=ns.train_from,
+        reselect_every=ns.reselect_every,
+        use_frozen_cache=not ns.no_frozen_cache,
+        frozen_cache_n=ns.frozen_cache_n,
+        use_resident=not ns.no_resident,
+        eval_every=ns.eval_every,
+        use_cuda=use_cuda,
+        use_amp=not ns.no_amp,
+        use_multi_gpu=not ns.no_multi_gpu,
+        tag=ns.tag,
+        checkpoint_dir=ns.checkpoint_dir,
+        log_dir=ns.log_dir,
+    )
+
+
+# ── Device Setup ──
+def setup_device(config: TrainConfig) -> Tuple[torch.device, int, object]:
+    """Configure device, AMP scaler, and multi-GPU."""
+    if config.use_cuda:
+        assert torch.cuda.is_available(), "CUDA requested but not available"
+        device = torch.device("cuda")
+        n_gpus = torch.cuda.device_count()
+        
+        for i in range(n_gpus):
+            p = torch.cuda.get_device_properties(i)
+            print(f"  GPU {i}: {p.name} ({p.total_mem/1e9:.1f}GB)")
+        
+        scaler = torch.cuda.amp.GradScaler() if config.use_amp else None
+        if scaler:
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            print("  AMP + cuDNN benchmark enabled")
+    else:
+        try:
+            from usaf.qwen3moe_dml import patch_qwen3moe_for_dml
+            from usaf.utils import get_dml_device
+            patch_qwen3moe_for_dml()
+            import torch_directml_native
+            torch_directml_native.disable_tiled_resources(True)
+            device = get_dml_device()
+        except ImportError:
+            device = torch.device("cpu")
+        n_gpus = 1
+        scaler = None
     
-    # Detect model architecture
-    info = ModelInfo(config.model_path)
-    print(f"Architecture: {info.num_layers} layers, {info.hidden_size} hidden")
-    if info.is_moe:
-        print(f"MoE: {info.num_experts} experts × {info.num_experts_per_tok} active, "
-              f"intermediate={info.expert_intermediate}")
+    return device, n_gpus, scaler
+
+
+# ── Main ──
+def main(args=None):
+    config = parse_args(args)
     
-    # Auto-configure trainable layers
-    if config.train_from == 0:
-        if info.is_moe:
-            config.train_from = max(0, info.num_layers - info.max_trainable_layers)
-        else:
-            config.train_from = info.num_layers  # train all layers for dense models
-    train_layers = set(range(config.train_from, info.num_layers))
+    print("=" * 60)
+    print("USAF — Ultra Sparse Adaptive Fine-Tuning")
+    print("=" * 60)
     
-    print(f"Trainable layers: {len(train_layers)} ({config.train_from}-{info.num_layers-1})")
-    print(f"VRAM: {info.estimated_vram_gb:.0f}GB total, ~{info.estimated_per_layer_gb:.1f}GB/layer")
+    # Model detection
+    print(f"\nModel: {config.model_path}")
+    from usaf.model_factory import detect_model, get_trainable_layers, get_param_patterns, get_router_path
     
-    # Quant path
-    if not config.quant_path:
-        config.quant_path = f"{config.model_path.split('/')[-1]}-q4/experts_q4.pt"
+    vram = torch.cuda.get_device_properties(0).total_mem/1e9 if torch.cuda.is_available() else 0
+    moe_cfg = detect_model(config.model_path, vram_gb=vram)
+    
+    if not moe_cfg.is_moe:
+        print("Error: Model is not a Mixture-of-Experts architecture.")
+        print("USAF only supports MoE models (Qwen3-MoE, Mixtral, DeepSeek-MoE, OLMoE, etc.)")
+        sys.exit(1)
+    
+    print(f"Architecture: {moe_cfg.num_layers} layers, H={moe_cfg.hidden_size}, "
+          f"heads={moe_cfg.num_attention_heads}/{moe_cfg.num_key_value_heads}")
+    print(f"MoE: {moe_cfg.num_experts} experts, {moe_cfg.num_experts_per_tok} active, "
+          f"intermediate={moe_cfg.expert_intermediate}")
+    
+    # Configure trainable layers
+    train_layers = get_trainable_layers(moe_cfg, config.train_from)
+    print(f"Trainable: {len(train_layers)} layers "
+          f"({min(train_layers) if train_layers else 0}-{max(train_layers) if train_layers else 0})")
+    print(f"Param naming: {moe_cfg.expert_prefix} -> {moe_cfg.expert_param_names}")
+    print(f"Router: {moe_cfg.router_path}")
+    
+    # Device setup (must happen BEFORE model loading for DML patching)
+    print(f"\nBackend: {'CUDA' if config.use_cuda else 'DirectML/CPU'}")
+    device, n_gpus, scaler = setup_device(config)
+    
+    if config.use_multi_gpu and n_gpus > 1 and config.use_cuda:
+        print(f"Multi-GPU: DataParallel across {n_gpus} GPUs")
     
     # Dataset
-    dataset_path = config.dataset if hasattr(config, 'dataset') else "data/train.jsonl"
-    train_samples, eval_samples, heldout_samples = _load_dataset(dataset_path, config.seq_len)
+    print(f"\nDataset: {config.dataset_path}")
+    train_samples, eval_samples, heldout_samples = _load_dataset(
+        config.dataset_path, config.seq_len)
     
-    effective_batch = config.microbatch * config.accum
+    # Calculate steps from epochs if requested
     if config.epochs > 0:
+        eff_batch = config.microbatch * config.accum
         tokens_per_epoch = len(train_samples) * config.seq_len
-        config.steps = max(1, int(config.epochs * tokens_per_epoch / (effective_batch * config.seq_len)))
+        config.steps = max(1, int(config.epochs * tokens_per_epoch / (eff_batch * config.seq_len)))
     
-    print(f"Dataset: {len(train_samples)} train, {len(eval_samples)} eval samples")
-    print(f"Steps: {config.steps}, Batch: {config.microbatch}×{config.accum}={effective_batch}")
-    print(f"Tokens: {config.steps * effective_batch * config.seq_len:,}")
+    eff_batch = config.microbatch * config.accum
+    print(f"Steps: {config.steps}, Batch: {config.microbatch}×{config.accum}={eff_batch}")
+    print(f"Tokens: {config.steps * eff_batch * config.seq_len:,}")
     
-    # ── Model loading ──
+    # Quant path auto-detection
+    if not config.quant_path:
+        model_name = config.model_path.split("/")[-1]
+        config.quant_path = f"{model_name}-q4/experts_q4.pt"
+    print(f"Q4 weights: {config.quant_path}")
+    
+    # ── Load model ──
     print(f"\nLoading model...")
-    model, cache, q_dict = _load_model(config, info, device)
+    model, cache, q_dict, wf, st_path = _load_model(config, moe_cfg, device)
     
-    # Multi-GPU
-    if use_multi_gpu:
-        print(f"Multi-GPU: DataParallel across {n_gpus} GPUs")
-        model = torch.nn.DataParallel(model)
-        # Note: expert streaming hooks are registered per-module;
-        # DataParallel replicates the model, so hooks apply to all replicas.
+    if config.use_multi_gpu and n_gpus > 1 and config.use_cuda:
+        model = nn.DataParallel(model)
     
-    # ── Training setup ──
-    # ... (importance, active selection, masters, optimizer)
-    # This follows the same logic as train_qwen3_12h.py but with CUDA optimizations
+    # ── Build training metadata ──
+    param_patterns = get_param_patterns(moe_cfg)
+    _train_names = []
+    for li in sorted(train_layers):
+        _train_names.extend(param_patterns[li])
     
-    print(f"\nSetup complete. Starting training...")
-    print(f"(Full training loop implementation follows the same pattern as train_qwen3_12h.py)")
+    def _q_shape(fn):
+        e = q_dict[fn]
+        if isinstance(e, dict):
+            return tuple(e["shape"])
+        return tuple(e[3])
     
-    return model, info, config
+    _shapes = {fn: _q_shape(fn) for fn in _train_names}
+    
+    # ── Run training ──
+    print(f"\nStarting training...")
+    print(f"  Sparsity: {config.frac*100:.1f}%")
+    print(f"  RigL: every {config.reselect_every} steps")
+    print(f"  Resident: {config.use_resident}")
+    print(f"  Frozen cache: {config.use_frozen_cache}")
+    print(f"  RAM: {ram():.1f}GB\n")
+    
+    # Delegate to the existing training pipeline
+    _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
+                  train_samples, eval_samples, heldout_samples,
+                  _train_names, _shapes, train_layers)
+    
+    return model
 
 
 def _load_dataset(path: str, seq_len: int):
-    """Load tokenized dataset."""
+    """Load a JSONL dataset of tokenized sequences."""
+    import random as _random
     samples = []
     if os.path.exists(path):
         with open(path) as f:
@@ -249,88 +287,78 @@ def _load_dataset(path: str, seq_len: int):
                 except json.JSONDecodeError:
                     continue
     
-    random.seed(42)
-    random.shuffle(samples)
+    _random.seed(42)
+    _random.shuffle(samples)
     
     n_train = max(1, len(samples) - 20)
-    train = samples[:n_train]
-    eval_s = samples[n_train:n_train+10]
-    heldout = samples[n_train+10:n_train+20]
-    
-    return train, eval_s, heldout
+    return samples[:n_train], samples[n_train:n_train+10], samples[n_train+10:n_train+20]
 
 
-def _load_model(config: USAFConfig, info: ModelInfo, device: torch.device):
-    """Load model with streaming expert hooks."""
-    from transformers import AutoConfig, AutoTokenizer
+def _load_model(config: TrainConfig, moe_cfg, device: torch.device):
+    """Load model with quantized expert streaming."""
+    from transformers import AutoConfig
     from safetensors import safe_open
-    from usaf.moe_loader import QuantizedExpertCache
     
-    # Load config + model structure
     with torch.device("meta"):
         cfg = AutoConfig.from_pretrained(config.model_path, trust_remote_code=True)
-        # Try to load the model class dynamically
+        from transformers import AutoModelForCausalLM
         try:
-            from transformers import AutoModelForCausalLM
-            model = AutoModelForCausalLM.from_config(cfg)
+            model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
         except Exception:
-            # Fallback: try Qwen3Moe specifically
             from transformers.models.qwen3_moe import Qwen3MoeForCausalLM
             model = Qwen3MoeForCausalLM(cfg)
     
-    # Load weights from safetensors
-    st_path = config.model_path
-    if not os.path.isdir(st_path):
-        # HuggingFace hub path — use local cache
+    # Find safetensor files
+    import glob as _glob
+    if os.path.isdir(config.model_path):
+        st_path = config.model_path
+    else:
         from transformers.utils import cached_file
         st_path = str(Path(cached_file(config.model_path, "config.json")).parent)
     
-    st_files = sorted([f for f in os.listdir(st_path) if f.endswith(".safetensors")])
+    st_files = sorted(_glob.glob(os.path.join(st_path, "*.safetensors")))
     wf = {}
     for fn in st_files:
-        with safe_open(os.path.join(st_path, fn), framework="pt") as sf:
+        with safe_open(fn, framework="pt") as sf:
             for key in sf.keys():
-                wf[key] = fn
+                wf[key] = os.path.basename(fn)
     
     mp = dict(model.named_parameters())
     n_loaded = 0
     for name in sorted(wf.keys()):
-        if ".mlp.experts." in name:
+        if ".mlp.experts." in name or ".block_sparse_moe." in name:
             continue
         if name not in mp:
             continue
         with safe_open(os.path.join(st_path, wf[name]), framework="pt") as sf:
-            tensor = sf.get_tensor(name)
+            tensor = sf.get_tensor(name).half()
         parts = name.split(".")
         obj = model
         for p in parts[:-1]:
             obj = getattr(obj, p)
-        obj._parameters[parts[-1]] = torch.nn.Parameter(
-            tensor.to(device=device, dtype=torch.float16), requires_grad=False)
+        obj._parameters[parts[-1]] = nn.Parameter(
+            tensor.to(device=device), requires_grad=False)
         n_loaded += 1
     
-    # Load buffers
     for mn, mod in model.named_modules():
         for bn, b in list(mod._buffers.items()):
             if b is not None and b.device.type == "meta":
                 if bn == "inv_freq":
-                    hd_val = getattr(mod, "dim", getattr(mod, "head_dim", 128))
+                    hd_v = getattr(mod, "dim", getattr(mod, "head_dim", 128))
                     base = getattr(mod, "base", 1000000.0)
-                    inv = 1.0 / (base ** (torch.arange(0, hd_val, 2, dtype=torch.float32) / hd_val))
+                    inv = 1.0 / (base ** (torch.arange(0, hd_v, 2, dtype=torch.float32) / hd_v))
                     mod._buffers[bn] = inv.to(dtype=torch.float16, device=device)
-                else:
-                    mod._buffers[bn] = torch.zeros(b.shape, dtype=torch.float16, device=device)
     
-    print(f"  {n_loaded} non-expert params → GPU")
+    print(f"  {n_loaded} non-expert params loaded")
     
     # Load Q4 expert weights
-    import torch
     q_dict = torch.load(config.quant_path, map_location="cpu", weights_only=True)
+    from usaf.moe_loader import QuantizedExpertCache
     cache = QuantizedExpertCache(q_dict, device, max_cached=1, group_size=128)
     
     # Setup streaming hooks
     for mname, mod in model.named_modules():
-        if not mname.endswith(".mlp.experts"):
+        if not (mname.endswith(".mlp.experts") or mname.endswith(".block_sparse_moe.experts")):
             continue
         mod._parameters.clear()
         if hasattr(mod, '_buffers'):
@@ -352,13 +380,232 @@ def _load_model(config: USAFConfig, info: ModelInfo, device: torch.device):
         mod.register_forward_pre_hook(make_pre(mname))
         mod.register_forward_hook(make_post())
     
-    return model, cache, q_dict
+    return model, cache, q_dict, wf, st_path
 
 
-# ── CLI entry point ──
-def main():
-    config = USAFConfig.from_cli()
-    train(config)
+def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
+                  train_samples, eval_samples, heldout_samples,
+                  _train_names, _shapes, train_layers):
+    """Run the full training loop. Uses the same pipeline as train_qwen3_12h.py."""
+    
+    N_LAYERS = moe_cfg.num_layers
+    DETACH_AT = min(train_layers) - 1
+    MICROBATCH = config.microbatch
+    ACCUM = config.accum
+    SEQ = config.seq_len
+    FRAC = config.frac
+    LR_PEAK = config.lr_peak
+    WD = config.weight_decay
+    STEPS = config.steps
+    RESELECT_EVERY = config.reselect_every
+    USE_FROZEN_CACHE = config.use_frozen_cache
+    USE_RESIDENT = config.use_resident
+    
+    from usaf.moe_loader import TopKImportanceStore, SparseGradStore
+    from usaf.sparse_optim import SparseAdam
+    from usaf.quantization import dequantize_4bit
+    
+    # Hooks for grad capture
+    imp_store = TopKImportanceStore(_shapes, frac=FRAC)
+    for mname, mod in model.named_modules():
+        if not (mname.endswith(".mlp.experts") or mname.endswith(".block_sparse_moe.experts")):
+            continue
+        mod._grad_capture = (imp_store, mname)
+    
+    # Helper functions
+    def _unwrap():
+        return model.module if hasattr(model, 'module') else model
+    
+    def _qwen_layer(i):
+        return _unwrap().model.layers[i]
+    
+    def _experts_name(i):
+        return moe_cfg.expert_prefix.format(i=i)
+    
+    def _prelude(input_ids):
+        hidden = _unwrap().model.embed_tokens(input_ids) if hasattr(_unwrap(), 'model') else _unwrap().embed_tokens(input_ids)
+        s_len = hidden.shape[1]
+        pos_ids = torch.arange(s_len, device=device).unsqueeze(0)
+        rotary = _unwrap().model.rotary_emb if hasattr(_unwrap(), 'model') else _unwrap().rotary_emb
+        cos, sin = rotary(hidden, position_ids=pos_ids)
+        mask = torch.triu(
+            torch.full((s_len, s_len), torch.finfo(torch.float16).min, device=device, dtype=torch.float16),
+            diagonal=1).unsqueeze(0).unsqueeze(0)
+        return hidden, pos_ids, (cos, sin), mask
+    
+    def _head_loss(hidden, labels):
+        norm = _unwrap().model.norm if hasattr(_unwrap(), 'model') else _unwrap().norm
+        lm_head = _unwrap().lm_head
+        hidden = norm(hidden)
+        logits = lm_head(hidden)
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        return nn.functional.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    
+    def fwd_bwd_imp(sample):
+        ids = torch.tensor([sample["input_ids"]], dtype=torch.long).to(device)
+        lbl = torch.tensor([sample["labels"]], dtype=torch.long).to(device)
+        hidden, pos_ids, pe, mask = _prelude(ids)
+        for i in range(N_LAYERS):
+            hidden = _qwen_layer(i)(hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+        cache.evict_all()
+        h_last = hidden.detach().requires_grad_(True)
+        loss = _head_loss(h_last, lbl)
+        loss.backward()
+        return loss.item()
+    
+    # Importance phase
+    print("Importance phase...")
+    t0 = time.time()
+    N_IMP = 3 if not os.environ.get("SMOKE_N") else 1
+    for imp_i in range(N_IMP):
+        s = train_samples[imp_i % len(train_samples)]
+        loss_imp = fwd_bwd_imp(s)
+        print(f"  imp {imp_i+1}/{N_IMP} | loss {loss_imp:.4f} | {time.time()-t0:.0f}s")
+    
+    active_idx = imp_store.select(FRAC)
+    ta = sum(i.numel() for i in active_idx.values())
+    te = sum(math.prod(_shapes[fn]) for fn in active_idx if fn in _shapes)
+    print(f"Active: {ta:,}/{te:,} ({100*ta/max(te,1):.4f}%)")
+    
+    # Masters + overlays
+    masters = {}
+    for fname, aidx in active_idx.items():
+        aidx = aidx.reshape(-1).to(torch.long)
+        entry = q_dict.get(fname)
+        if entry is None:
+            continue
+        if isinstance(entry, dict):
+            t = dequantize_4bit(entry["q"], entry["s"], entry["z"], entry["shape"], group_size=128)
+        else:
+            t = dequantize_4bit(entry[0], entry[1], entry[2], entry[3], group_size=128)
+        vals = t.reshape(-1).index_select(0, aidx).float()
+        del t
+        p = nn.Parameter(vals, requires_grad=False)
+        masters[fname] = p
+        cache.overlays[fname] = (aidx, p)
+    
+    sparse_store = SparseGradStore(active_idx, _shapes)
+    for mname, mod in model.named_modules():
+        if not (mname.endswith(".mlp.experts") or mname.endswith(".block_sparse_moe.experts")):
+            continue
+        mod._grad_capture = (sparse_store, mname)
+    
+    if USE_RESIDENT:
+        cache.make_resident(train_layers)
+        cache.apply_resident_overlays(active_idx, masters)
+        cache._prefetch_disabled = True
+    
+    opt = SparseAdam(masters, active_idx=active_idx, lr=LR_PEAK, weight_decay=WD, compact_params=True)
+    print(f"Optimizer: {opt.optimizer_memory_mb:.1f}MB")
+    
+    # Training loop
+    def fwd_bwd(batch, zero_store=True):
+        if isinstance(batch, dict):
+            batch = [batch]
+        if zero_store:
+            sparse_store.zero_()
+        ids = torch.stack([torch.tensor(s["input_ids"], dtype=torch.long) for s in batch]).to(device)
+        lbl = torch.stack([torch.tensor(s["labels"], dtype=torch.long) for s in batch]).to(device)
+        hidden, pos_ids, pe, mask = _prelude(ids)
+        
+        with torch.no_grad():
+            for i in range(DETACH_AT + 1):
+                hidden = _qwen_layer(i)(hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+            cache.evict_all()
+            xs = []
+            for i in range(DETACH_AT + 1, N_LAYERS):
+                xs.append(hidden)
+                hidden = _qwen_layer(i)(hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+            cache.evict_all()
+        
+        h_last = hidden.detach().requires_grad_(True)
+        loss = _head_loss(h_last, lbl)
+        
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        
+        g = h_last.grad
+        for j in range(len(xs) - 1, -1, -1):
+            i = DETACH_AT + 1 + j
+            x2 = xs[j].detach().requires_grad_(True)
+            out = _qwen_layer(i)(x2, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+            out.backward(g)
+            g = x2.grad
+            cache.evict_all()
+        
+        return loss.item()
+    
+    losses = []
+    si = 0
+    t_start = time.time()
+    good_streak = 0
+    loss_scale = 4096.0
+    
+    print(f"\n=== Training ({STEPS} steps) ===\n")
+    for step in range(1, STEPS + 1):
+        t_step = time.time()
+        
+        if step <= max(1, int(STEPS * 0.05)):
+            lr = LR_PEAK * step / max(1, int(STEPS * 0.05))
+        else:
+            progress = (step - max(1, int(STEPS * 0.05))) / max(1, STEPS - max(1, int(STEPS * 0.05)))
+            lr = LR_PEAK * 0.1 + LR_PEAK * 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+        opt.lr = lr
+        
+        sparse_store.zero_()
+        step_loss = 0.0
+        
+        for a in range(ACCUM):
+            mb = []
+            for _ in range(MICROBATCH):
+                mb.append(train_samples[si % len(train_samples)])
+                si += 1
+                if si % len(train_samples) == 0:
+                    random.shuffle(train_samples)
+            lv = fwd_bwd(mb, zero_store=False)
+            step_loss += lv
+        
+        step_loss /= ACCUM
+        
+        denom = loss_scale * ACCUM
+        cg = {n: v / denom for n, v in sparse_store.compact.items()}
+        finite = all(torch.isfinite(v).all().item() for v in cg.values())
+        
+        if finite:
+            opt.step(compact_grads=cg)
+            if USE_RESIDENT:
+                cache.sync_resident(active_idx, masters)
+            good_streak += 1
+            if good_streak % 200 == 0:
+                loss_scale = min(loss_scale * 2, 65536.0)
+        else:
+            loss_scale = max(loss_scale / 2, 64.0)
+        
+        cache.evict_all()
+        losses.append(step_loss)
+        
+        dt = time.time() - t_step
+        pct = 100.0 * step / STEPS
+        eta_h = (STEPS - step) * dt / 3600
+        tok_s = ACCUM * MICROBATCH * SEQ / dt
+        
+        print(f"  {step:3d}/{STEPS} | loss {step_loss:.4f} | {tok_s:.0f} tok/s | "
+              f"LR {lr:.1e} | RAM {ram():.1f}G | ETA {eta_h:.1f}h", flush=True)
+    
+    t_total = time.time() - t_start
+    skipped = sum(1 for l in losses if not math.isfinite(l))
+    
+    print(f"\n=== Complete ===")
+    print(f"Time: {t_total/3600:.1f}h")
+    print(f"Loss: {losses[0]:.4f} -> {losses[-1]:.4f}")
+    print(f"Skipped: {skipped}/{STEPS} steps")
+    print(f"Peak RAM: {ram():.1f}GB")
+    
+    return losses
 
 
 if __name__ == "__main__":
