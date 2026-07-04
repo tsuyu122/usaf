@@ -120,8 +120,8 @@ These are the models USAF was designed for. I just don't have the GPUs.
 | **Qwen3-235B-A22B** | 235B | 22B | Yes | Same architecture as tested, 8× larger |
 | **Mistral Large 3** | 675B | 41B | Yes | 128 experts, Apache 2.0, Dec 2025 |
 | **Mixtral-8x22B** | 141B | 39B | Yes | Non-fused expert projections |
-| **DeepSeek-V4 Pro** | ~500B | ~40B | Est. | Latest DeepSeek MoE generation |
-| **Kimi K2.5** (Moonshot) | ~1T | ~50B | Est. | Largest open MoE ecosystem |
+| **DeepSeek-V4 Pro** | 1.6T | 49B | Yes | Latest DeepSeek MoE generation |
+| **Kimi K2.5** (Moonshot) | 1T | 32B | Yes | Largest open MoE ecosystem |
 
 Hardware needed: 4-8× A100 80GB or equivalent per model. If you have access and want to see USAF results on these, reach out via [GitHub Discussions](https://github.com/tsuyu122/usaf/discussions). I'll write the training code — you bring the GPUs.
 
