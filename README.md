@@ -115,13 +115,13 @@ Auto-detection works for any MoE model from HuggingFace — `config.json` is all
 
 These are the models USAF was designed for. I just don't have the GPUs.
 
-| Model | Parameters | Active | Why |
-|---|---|---|---|
-| **DeepSeek-V4 Pro** | ~500B+ | ~40B | Latest DeepSeek MoE |
-| **Kimi K2.6** (Moonshot) | ~1T | ~50B | Best open MoE available |
-| **GLM-4 MoE** (Zhipu) | ~400B | ~30B | Different architecture lineage |
-| **Qwen3-235B** | 235B | 22B | Same family as tested, 8× larger |
-| **Mixtral-8x22B** | 141B | 39B | Non-fused expert projections |
+| Model | Parameters | Active | Verified | Why |
+|---|---|---|---|---|---|
+| **Qwen3-235B-A22B** | 235B | 22B | Yes | Same architecture as tested, 8× larger |
+| **Mistral Large 3** | 675B | 41B | Yes | 128 experts, Apache 2.0, Dec 2025 |
+| **Mixtral-8x22B** | 141B | 39B | Yes | Non-fused expert projections |
+| **DeepSeek-V4 Pro** | ~500B | ~40B | Est. | Latest DeepSeek MoE generation |
+| **Kimi K2.5** (Moonshot) | ~1T | ~50B | Est. | Largest open MoE ecosystem |
 
 Hardware needed: 4-8× A100 80GB or equivalent per model. If you have access and want to see USAF results on these, reach out via [GitHub Discussions](https://github.com/tsuyu122/usaf/discussions). I'll write the training code — you bring the GPUs.
 
