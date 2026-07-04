@@ -1,0 +1,64 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Apply RoPE (HF rotate_half / half-split format) to Q and K — Qwen3/Llama style.
+// cos/sin have shape [S, hd], duplicated halves: cos[i]==cos[i+hd/2].
+// HF formula: rotate_half(x) = cat([-x[hd/2:], x[:hd/2]]); out = x*cos + rotate_half(x)*sin
+// i.e. for i<hd/2: out[i]=x[i]*cos[i]-x[i+hd/2]*sin[i]; for i>=hd/2: out[i]=x[i]*cos[i]+x[i-hd/2]*sin[i]
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Q { float16_t q[]; };
+layout(set = 0, binding = 1) readonly buffer K { float16_t k[]; };
+layout(set = 0, binding = 2) readonly buffer Cos { float16_t c[]; };
+layout(set = 0, binding = 3) readonly buffer Sin { float16_t s[]; };
+layout(set = 0, binding = 4) writeonly buffer QOut { float16_t qo[]; };
+layout(set = 0, binding = 5) writeonly buffer KOut { float16_t ko[]; };
+
+layout(push_constant) uniform P { uint B; uint nH; uint nKV; uint S; uint hd; } pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total_q_elem = pc.B * pc.nH * pc.S * pc.hd;
+    uint total_k_elem = pc.B * pc.nKV * pc.S * pc.hd;
+    uint hd2 = pc.hd >> 1;
+
+    // Process Q: one thread per element
+    if (gid < total_q_elem) {
+        uint token_idx = gid / pc.hd;
+        uint elem_idx = gid % pc.hd;
+        uint s_pos = token_idx % pc.S;
+
+        float x_val = float(q[gid]);
+        float c_val = float(c[s_pos * pc.hd + elem_idx]);
+        float s_val = float(s[s_pos * pc.hd + elem_idx]);
+
+        float x_rot;
+        if (elem_idx < hd2) {
+            x_rot = -float(q[token_idx * pc.hd + elem_idx + hd2]);
+        } else {
+            x_rot = float(q[token_idx * pc.hd + elem_idx - hd2]);
+        }
+        qo[gid] = float16_t(x_val * c_val + x_rot * s_val);
+    }
+
+    // Process K
+    if (gid < total_k_elem) {
+        uint token_idx = gid / pc.hd;
+        uint elem_idx = gid % pc.hd;
+        uint s_pos = token_idx % pc.S;
+
+        float x_val = float(k[gid]);
+        float c_val = float(c[s_pos * pc.hd + elem_idx]);
+        float s_val = float(s[s_pos * pc.hd + elem_idx]);
+
+        float x_rot;
+        if (elem_idx < hd2) {
+            x_rot = -float(k[token_idx * pc.hd + elem_idx + hd2]);
+        } else {
+            x_rot = float(k[token_idx * pc.hd + elem_idx - hd2]);
+        }
+        ko[gid] = float16_t(x_val * c_val + x_rot * s_val);
+    }
+}

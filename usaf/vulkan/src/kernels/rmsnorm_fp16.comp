@@ -1,0 +1,70 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer X { float16_t x[]; };
+layout(set = 0, binding = 1) readonly buffer W { float16_t w[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float16_t y[]; };
+
+layout(push_constant) uniform P { uint rows; uint cols; float eps; } pc;
+
+// Max subgroups = ceil(wg_size / min_subgroup_size) = 256/32 = 8
+// Only first (gl_WorkGroupSize.x / gl_SubgroupSize) entries are used at runtime
+shared float s_sums[8];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.cols;
+    uint sg = gl_SubgroupID;   // 0,1,2,3
+    uint sg_lane = gl_SubgroupInvocationID; // 0..63
+
+    // Step 1: per-thread partial sum
+    float sum_sq = 0.0;
+    for (uint i = tid; i < pc.cols; i += 256) {
+        float val = float(x[base + i]);
+        sum_sq += val * val;
+    }
+
+    // Step 2: subgroup reduction (wave64)
+    sum_sq = subgroupAdd(sum_sq);
+
+    // Step 3: cross-subgroup reduction using shared memory
+    if (sg_lane == 0) {
+        s_sums[sg] = sum_sq;
+    }
+    barrier();
+    memoryBarrierShared();
+
+    // Only subgroup 0 lane 0 collects and computes rms
+    float rms_val = 0.0;
+    if (sg == 0 && sg_lane == 0) {
+        uint num_sg = gl_WorkGroupSize.x / gl_SubgroupSize;
+        float total = 0.0;
+        for (uint i = 0; i < num_sg; i++) {
+            total += s_sums[i];
+        }
+        rms_val = 1.0 / sqrt(total / float(pc.cols) + pc.eps);
+    }
+
+    // Broadcast rms_val to all threads
+    // Subgroup 0 lane 0 writes, then all threads read from shared
+    if (sg == 0 && sg_lane == 0) {
+        s_sums[0] = rms_val;
+    }
+    barrier();
+
+    rms_val = s_sums[0];
+
+    // Step 4: normalize and apply weight
+    for (uint i = tid; i < pc.cols; i += 256) {
+        float val = float(x[base + i]) * rms_val * float(w[i]);
+        y[base + i] = float16_t(val);
+    }
+}

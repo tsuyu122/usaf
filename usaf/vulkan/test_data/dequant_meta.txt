@@ -1,0 +1,5 @@
+out_features=1536
+in_features=2048
+group_size=128
+q4_bytes=1572864
+q4_shape=1536,1024

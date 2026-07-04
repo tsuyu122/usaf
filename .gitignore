@@ -1,0 +1,57 @@
+# Dependencies
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Checkpoints & logs
+checkpoints/
+logs/
+results/*.json
+!results/.gitkeep
+
+# Large data files
+*.safetensors
+*.pt
+*.bin
+!data/.gitkeep
+
+# Vulkan build artifacts
+usaf/vulkan/build/
+usaf/vulkan/build/_deps/
+
+# Kaggle
+kaggle_kernel/
+
+# Test artifacts
+*_smoke*
+*_test_*
+*.npy
+*.npz
+bench/
+
+# Environment
+.env
+.kilo/
+.claude/

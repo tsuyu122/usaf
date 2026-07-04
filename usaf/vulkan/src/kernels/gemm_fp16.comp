@@ -1,0 +1,142 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Tiled GEMM with f16vec4 vectorized loads for higher memory throughput
+// TILE_M=128, TILE_N=128, TILE_K=32, 256 threads (16x16)
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer A { float16_t a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float16_t b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float16_t c[]; };
+
+layout(push_constant) uniform Push { uint M; uint K; uint N; } pc;
+
+#define TILE_M 128
+#define TILE_N 128
+#define TILE_K 32
+
+shared float16_t sA[TILE_M * TILE_K];
+shared float16_t sB[TILE_K * TILE_N];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint tid = ty * 16 + tx;
+
+    uint m_block = gl_WorkGroupID.y * TILE_M;
+    uint n_block = gl_WorkGroupID.x * TILE_N;
+    uint m_local = ty * 8;
+    uint n_local = tx * 8;
+
+    float acc[8][8];
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
+            acc[i][j] = 0.0f;
+
+    uint k_blocks = (pc.K + TILE_K - 1) / TILE_K;
+
+    for (uint kb = 0; kb < k_blocks; kb++) {
+        uint k_start = kb * TILE_K;
+
+        // Vectorized load sA: 4 elements per thread per iteration (f16vec4)
+        // 256 threads, TILE_M*TILE_K=4096 elements, each loads 4096/256=16 elements
+        // Using f16vec4: 16/4 = 4 iterations per thread
+        for (uint vi = tid * 4; vi < TILE_M * TILE_K; vi += 256 * 4) {
+            uint m = vi / TILE_K;
+            uint k = vi % TILE_K;
+            uint gm = m_block + m;
+            uint gk = k_start + k;
+            if (gm < pc.M && gk + 3 < pc.K) {
+                f16vec4 vals = f16vec4(
+                    a[gm * pc.K + gk],     a[gm * pc.K + gk + 1],
+                    a[gm * pc.K + gk + 2], a[gm * pc.K + gk + 3]
+                );
+                sA[vi]     = vals.x;
+                sA[vi + 1] = vals.y;
+                sA[vi + 2] = vals.z;
+                sA[vi + 3] = vals.w;
+            } else {
+                for (uint j = 0; j < 4; j++) {
+                    uint gk_j = gk + j;
+                    sA[vi + j] = (gm < pc.M && gk_j < pc.K) ? a[gm * pc.K + gk_j] : float16_t(0.0f);
+                }
+            }
+        }
+
+        // Vectorized load sB: 4 elements per thread per iteration
+        for (uint vi = tid * 4; vi < TILE_K * TILE_N; vi += 256 * 4) {
+            uint k = vi / TILE_N;
+            uint n = vi % TILE_N;
+            uint gk = k_start + k;
+            uint gn = n_block + n;
+            if (gk < pc.K && gn + 3 < pc.N) {
+                f16vec4 vals = f16vec4(
+                    b[gk * pc.N + gn],     b[gk * pc.N + gn + 1],
+                    b[gk * pc.N + gn + 2], b[gk * pc.N + gn + 3]
+                );
+                sB[vi]     = vals.x;
+                sB[vi + 1] = vals.y;
+                sB[vi + 2] = vals.z;
+                sB[vi + 3] = vals.w;
+            } else {
+                for (uint j = 0; j < 4; j++) {
+                    uint gn_j = gn + j;
+                    sB[vi + j] = (gk < pc.K && gn_j < pc.N) ? b[gk * pc.N + gn_j] : float16_t(0.0f);
+                }
+            }
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        // Compute: unrolled 8x8 MACs over TILE_K
+        for (uint kk = 0; kk < TILE_K; kk++) {
+            uint a_row_base = m_local * TILE_K + kk;
+            uint b_row_base = kk * TILE_N + n_local;
+
+            float a0 = float(sA[a_row_base + 0 * TILE_K]);
+            float a1 = float(sA[a_row_base + 1 * TILE_K]);
+            float a2 = float(sA[a_row_base + 2 * TILE_K]);
+            float a3 = float(sA[a_row_base + 3 * TILE_K]);
+            float a4 = float(sA[a_row_base + 4 * TILE_K]);
+            float a5 = float(sA[a_row_base + 5 * TILE_K]);
+            float a6 = float(sA[a_row_base + 6 * TILE_K]);
+            float a7 = float(sA[a_row_base + 7 * TILE_K]);
+
+            float b0 = float(sB[b_row_base + 0]);
+            float b1 = float(sB[b_row_base + 1]);
+            float b2 = float(sB[b_row_base + 2]);
+            float b3 = float(sB[b_row_base + 3]);
+            float b4 = float(sB[b_row_base + 4]);
+            float b5 = float(sB[b_row_base + 5]);
+            float b6 = float(sB[b_row_base + 6]);
+            float b7 = float(sB[b_row_base + 7]);
+
+            #define MAC(i, j) acc[i][j] += a##i * b##j
+            MAC(0,0); MAC(0,1); MAC(0,2); MAC(0,3); MAC(0,4); MAC(0,5); MAC(0,6); MAC(0,7);
+            MAC(1,0); MAC(1,1); MAC(1,2); MAC(1,3); MAC(1,4); MAC(1,5); MAC(1,6); MAC(1,7);
+            MAC(2,0); MAC(2,1); MAC(2,2); MAC(2,3); MAC(2,4); MAC(2,5); MAC(2,6); MAC(2,7);
+            MAC(3,0); MAC(3,1); MAC(3,2); MAC(3,3); MAC(3,4); MAC(3,5); MAC(3,6); MAC(3,7);
+            MAC(4,0); MAC(4,1); MAC(4,2); MAC(4,3); MAC(4,4); MAC(4,5); MAC(4,6); MAC(4,7);
+            MAC(5,0); MAC(5,1); MAC(5,2); MAC(5,3); MAC(5,4); MAC(5,5); MAC(5,6); MAC(5,7);
+            MAC(6,0); MAC(6,1); MAC(6,2); MAC(6,3); MAC(6,4); MAC(6,5); MAC(6,6); MAC(6,7);
+            MAC(7,0); MAC(7,1); MAC(7,2); MAC(7,3); MAC(7,4); MAC(7,5); MAC(7,6); MAC(7,7);
+            #undef MAC
+        }
+
+        barrier();
+        memoryBarrierShared();
+    }
+
+    for (uint mi = 0; mi < 8; mi++) {
+        uint gm = m_block + m_local + mi;
+        if (gm >= pc.M) continue;
+        for (uint ni = 0; ni < 8; ni++) {
+            uint gn = n_block + n_local + ni;
+            if (gn >= pc.N) continue;
+            c[gm * pc.N + gn] = float16_t(acc[mi][ni]);
+        }
+    }
+}
