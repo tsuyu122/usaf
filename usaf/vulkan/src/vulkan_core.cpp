@@ -195,12 +195,12 @@ void upload_buffer(ComputeContext& ctx, Buffer& buf, const void* data, vk::Devic
 }
 
 void download_buffer(ComputeContext& ctx, Buffer& buf, void* data, vk::DeviceSize size) {
-    assert(buf.mapped && "Buffer must be host-visible");
     if (!buf.is_coherent) {
-        vk::MappedMemoryRange range(buf.memory, 0, size);
-        ctx.device.invalidateMappedMemoryRanges(range);
+        vk::MappedMemoryRange mmr(buf.memory, 0, size);
+        ctx.device.invalidateMappedMemoryRanges(mmr);
     }
-    std::memcpy(data, buf.mapped, size);
+    if (size > buf.size) size = buf.size;
+    memcpy(data, buf.mapped, size);
 }
 
 void destroy_buffer(ComputeContext& ctx, Buffer& buf) {

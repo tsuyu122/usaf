@@ -218,7 +218,7 @@ class QuantizedExpertCache:
                 import usaf_vk
                 q_h, s_h, z_h, out_rows, in_feats, total_elems = vk_info
                 usaf_vk.dequant_pipe(q_h, s_h, z_h, self._vk_out_buf, out_rows, in_feats, 128)
-                usaf_vk.barrier()  # required: download_buffer doesn't wait for GPU
+                usaf_vk.barrier()
                 raw = usaf_vk.download(self._vk_out_buf, [out_rows, in_feats])
                 shape = entry[3] if isinstance(entry, tuple) else entry["shape"]
                 t = torch.from_numpy(np.ascontiguousarray(raw.view(np.float16))).reshape(shape)
