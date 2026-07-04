@@ -118,16 +118,17 @@ Auto-detection reads `config.json` from HuggingFace and extracts expert counts, 
 
 ## Models I Want to Test
 
-These models are next on my list. I built USAF for them — I just don't have the hardware to run them yet.
+These are the models USAF was designed for. I just don't have the hardware to run them yet.
 
-| Model | Parameters | Active | Why |
+| Model | Parameters | Active | Why It Matters |
 |---|---|---|---|
-| **DeepSeek-V3** | 671B | 37B | Largest open MoE. Would validate USAF at extreme scale |
-| **Qwen3-235B-A22B** | 235B | 22B | Qwen family. Same architecture, 8× larger |
-| **Mixtral-8x22B** | 141B | 39B | Different expert structure (non-fused projections) |
-| **DeepSeek-R1** | 671B | 37B | Reasoning-focused MoE. Router training impact on chain-of-thought |
+| **DeepSeek-V4 Pro** | ~500B+ | ~40B | Latest DeepSeek MoE. State of the art for code generation |
+| **Kimi K2** (Moonshot) | ~1T | ~50B | Largest open MoE. Would push USAF to its limits |
+| **GLM-4 MoE** (Zhipu) | ~400B | ~30B | Different architecture (non-Qwen lineage). Validates model factory |
+| **Qwen3-235B-A22B** | 235B | 22B | Same architecture as tested, 8× larger |
+| **Mixtral-8x22B** | 141B | 39B | Non-fused expert projections — tests streaming on different layouts |
 
-Hardware needed per model: 4-8× A100 80GB or equivalent. If you have access and want to see USAF results on these models, reach out on [GitHub Discussions](https://github.com/tsuyu122/usaf/discussions) or open an issue. I'll handle the training code — you handle the GPUs.
+Hardware needed: 4-8× A100 80GB or equivalent per model. If you have access to this kind of compute and want to see USAF results on frontier models, reach out on [GitHub Discussions](https://github.com/tsuyu122/usaf/discussions). I'll handle the training code — you handle the GPUs.
 
 ## Universal CLI
 
