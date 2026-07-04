@@ -1,8 +1,15 @@
 import torch
-import torch_directml
+try:
+    import torch_directml
+    HAS_DML = True
+except ImportError:
+    HAS_DML = False
+    torch_directml = None
 
 
 def get_dml_device(device_id: int = 0) -> torch.device:
+    if not HAS_DML:
+        raise RuntimeError("torch-directml not installed. Use CUDA or CPU instead.")
     return torch_directml.device(device_id)
 
 
