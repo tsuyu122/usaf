@@ -116,7 +116,7 @@ Auto-detection works for any MoE model from HuggingFace — `config.json` is all
 These are the models USAF was designed for. I just don't have the GPUs.
 
 | Model | Parameters | Active | Verified | Why |
-|---|---|---|---|---|---|
+|---|---|---|---|---|
 | **DeepSeek-V4 Pro** | 1.6T | 49B | Yes | Latest DeepSeek, MIT license, Apr 2026 |
 | **Kimi K2.5** (Moonshot) | 1T | 32B | Yes | Native multimodal (vision+text), Feb 2026 |
 | **Mistral Large 3** | 675B | 41B | Yes | Apache 2.0, Dec 2025 |
