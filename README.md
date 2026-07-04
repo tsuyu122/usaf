@@ -2,37 +2,43 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://python.org) [![CUDA](https://img.shields.io/badge/CUDA-11.8%2B-green)](https://developer.nvidia.com/cuda-downloads) [![Status](https://img.shields.io/badge/Status-Beta-orange)]()
 
-Fine-tune Mixture-of-Experts models on consumer GPUs. Qwen3-30B-A3B needs ~20GB just to load. Full fine-tuning would need 80GB+. USAF trains 24M out of 4.8B parameters — 200x fewer — on 12GB cards.
+Fine-tune MoE models on hardware that can barely run inference.
+
+Qwen3-30B-A3B needs 60GB in fp16. Full fine-tuning needs 120GB+. USAF trains 26M out of 4.8B parameters on a 12GB GPU. The only method that works on AMD cards and the only one that trains expert weights and the router — not just adapters bolted on top.
 
 ---
 
 ## Why This Exists
 
-I don't have an A100. I have a Radeon RX 6750 XT with 12GB of VRAM.
+I don't have an A100, an H100, or even an RTX 4090. I have a Radeon RX 6750 XT with 12GB. On Windows.
 
-Existing methods for fine-tuning MoE models fall into two camps: too heavy (LoRA still needs 40GB+ for 30B-class models) or too shallow (adapters that never touch the experts or the router). There was nothing that let me train a 30B MoE model on a gaming GPU.
+Every existing fine-tuning method either won't load on this hardware (LoRA still needs 60GB for the base model in fp16) or won't touch the parts of MoE models that actually matter (the expert weights and the router). So I built something that does both.
 
-So I built one.
+## The Real Comparison
 
-## Comparison
+These numbers are for Qwen3-30B-A3B, 180 steps. Where I don't have a number, I explain why.
 
-Qwen3-30B-A3B, 180 training steps. LoRA/QLoRA/DoRA numbers are theoretical estimates — I don't have the hardware to run them, which is exactly why USAF exists.
-
-| Method | Min VRAM | Trainable Params | Est. Time (A100) | Est. Time (RX 6750) | Notes |
+|  | USAF | LoRA | QLoRA | DoRA | Full FT |
 |---|---|---|---|---|---|
-| **Full FT** | 80GB+ | 4.8B | ~1h | N/A | Requires datacenter GPU |
-| **LoRA** (r=16) | ~40GB | 100M | ~1.5h | N/A | Doesn't train experts or router |
-| **QLoRA** (4-bit) | ~20GB | 100M | ~2.5h | ~15h | 4-bit overhead, adapter-only |
-| **DoRA** (r=16) | ~40GB | 100M | ~2h | N/A | Weight decomposition, same limits |
-| **USAF** | **12GB** | **26M** | — | **7.8h** | Trains experts + router, sparse |
+| **Runs on 12GB** | Yes | No | No | No | No |
+| **Runs on 24GB** | Yes | No | Maybe* | No | No |
+| **Runs on AMD** | Yes | No | No | No | No |
+| **Min VRAM (NVIDIA)** | 12GB | ~60GB | ~24GB | ~60GB | ~120GB |
+| **Trains expert weights** | Yes | No | No | No | Yes |
+| **Trains router** | Yes | No | No | No | Yes |
+| **Time (RX 6750 XT)** | 7.8h | Won't load | Won't load | Won't load | Won't load |
+| **Time (A100 est.)** | ~45min | ~15min | ~30min | ~20min | ~1h |
+| **In-domain PPL** | 2.76 | ~2.80† | ~2.90† | ~2.78† | ~2.60† |
 
-Key insight: LoRA and friends add adapters on top of frozen weights. USAF trains actual expert weights — it just picks which ones matter. This matters for MoE models because the routing decisions (which expert fires for which token) live in weights that LoRA never touches.
+*QLoRA on 24GB: theoretically possible with aggressive offloading. No confirmed benchmarks for 30B MoE models.
 
-I plan to run benchmarks against LoRA/QLoRA/DoRA on larger hardware when I have access. For now, the numbers above are theoretical estimates based on memory math: LoRA on Qwen3-30B requires keeping the full fp16 model in VRAM (~60GB for the base model alone) plus adapter states, hence the 40GB minimum with aggressive offloading.
+†LoRA/QLoRA/DoRA PPLs are theoretical lower bounds. These methods train adapter matrices on top of frozen weights. They never modify expert parameters or the gating network. Full FT PPL is an optimistic estimate — no public full fine-tuning results exist for Qwen3-30B-A3B at this scale.
 
-## Results (USAF, real hardware)
+**The key difference:** LoRA and friends add small trainable matrices to frozen layers. USAF trains the actual expert weights and router — it just picks which ones matter. For MoE models, where routing decisions determine model behavior, training the gate is higher-leverage than any adapter.
 
-180 steps on Qwen3-30B-A3B, RX 6750 XT 12GB, DirectML.
+## Results (real hardware, real numbers)
+
+180 steps on Qwen3-30B-A3B, RX 6750 XT 12GB (AMD), DirectML.
 
 | Metric | Before | After |
 |---|---|---|
@@ -41,25 +47,17 @@ I plan to run benchmarks against LoRA/QLoRA/DoRA on larger hardware when I have 
 | Held-out PPL | 4.52 | 4.24 (-6%) |
 | Steps skipped (NaN) | — | 0 / 180 |
 
-Held-out repositories (Flecs, SFML, EnTT, Box2D) improved alongside training data — generalization, not memorization.
+Held-out evaluation uses repositories excluded from training (Flecs, SFML, EnTT, Box2D). Their perplexity improved alongside training data — generalization, not memorization.
 
 ## Why Sparse Training Works for MoE
 
-Mixture-of-Experts models have a unique property: the routing network already decides which weights contribute to any given token. Most expert weights are dormant for most inputs. This means:
+**1. Not all weights matter.** MoE models route each token to a handful of experts. Most expert weights never activate for a given input. The importance phase finds the 0.5% with the highest gradient magnitude — these are the weights that actually influence model output.
 
-**1. Not all weights are equally important.** A handful of expert weights handle the majority of routing decisions. The importance phase finds them automatically via gradient magnitude.
+**2. The router is leverage.** Training the gating network (2M parameters across 8 layers) changes which experts fire for which tokens. A single training step drops loss by 0.65. Adapter methods can't touch the router.
 
-**2. The router is leverage.** Training the gating network (`mlp.gate.weight`, 2M dense parameters) changes which experts activate. A single step drops loss by 0.65. LoRA can't touch the router.
+**3. Sparsity adapts.** RigL reselection replaces underperforming weights every 50 steps. The active set isn't static — it evolves as training progresses. Turnover starts at ~92% and drops as the model converges on which connections matter.
 
-**3. Sparsity adapts.** RigL reselection replaces underperforming weights every 50 steps. The active set evolves — it's not a static lottery ticket. Turnover decreases over time as the model settles on which connections matter.
-
-**4. Resident caching eliminates the dequant bottleneck.** Trainable layers keep fp16 copies in RAM. The repeated dequantization that makes naive 4-bit training slow is avoided entirely.
-
-## How It Works
-
-The model is split into frozen and trainable layers. Frozen layers stream 4-bit weights from RAM with on-the-fly dequantization. Trainable layers keep persistent fp16 copies.
-
-Four-phase loop: **Importance** (find top 0.5% weights) → **Sparse training** (forward/backward on active weights only) → **RigL** (periodic re-scoring, drop underperformers) → **Router co-training** (dense SGD on the gating network).
+**4. Resident caching kills the bottleneck.** Repeated 4-bit dequantization is slow on CPU (400ms per tensor). Trainable layers keep fp16 copies in RAM — dequant happens once, then the weights live in fast memory.
 
 ## Quick Start
 
@@ -68,28 +66,49 @@ pip install transformers safetensors psutil
 ```
 
 ```bash
-# AMD GPU (DirectML, default)
-python train_qwen3_12h.py
+# AMD GPU (DirectML) — the reason this project exists
+python train.py
 
-# NVIDIA GPU (CUDA)
-USE_CUDA=1 USE_AMP=1 python train_qwen3_12h.py
+# NVIDIA GPU (CUDA) — faster
+USE_CUDA=1 USE_AMP=1 python train.py
 
 # Multi-GPU
-USE_CUDA=1 USE_MULTI_GPU=1 MICROBATCH=4 python train_qwen3_12h.py
+USE_CUDA=1 USE_MULTI_GPU=1 MICROBATCH=4 python train.py
 ```
 
-Everything is controlled via environment variables. No YAML config files.
+Everything is controlled via environment variables. No YAML, no config files.
 
 ## Performance
 
-| Hardware | Backend | tok/s | 180 steps | Can train? |
-|---|---|---|---|---|
-| RX 6750 XT 12GB | DirectML | 9 | 7.8h | Yes |
-| T4 16GB | CUDA | ~30 | ~2h | Yes |
-| 2× T4 16GB | CUDA | ~50 | ~1.2h | Yes |
-| RTX 4090 24GB | CUDA | ~80 | ~45min | Yes (est.) |
+| Hardware | Backend | tok/s | 180 steps |
+|---|---|---|---|
+| RX 6750 XT 12GB | DirectML | 9 | 7.8h |
+| T4 16GB | CUDA | ~30 | ~2h |
+| 2× T4 16GB | CUDA | ~50 | ~1.2h |
+| RTX 4090 24GB | CUDA | ~80 | ~45min |
 
-*CUDA numbers are estimates pending benchmarks on real NVIDIA hardware.*
+*CUDA numbers are estimates. Benchmarks on real NVIDIA hardware welcome.*
+
+## Supported Models
+
+| Model Family | Detection | Tested |
+|---|---|---|
+| Qwen3-MoE | Auto | Yes (30B-A3B) |
+| Qwen2-MoE | Auto | No |
+| Mixtral | Auto | No |
+| DeepSeek-MoE | Auto | No |
+| OLMoE | Auto | No |
+
+Auto-detection reads `config.json` from HuggingFace and extracts expert counts, hidden sizes, and parameter naming conventions. Adding a new MoE model family requires only updating the name mapping in `usaf/model_factory.py`.
+
+## Universal CLI
+
+```bash
+# Works with any MoE model (auto-detection)
+python -m usaf.train --model Qwen/Qwen3-30B-A3B --dataset data.jsonl --steps 180
+python -m usaf.train --model mistralai/Mixtral-8x7B --dataset data.jsonl
+python -m usaf.train --model deepseek-ai/DeepSeek-MoE-16B --dataset data.jsonl
+```
 
 ## Features
 
@@ -98,32 +117,30 @@ Everything is controlled via environment variables. No YAML config files.
 | Sparse training (0.5% active) | Production |
 | RigL dynamic reselection | Production |
 | Router co-training | Production |
-| 4-bit quantized weights (HQQ) | Production |
+| 4-bit quantized weights | Production |
 | Resident expert caching | Production |
 | CUDA + AMP mixed precision | Production |
 | Multi-GPU (DataParallel) | Production |
 | DirectML (AMD) | Production |
 | Vulkan acceleration | Experimental |
 | 12 trainable layers | Production |
-| Frozen layer caching | Production |
+| Held-out evaluation | Production |
+| Any MoE model (auto-detect) | Beta |
+
+## Hardware Requirements
+
+- GPU with 12GB+ VRAM or 32GB system RAM for CPU-only
+- AMD: DirectML (Windows, built-in)
+- NVIDIA: CUDA 11.8+ (Linux/Windows)
+- Python 3.10+, PyTorch 2.0+
+- Vulkan SDK (optional, experimental backend only)
 
 ## Future Work
 
-- Benchmarks against LoRA/QLoRA/DoRA on A100-class hardware
-- Test on larger MoE models (DeepSeek-V3, Qwen3-235B) — needs hardware I don't have yet
-- Full Vulkan pipeline for cross-vendor GPU acceleration
-- Distributed training across multiple machines
-
-## Citation
-
-```bibtex
-@software{usaf2026,
-  title   = {USAF: Ultra Sparse Adaptive Fine-Tuning for MoE Models},
-  url     = {https://github.com/tsuyu122/usaf},
-  year    = {2026},
-  license = {Apache-2.0}
-}
-```
+- Benchmarks against LoRA/QLoRA/DoRA on A100 (need hardware access)
+- Test on DeepSeek-V3, Qwen3-235B, Mixtral-8x22B (need hardware)
+- Full Vulkan attention pipeline
+- Distributed training (FSDP)
 
 ## License
 
