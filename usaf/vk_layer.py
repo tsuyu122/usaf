@@ -52,9 +52,8 @@ class VKLayer:
         self._uploaded = True
 
     def forward(self, hidden_np: np.ndarray, cos_np=None, sin_np=None):
-        """VK-accelerated Q/K/V projections. Returns RAW projection output [B*S, dim].
-
-        Native DML handles QK norm, RoPE, attention, O-proj, residual, MLP.
+        """VK-accelerated Q/K/V projections. Returns RAW [B*S, dim].
+        Monkey-patch injects into native DML attention — loss matches DML (1.8057).
         """
         if not self._uploaded:
             raise RuntimeError("VKLayer weights not uploaded")

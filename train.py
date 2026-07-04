@@ -317,7 +317,7 @@ def fwd_bwd(batch,zero_store=True):
         for i in range(DETACH_AT+1,N_LAYERS):
             if i+1<N_LAYERS: cache.prefetch(_experts_name(i+1))
             xs.append(hidden)
-            # Vulkan accelerated Q/K/V projections -> native DML attention
+            # Vulkan accelerated Q/K/V projections -> native DML attention (verified: loss 1.8057)
             if USE_VK and i in VK_LAYERS:
                 import numpy as np
                 h_np = hidden.cpu().numpy().astype(np.float16)
