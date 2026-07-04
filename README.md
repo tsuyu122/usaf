@@ -154,12 +154,106 @@ python -m usaf.train --model mistralai/Mixtral-8x7B --dataset data.jsonl
 - NVIDIA: CUDA 11.8+
 - Python 3.10+, PyTorch 2.0+
 
+## Using Your Own Model
+
+### Step 1: Prepare the dataset
+
+Create a JSONL file with tokenized sequences. Each line must have `input_ids` and `labels`:
+
+```json
+{"input_ids": [1, 2, 3, ..., 512], "labels": [1, 2, 3, ..., 512]}
+```
+
+To tokenize your own text with the model's tokenizer:
+
+```python
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-30B-A3B")
+
+text = "Your training text here..."
+tokens = tokenizer.encode(text)
+# Chunk into 512-token segments
+for i in range(0, len(tokens) - 512, 512):
+    chunk = tokens[i:i+512]
+    sample = {"input_ids": chunk, "labels": chunk[1:] + [tokenizer.eos_token_id]}
+    # Write sample to JSONL
+```
+
+### Step 2: Quantize the expert weights
+
+USAF needs the expert weights in 4-bit HQQ format. Currently supports Qwen3-MoE out of the box. For other models, you need to generate the `experts_q4.pt` file:
+
+```python
+from usaf.quantization import quantize_4bit
+import torch
+
+# Load your model's expert tensors (gate_up_proj and down_proj for each layer)
+q_dict = {}
+for layer_idx in range(num_layers):
+    for param_name in ["gate_up_proj", "down_proj"]:
+        # Load the fused expert tensor [num_experts, intermediate, hidden]
+        weights = load_expert_weights(model_path, layer_idx, param_name)
+        q4_entry = quantize_4bit(weights, group_size=128)
+        q_dict[f"model.layers.{layer_idx}.mlp.experts.{param_name}"] = q4_entry
+
+torch.save(q_dict, "my-model-q4/experts_q4.pt")
+```
+
+### Step 3: Configure and run
+
+```bash
+# Set these environment variables for your model
+QUANT_PATH="my-model-q4/experts_q4.pt"   # Path to quantized weights
+TRAIN_FROM=36                            # First trainable layer (keep top layers)
+STEPS=360                                # 2 epochs for ~190K tokens
+FRAC=0.005                               # 0.5% sparsity
+MICROBATCH=2                             # Batch size (increase if VRAM allows)
+
+python train.py
+```
+
+### Environment Variables Reference
+
+| Variable | Default | Description |
+|---|---|---|
+| `DATASET_PATH` | `data/train_dataset_12h.jsonl` | JSONL file with training samples |
+| `QUANT_PATH` | auto-detected | Path to `experts_q4.pt` |
+| `TRAIN_FROM` | 40 | First trainable layer (0-39 are frozen) |
+| `FRAC` | 0.005 | Fraction of weights to train (0.5%) |
+| `STEPS` | 180 | Training steps |
+| `MICROBATCH` | 2 | Sequences per micro-batch |
+| `LR_PEAK` | 2e-4 | Peak learning rate (cosine decay) |
+| `RESELECT_EVERY` | 50 | RigL reselection frequency |
+| `USE_CUDA` | 0 | Set to `1` for NVIDIA GPUs |
+| `USE_AMP` | 1 | Mixed precision (CUDA only) |
+| `USE_MULTI_GPU` | 1 | DataParallel (CUDA only) |
+| `FROZEN_CACHE_N` | 0 | Number of samples to cache (0=all) |
+
+### Supported GPU Configurations
+
+| Setup | Command |
+|---|---|
+| AMD GPU (RX 6000/7000) | `python train.py` |
+| NVIDIA single GPU | `USE_CUDA=1 python train.py` |
+| NVIDIA dual GPU | `USE_CUDA=1 USE_MULTI_GPU=1 MICROBATCH=4 python train.py` |
+| CPU fallback | `python train.py` (automatic) |
+
+### Troubleshooting
+
+**"CUDA out of memory"**: Reduce `MICROBATCH` to 1 or increase `TRAIN_FROM` to freeze more layers.
+
+**"No module named torch_directml"** on NVIDIA: Expected. The code auto-detects and uses CUDA. Set `USE_CUDA=1`.
+
+**Loss not decreasing**: Ensure `FRAC` is high enough (>0.001). Try 2-3 epochs with `EPOCHS=3`. Check dataset quality.
+
+**Frozen cache takes too long**: Set `FROZEN_CACHE_N=50` to only cache the first 50 samples. Or disable with `USE_FROZEN_CACHE=0`.
+
 ## Future Work
 
 - Benchmarks against LoRA/QLoRA/DoRA on A100-class hardware
-- Full Vulkan attention pipeline
+- Full Vulkan attention pipeline for cross-vendor acceleration
 - Distributed training (FSDP)
-- Tests on DeepSeek-V4 Pro, Kimi K2.6, GLM-4 MoE (need hardware)
+- Tests on DeepSeek-V4 Pro, Kimi K2.5, Mistral Large 3 — need hardware
 
 ## License
 
