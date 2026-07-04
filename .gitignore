@@ -34,19 +34,21 @@ results/*.json
 # Large data files
 *.safetensors
 *.pt
-*.bin
 !data/.gitkeep
+Qwen3-30B-A3B*/
+.hf_cache/
 
 # Vulkan build artifacts
 usaf/vulkan/build/
-usaf/vulkan/build/_deps/
 
 # Kaggle
 kaggle_kernel/
 
-# Test artifacts
-*_smoke*
-*_test_*
+# Test/benchmark scripts
+_bench_*.py
+_debug_*.py
+_demo_*.py
+_test_*.py
 *.npy
 *.npz
 bench/
