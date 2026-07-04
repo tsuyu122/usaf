@@ -240,7 +240,7 @@ def main(args=None):
     if config.use_multi_gpu and n_gpus > 1 and config.use_cuda:
         model = nn.DataParallel(model)
     
-    # ── Build training metadata ──
+    # Build training metadata
     param_patterns = get_param_patterns(moe_cfg)
     _train_names = []
     for li in sorted(train_layers):
@@ -254,6 +254,21 @@ def main(args=None):
     
     _shapes = {fn: _q_shape(fn) for fn in _train_names}
     
+    # Get transformer layers for the training loop (handles DataParallel)
+    base = model.module if hasattr(model, 'module') else model
+    if hasattr(base, 'model') and hasattr(base.model, 'layers'):
+        transformer = base.model
+    elif hasattr(base, 'transformer') and hasattr(base.transformer, 'layers'):
+        transformer = base.transformer
+    else:
+        raise RuntimeError("Cannot find transformer layers in model. Expected .model.layers or .transformer.layers")
+    
+    layers = transformer.layers
+    embed = transformer.embed_tokens
+    rotary = transformer.rotary_emb
+    norm_fn = transformer.norm
+    lm_head = base.lm_head
+    
     # ── Run training ──
     print(f"\nStarting training...")
     print(f"  Sparsity: {config.frac*100:.1f}%")
@@ -265,7 +280,8 @@ def main(args=None):
     # Delegate to the existing training pipeline
     _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                   train_samples, eval_samples, heldout_samples,
-                  _train_names, _shapes, train_layers)
+                  _train_names, _shapes, train_layers,
+                  layers, embed, rotary, norm_fn, lm_head)
     
     return model
 
@@ -385,8 +401,9 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device):
 
 def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                   train_samples, eval_samples, heldout_samples,
-                  _train_names, _shapes, train_layers):
-    """Run the full training loop. Uses the same pipeline as train_qwen3_12h.py."""
+                  _train_names, _shapes, train_layers,
+                  layers, embed, rotary, norm_fn, lm_head):
+    """Run the full training loop using pre-extracted layer references."""
     
     N_LAYERS = moe_cfg.num_layers
     DETACH_AT = min(train_layers) - 1
@@ -412,21 +429,10 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             continue
         mod._grad_capture = (imp_store, mname)
     
-    # Helper functions
-    def _unwrap():
-        return model.module if hasattr(model, 'module') else model
-    
-    def _qwen_layer(i):
-        return _unwrap().model.layers[i]
-    
-    def _experts_name(i):
-        return moe_cfg.expert_prefix.format(i=i)
-    
     def _prelude(input_ids):
-        hidden = _unwrap().model.embed_tokens(input_ids) if hasattr(_unwrap(), 'model') else _unwrap().embed_tokens(input_ids)
+        hidden = embed(input_ids)
         s_len = hidden.shape[1]
         pos_ids = torch.arange(s_len, device=device).unsqueeze(0)
-        rotary = _unwrap().model.rotary_emb if hasattr(_unwrap(), 'model') else _unwrap().rotary_emb
         cos, sin = rotary(hidden, position_ids=pos_ids)
         mask = torch.triu(
             torch.full((s_len, s_len), torch.finfo(torch.float16).min, device=device, dtype=torch.float16),
@@ -434,10 +440,8 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         return hidden, pos_ids, (cos, sin), mask
     
     def _head_loss(hidden, labels):
-        norm = _unwrap().model.norm if hasattr(_unwrap(), 'model') else _unwrap().norm
-        lm_head = _unwrap().lm_head
-        hidden = norm(hidden)
-        logits = lm_head(hidden)
+        h = norm_fn(hidden)
+        logits = lm_head(h)
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
         return nn.functional.cross_entropy(
@@ -448,7 +452,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         lbl = torch.tensor([sample["labels"]], dtype=torch.long).to(device)
         hidden, pos_ids, pe, mask = _prelude(ids)
         for i in range(N_LAYERS):
-            hidden = _qwen_layer(i)(hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+            hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
         cache.evict_all()
         h_last = hidden.detach().requires_grad_(True)
         loss = _head_loss(h_last, lbl)
@@ -512,12 +516,12 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         
         with torch.no_grad():
             for i in range(DETACH_AT + 1):
-                hidden = _qwen_layer(i)(hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+                hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
             cache.evict_all()
             xs = []
             for i in range(DETACH_AT + 1, N_LAYERS):
                 xs.append(hidden)
-                hidden = _qwen_layer(i)(hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+                hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
             cache.evict_all()
         
         h_last = hidden.detach().requires_grad_(True)
@@ -532,7 +536,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         for j in range(len(xs) - 1, -1, -1):
             i = DETACH_AT + 1 + j
             x2 = xs[j].detach().requires_grad_(True)
-            out = _qwen_layer(i)(x2, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+            out = layers[i](x2, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
             out.backward(g)
             g = x2.grad
             cache.evict_all()
