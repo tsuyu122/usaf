@@ -317,12 +317,11 @@ def fwd_bwd(batch,zero_store=True):
         for i in range(DETACH_AT+1,N_LAYERS):
             if i+1<N_LAYERS: cache.prefetch(_experts_name(i+1))
             xs.append(hidden)
-            # Vulkan accelerated Q/K/V projections
+            # Vulkan accelerated Q/K/V projections -> native DML attention
             if USE_VK and i in VK_LAYERS:
                 import numpy as np
                 h_np = hidden.cpu().numpy().astype(np.float16)
                 q_np, k_np, v_np = VK_LAYERS[i].forward(h_np, np.zeros((1,)), np.zeros((1,)))
-                # Inject VK Q/K/V via nn.Module wrapper
                 q_t = torch.from_numpy(np.ascontiguousarray(q_np.astype(np.float32))).to(device).half()
                 k_t = torch.from_numpy(np.ascontiguousarray(k_np.astype(np.float32))).to(device).half()
                 v_t = torch.from_numpy(np.ascontiguousarray(v_np.astype(np.float32))).to(device).half()
@@ -417,7 +416,7 @@ if USE_VK_STREAMING:
 # ── Frozen cache: precompute hidden@DETACH_AT for all samples ──
 if USE_FROZEN_CACHE:
     from usaf.frozen_cache import build_frozen_cache, get_hidden
-    FROZEN_EVAL = os.environ.get("FROZEN_EVAL", "1") == "1"
+    FROZEN_EVAL = os.environ.get("FROZEN_EVAL", "0") == "1"  # default: only train samples in cache
     _fc_n = FROZEN_CACHE_N if FROZEN_CACHE_N > 0 else len(train_samples)
     _fc_train = train_samples[:_fc_n]
     if FROZEN_EVAL:

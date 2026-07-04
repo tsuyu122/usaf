@@ -199,6 +199,37 @@ static void dequant_pipelined(int q_h, int s_h, int z_h, int out_h,
     dispatch(ctx(), cp->pipeline, gx, 1, 1, &pc, sizeof(pc));
 }
 
+static void attn_softmax_pipelined(int scores_h, int v_h, int out_h,
+                                    int nH, int nKV, int S, int hd, int causal) {
+    ensure_init();
+    auto& bs = get_buf(scores_h); auto& bv = get_buf(v_h); auto& bo = get_buf(out_h);
+
+    std::vector<vk::DescriptorSetLayoutBinding> bnd = {
+        {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+        {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+        {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+    };
+    struct { uint32_t nH, nKV, S, hd, causal; } pc = {(uint32_t)nH, (uint32_t)nKV, (uint32_t)S, (uint32_t)hd, (uint32_t)causal};
+
+    auto* cp = get_or_create_pipeline("attn_softmax", bnd, sizeof(pc));
+    if (!cp->pipeline.pipeline) {
+        auto shader = load_shader(ctx(), g_spirv_dir.empty() ? "spirv/attn_softmax.spv" : (g_spirv_dir + "/attn_softmax.spv").c_str(), "main");
+        std::vector<vk::PushConstantRange> push = {{vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc)}};
+        cp->pipeline = create_compute_pipeline(ctx(), shader, bnd, push);
+    }
+
+    vk::DescriptorBufferInfo dbis[3] = {
+        {bs.buffer, 0, bs.size}, {bv.buffer, 0, bv.size}, {bo.buffer, 0, bo.size},
+    };
+    std::vector<vk::WriteDescriptorSet> writes(3);
+    for (int i = 0; i < 3; i++)
+        writes[i].setDstSet(cp->pipeline.desc_set).setDstBinding(i)
+            .setDescriptorType(vk::DescriptorType::eStorageBuffer).setBufferInfo(dbis[i]);
+    update_descriptor_set(ctx(), cp->pipeline, writes);
+
+    dispatch(ctx(), cp->pipeline, nH, 1, 1, &pc, sizeof(pc));
+}
+
 static py::tuple rope_pipelined(int q_h, int k_h, int cos_h, int sin_h,
                                  int qo_h, int ko_h,
                                  int B, int nH, int nKV, int S, int hd) {
@@ -471,6 +502,9 @@ PYBIND11_MODULE(usaf_vk, m) {
           py::arg("q_handle"), py::arg("k_handle"), py::arg("cos_handle"), py::arg("sin_handle"),
           py::arg("qo_handle"), py::arg("ko_handle"),
           py::arg("B"), py::arg("nH"), py::arg("nKV"), py::arg("S"), py::arg("hd"));
+    m.def("attn_softmax_pipe", &attn_softmax_pipelined, "Attention softmax + V-proj: out = softmax(scores) @ V",
+          py::arg("scores_handle"), py::arg("v_handle"), py::arg("out_handle"),
+          py::arg("nH"), py::arg("nKV"), py::arg("S"), py::arg("hd"), py::arg("causal") = 1);
 
     // Cleanup on module unload
     auto atexit = py::module_::import("atexit");

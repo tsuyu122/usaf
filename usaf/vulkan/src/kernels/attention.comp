@@ -2,93 +2,77 @@
 #extension GL_EXT_shader_16bit_storage : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
-// Tiled attention: one head per workgroup, S threads.
-// Each thread computes one output row via tiled Q@K^T with online softmax.
+// Softmax + V-proj: one workgroup per head.
+// Input: scores [B*nH, S, S] from Q@K^T/scale, V [B*nKV, S, hd]
+// Output: attention output [B*nH, S, hd]
+// GQA: repeats V to match query heads.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) readonly buffer QBuf  { float16_t q[]; };
-layout(set = 0, binding = 1) readonly buffer KBuf  { float16_t k[]; };
-layout(set = 0, binding = 2) readonly buffer VBuf  { float16_t v[]; };
-layout(set = 0, binding = 3) writeonly buffer OutBuf { float16_t result[]; };
+layout(set = 0, binding = 0) readonly buffer SBuf  { float16_t scores[]; };
+layout(set = 0, binding = 1) readonly buffer VBuf  { float16_t v[]; };
+layout(set = 0, binding = 2) writeonly buffer OutBuf { float16_t result[]; };
 
 layout(push_constant) uniform Push {
-    uint S;
-    uint hd;
-    uint n_heads;
-    float scale;
-    uint causal;
+    uint nH;     // num query heads
+    uint nKV;    // num key/value heads
+    uint S;      // sequence length
+    uint hd;     // head dimension
+    uint causal; // 1 = causal mask
 } pc;
 
-shared float s_q[256][4];  // tile of Q: 256 rows × 4 cols (processed in chunks)
-shared float s_k[256][4];  // tile of K
-shared float s_v[256][4];  // tile of V
-
 void main() {
-    uint head = gl_WorkGroupID.x;
-    uint row = gl_LocalInvocationID.x;
-    if (head >= pc.n_heads || row >= pc.S) return;
+    uint head_q = gl_WorkGroupID.x;  // query head
+    uint tid = gl_LocalInvocationID.x;
     
-    uint q_off = (head * pc.S + row) * pc.hd;
-    uint k_off = head * pc.S * pc.hd;
-    uint v_off = head * pc.S * pc.hd;
-    uint o_off = (head * pc.S + row) * pc.hd;
+    if (head_q >= pc.nH || tid >= pc.S) return;
     
-    // Initialize output accumulators with 0
-    float o_vals[128]; // max hd=128
-    for (uint d = 0; d < pc.hd && d < 128; d++) o_vals[d] = 0.0;
+    // GQA: which KV head?
+    uint n_rep = pc.nH / pc.nKV;
+    uint head_kv = head_q / n_rep;
     
-    float running_max = -1e10;
-    float running_sum = 0.0;
+    uint row = tid;  // each thread computes one output row (S=512, 256 threads: workgroup barrier needed)
+    // Actually need 512 threads. Use 256 threads × 2 rows each.
+    // For simplicity: if S > 256, each thread handles ceil(S/256) rows.
+    // For S=512: each thread handles 2 rows (tid and tid+256)
     
-    // Process hd dimension in chunks of TILE_DIM=4
-    uint TILE_DIM = 4;
-    uint n_hd_tiles = (pc.hd + TILE_DIM - 1) / TILE_DIM;
+    uint scores_off = head_q * pc.S * pc.S;
+    uint v_off = head_kv * pc.S * pc.hd;
+    uint out_off = head_q * pc.S * pc.hd;
     
-    // Outer loop: iterate over query dimension tiles (hd)
-    // Each tile computes partial dot products for all key positions
-    for (uint hd_tile = 0; hd_tile < n_hd_tiles; hd_tile++) {
-        uint d_start = hd_tile * TILE_DIM;
-        uint d_end = min(d_start + TILE_DIM, pc.hd);
-        uint d_count = d_end - d_start;
+    // Process up to 2 rows per thread
+    for (uint r_idx = 0; r_idx < 2; r_idx++) {
+        uint r = tid + r_idx * 256;
+        if (r >= pc.S) break;
         
-        // Load Q tile for this row into registers
-        float q_tile[4];
-        for (uint d = 0; d < d_count; d++) {
-            q_tile[d] = float(q[q_off + d_start + d]);
+        // Step 1: find max for numerical stability
+        float max_val = -1e10;
+        for (uint c = 0; c < pc.S; c++) {
+            if (pc.causal != 0 && c > r) continue;
+            float s = float(scores[scores_off + r * pc.S + c]);
+            if (s > max_val) max_val = s;
         }
         
-        // Inner loop: iterate over key positions in tiles of 256
-        for (uint k_start = 0; k_start < pc.S; k_start += 256) {
-            uint k_end = min(k_start + 256, pc.S);
-            
-            // Load K/V tiles cooperatively
-            uint k_row = k_start + gl_LocalInvocationID.x;
-            if (k_row < k_end) {
-                for (uint d = 0; d < d_count; d++) {
-                    s_k[gl_LocalInvocationID.x][d] = float(k[k_off + k_row * pc.hd + d_start + d]);
-                }
-            }
-            barrier();
-            
-            // Compute partial dot products: q_tile @ k_tile^T for all key positions
-            for (uint j = 0; j < (k_end - k_start); j++) {
-                if (pc.causal != 0 && (k_start + j) > row) continue;
-                float dot = 0.0;
-                for (uint d = 0; d < d_count; d++) {
-                    dot += q_tile[d] * s_k[j][d];
-                }
-                // The full dot product is accumulated across hd_tiles
-                // Need to accumulate per key position across tiles
-                // This is complex — storing per-key-position accumulators
-                // Simplified: just compute approximate attention (wrong but fast)
-            }
-            barrier();
+        // Step 2: compute exp sum
+        float exp_sum = 0.0;
+        float exp_vals[512]; // scores per key position
+        for (uint c = 0; c < pc.S; c++) {
+            if (pc.causal != 0 && c > r) { exp_vals[c] = 0.0; continue; }
+            float s = float(scores[scores_off + r * pc.S + c]);
+            float e = exp(s - max_val);
+            exp_vals[c] = e;
+            exp_sum += e;
         }
-    }
-    
-    // Placeholder: copy Q to output (identity — wrong but compiles)
-    for (uint d = 0; d < pc.hd && d < 128; d++) {
-        result[o_off + d] = float16_t(float(q[q_off + d]));
+        
+        // Step 3: weighted sum of V
+        float inv_sum = 1.0 / (exp_sum + 1e-10);
+        for (uint d = 0; d < pc.hd; d++) {
+            float weighted = 0.0;
+            for (uint c = 0; c < pc.S; c++) {
+                if (exp_vals[c] <= 0.0) continue;
+                weighted += exp_vals[c] * inv_sum * float(v[v_off + c * pc.hd + d]);
+            }
+            result[out_off + r * pc.hd + d] = float16_t(weighted);
+        }
     }
 }

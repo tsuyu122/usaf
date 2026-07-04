@@ -24,10 +24,11 @@ except Exception as e:
     print(f"  [VK] import failed: {e}", flush=True)
 
 class VKLayer:
-    """Vulkan-accelerated forward for one Qwen3MoE decoder layer.
+    """Vulkan-accelerated Q/K/V projections for one Qwen3MoE decoder layer.
 
-    Manages persistent GPU buffers for weights. Only handles the non-MoE
-    part (rmsnorm, attention projections, RoPE). MoE part still uses DML.
+    Forward: RMSNorm -> Q/K/V projections -> download Q/K/V.
+    Native DML handles QK norm, RoPE, attention, O-proj, residual, MLP.
+    Monkey-patch injects VK Q/K/V into native attention for correctness.
     """
 
     def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int, head_dim: int,
@@ -43,8 +44,6 @@ class VKLayer:
             return
 
         for name, w in weights.items():
-            # Fase 11 fix: VK GEMM expects W^T [K,N], PyTorch stores W [N,K]
-            # Transpose projection weights before upload
             if 'proj.weight' in name:
                 w = np.ascontiguousarray(w.T)
             h = usaf_vk.create_buf(w.nbytes, True)
@@ -52,14 +51,10 @@ class VKLayer:
             self.bufs[name] = h
         self._uploaded = True
 
-    def forward(self, hidden_np: np.ndarray, cos_np: np.ndarray, sin_np: np.ndarray):
-        """VK-accelerated Q/K/V projections only. Returns RAW projection output.
+    def forward(self, hidden_np: np.ndarray, cos_np=None, sin_np=None):
+        """VK-accelerated Q/K/V projections. Returns RAW projection output [B*S, dim].
 
-        The native DML layer handles QK norm, RoPE, attention, O-proj, residual, MLP.
-        VK only accelerates the heavy GEMMs (Q/K/V projections).
-
-        Returns:
-            (q_np, k_np, v_np): Q, K, V as flat [B*S, dim] float16
+        Native DML handles QK norm, RoPE, attention, O-proj, residual, MLP.
         """
         if not self._uploaded:
             raise RuntimeError("VKLayer weights not uploaded")
@@ -70,17 +65,11 @@ class VKLayer:
         def alloc(shape):
             return usaf_vk.create_buf(int(np.prod(shape)) * 2, True)
 
-        hx = alloc(x.shape)
-        usaf_vk.upload(hx, x)
-
+        hx = alloc(x.shape); usaf_vk.upload(hx, x)
         hrms = alloc(x.shape)
         hq = alloc((B * S, self.nH * self.hd))
         hk = alloc((B * S, self.nKV * self.hd))
         hv = alloc((B * S, self.nKV * self.hd))
-        hqo_buf = alloc((B * S, self.nH * self.hd))
-        hko_buf = alloc((B * S, self.nKV * self.hd))
-        ho = alloc((B * S, H))
-        hpost = alloc((B * S, H))
 
         usaf_vk.rmsnorm_pipe(hx, self.bufs["input_layernorm.weight"], hrms, B * S, H, 1e-6)
         usaf_vk.barrier()
@@ -91,7 +80,6 @@ class VKLayer:
         usaf_vk.gemm_pipe(hrms, self.bufs["self_attn.v_proj.weight"], hv, B * S, H, self.nKV * self.hd)
         usaf_vk.barrier()
 
-        # Download raw Q/K/V projections (flat format)
         q_np = usaf_vk.download(hq, [B * S, self.nH * self.hd]).view(np.float16)
         k_np = usaf_vk.download(hk, [B * S, self.nKV * self.hd]).view(np.float16)
         v_np = usaf_vk.download(hv, [B * S, self.nKV * self.hd]).view(np.float16)
