@@ -2,9 +2,8 @@ cff-version: 1.2.0
 message: "If you use USAF, please cite it as below."
 title: "USAF: Ultra Sparse Adaptive Fine-Tuning for Mixture-of-Experts Models"
 authors:
-  - family-names: "Tsuyoshi"
-    given-names: "Enzo"
-    orcid: ""
+  - family-names: "tsuyu122"
+    given-names: ""
 repository-code: "https://github.com/tsuyu122/usaf"
 url: "https://github.com/tsuyu122/usaf"
 license: Apache-2.0

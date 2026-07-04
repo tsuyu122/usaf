@@ -3,7 +3,7 @@
 By submitting a pull request or contributing to USAF in any form,
 you agree that:
 
-1. You grant **Enzo Tsuyoshi** (the project owner) a perpetual,
+1. You grant **tsuyu122** (the project owner) a perpetual,
    worldwide, non-exclusive, royalty-free, irrevocable copyright
    license to use, modify, distribute, and sublicense your
    contribution under any license terms.
