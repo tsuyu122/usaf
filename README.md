@@ -99,7 +99,20 @@ Everything is controlled via environment variables. No YAML, no config files.
 | DeepSeek-MoE | Auto | No |
 | OLMoE | Auto | No |
 
-Auto-detection reads `config.json` from HuggingFace and extracts expert counts, hidden sizes, and parameter naming conventions. Adding a new MoE model family requires only updating the name mapping in `usaf/model_factory.py`.
+Auto-detection reads `config.json` from HuggingFace and extracts expert counts, hidden sizes, and parameter naming conventions.
+
+## Models I Want to Test
+
+These models are next on my list. I built USAF for them — I just don't have the hardware to run them yet.
+
+| Model | Parameters | Active | Why |
+|---|---|---|---|
+| **DeepSeek-V3** | 671B | 37B | Largest open MoE. Would validate USAF at extreme scale |
+| **Qwen3-235B-A22B** | 235B | 22B | Qwen family. Same architecture, 8× larger |
+| **Mixtral-8x22B** | 141B | 39B | Different expert structure (non-fused projections) |
+| **DeepSeek-R1** | 671B | 37B | Reasoning-focused MoE. Router training impact on chain-of-thought |
+
+Hardware needed per model: 4-8× A100 80GB or equivalent. If you have access and want to see USAF results on these models, reach out on [GitHub Discussions](https://github.com/tsuyu122/usaf/discussions) or open an issue. I'll handle the training code — you handle the GPUs.
 
 ## Universal CLI
 
@@ -137,10 +150,10 @@ python -m usaf.train --model deepseek-ai/DeepSeek-MoE-16B --dataset data.jsonl
 
 ## Future Work
 
-- Benchmarks against LoRA/QLoRA/DoRA on A100 (need hardware access)
-- Test on DeepSeek-V3, Qwen3-235B, Mixtral-8x22B (need hardware)
-- Full Vulkan attention pipeline
-- Distributed training (FSDP)
+- Benchmarks against LoRA/QLoRA/DoRA on A100-class hardware
+- Full Vulkan attention pipeline for cross-vendor GPU acceleration
+- Distributed training (FSDP) for multi-node setups
+- Once I have access to larger GPUs: DeepSeek-V3, Qwen3-235B, Mixtral-8x22B
 
 ## License
 
