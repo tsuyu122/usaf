@@ -202,20 +202,32 @@ class QuantizedExpertCache:
         }
 
     def _dequant_cpu(self, expert_module_name: str) -> Dict[str, torch.Tensor]:
-        """Dequantize an expert module's params to CPU fp16 (overlay applied)."""
+        """Dequantize an expert module's params to CPU fp16 (overlay applied).
+
+        Uses VK GPU dequant when _vk_q4_all has buffers for this param.
+        """
         cpu_params: Dict[str, torch.Tensor] = {}
         for full_name, local_name in self._expert_to_params.get(expert_module_name, []):
             entry = self._q_dict.get(full_name)
             if entry is None:
                 continue
 
-            if isinstance(entry, dict) and "q" in entry:
+            # Try VK GPU dequant first (Fase 13: streaming acceleration)
+            vk_info = self._vk_q4_all.get(full_name) if hasattr(self, '_vk_q4_all') else None
+            if vk_info is not None:
+                import usaf_vk
+                q_h, s_h, z_h, out_rows, in_feats, total_elems = vk_info
+                usaf_vk.dequant_pipe(q_h, s_h, z_h, self._vk_out_buf, out_rows, in_feats, 128)
+                usaf_vk.barrier()  # required: download_buffer doesn't wait for GPU
+                raw = usaf_vk.download(self._vk_out_buf, [out_rows, in_feats])
+                shape = entry[3] if isinstance(entry, tuple) else entry["shape"]
+                t = torch.from_numpy(np.ascontiguousarray(raw.view(np.float16))).reshape(shape)
+            elif isinstance(entry, dict) and "q" in entry:
                 t = dequantize_4bit(
                     entry["q"], entry["s"], entry["z"], entry["shape"],
                     group_size=self._group_size,
                 )
             elif isinstance(entry, tuple) and len(entry) == 4:
-                # Tuple format: (q, s, z, shape) — raw quantize_4bit output
                 t = dequantize_4bit(
                     entry[0], entry[1], entry[2], entry[3],
                     group_size=self._group_size,
@@ -358,6 +370,66 @@ class QuantizedExpertCache:
         if n_uploaded > 0:
             self._vk_enabled = True
         print(f"  [VK dequant] uploaded={n_uploaded} params, max_elems={max_elems}, enabled={self._vk_enabled}", flush=True)
+
+    def setup_vk_streaming(self, max_layers: int = 999):
+        """Upload q4 for layers 0..max_layers-1 to Vulkan. Accelerates _dequant_cpu.
+
+        Args:
+            max_layers: Only upload layers with index < max_layers (default: all)
+        """
+        try:
+            import os, sys
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vulkan', 'build', 'Release'))
+            os.add_dll_directory(os.environ.get('VULKAN_SDK', 'C:/VulkanSDK/1.4.341.1') + '/Bin')
+            import usaf_vk
+            usaf_vk.set_spirv_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vulkan', 'build', 'spirv'))
+        except Exception:
+            return
+
+        self._vk_q4_all = {}
+        n = 0
+        max_elems = 0
+        for expert_name, entries in self._expert_to_params.items():
+            # Only upload layers within range
+            parts = expert_name.split(".")
+            if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
+                try:
+                    layer_idx = int(parts[2])
+                    if layer_idx >= max_layers:
+                        continue
+                except ValueError:
+                    pass
+            for full_name, local_name in entries:
+                entry = self._q_dict.get(full_name)
+                if entry is None:
+                    continue
+                q4 = entry[0].numpy()
+                scales = entry[1].numpy()
+                zeros = entry[2].numpy()
+                shape = entry[3]
+                in_feats = int(shape[-1])
+                total_elems = 1
+                for s in shape:
+                    total_elems *= int(s)
+                out_rows = total_elems // in_feats
+                n_groups = total_elems // 128
+
+                q_gpu = np.ascontiguousarray(q4[:n_groups, :].reshape(out_rows, in_feats // 2))
+                s_gpu = np.ascontiguousarray(scales[:n_groups].reshape(out_rows, in_feats // 128).astype(np.float16))
+                z_gpu = np.ascontiguousarray(zeros[:n_groups].reshape(out_rows, in_feats // 128).astype(np.float16))
+
+                h_q = usaf_vk.create_buf(q_gpu.nbytes, True)
+                h_s = usaf_vk.create_buf(s_gpu.nbytes, True)
+                h_z = usaf_vk.create_buf(z_gpu.nbytes, True)
+                usaf_vk.upload(h_q, q_gpu)
+                usaf_vk.upload(h_s, s_gpu)
+                usaf_vk.upload(h_z, z_gpu)
+                self._vk_q4_all[full_name] = (h_q, h_s, h_z, out_rows, in_feats, total_elems)
+                max_elems = max(max_elems, total_elems)
+                n += 1
+        if max_elems > 0:
+            self._vk_out_buf = usaf_vk.create_buf(max_elems * 2, True)
+        print(f"  [VK streaming] uploaded={n} params, out_buf={max_elems*2/1e6:.0f}MB", flush=True)
 
     def apply_resident_overlays(self, active_idx, masters):
         """Scatter initial master values into resident tensors (call once after selection)."""

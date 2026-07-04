@@ -406,6 +406,14 @@ capture_store=sparse_store
 cache.clear_prefetch()
 import gc; gc.collect()
 
+# VK streaming: upload q4 for FROZEN layers (0..DETACH_AT) to accelerate dequant
+USE_VK_STREAMING = os.environ.get("USE_VK_STREAMING", "0") == "1"
+if USE_VK_STREAMING:
+    t_vk = time.time()
+    # Only upload frozen layers — trainable layers use resident mode
+    cache.setup_vk_streaming(max_layers=DETACH_AT + 1)
+    print(f"  VK streaming ready in {time.time()-t_vk:.0f}s")
+
 # ── Frozen cache: precompute hidden@DETACH_AT for all samples ──
 if USE_FROZEN_CACHE:
     from usaf.frozen_cache import build_frozen_cache, get_hidden
