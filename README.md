@@ -4,7 +4,7 @@
 
 Fine-tune MoE models on hardware that can barely run inference.
 
-Qwen3-30B-A3B needs 60GB in fp16. Full fine-tuning needs 120GB+. USAF trains 26M out of 4.8B parameters on a 12GB GPU — the only method that works on AMD and the only one that trains expert weights and the router.
+Qwen3-30B-A3B (used in all benchmarks on this page) needs 60GB in fp16. Full fine-tuning needs 120GB+. USAF trains 26M out of 4.8B parameters on a 12GB GPU — the only method that works on AMD and the only one that trains expert weights and the router.
 
 ---
 

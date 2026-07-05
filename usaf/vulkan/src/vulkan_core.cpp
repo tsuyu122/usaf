@@ -23,17 +23,27 @@ ComputeContext init_compute(const std::string& app_name) {
     ComputeContext ctx;
 
     vk::ApplicationInfo app_info(app_name.c_str(), 1, "USAF", 1, VK_API_VERSION_1_3);
+    
+    bool enable_validation = false;
+    const char* val_env = getenv("VK_VALIDATION");
+    if (val_env && strcmp(val_env, "1") == 0) enable_validation = true;
+    
+    uint32_t layer_count = enable_validation ? 1 : 0;
     const char* layers[] = {"VK_LAYER_KHRONOS_validation"};
+    uint32_t ext_count = enable_validation ? 1 : 0;
     const char* inst_exts[] = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
 
-    // Register debug callback for validation layer messages (pNext chain)
-    vk::DebugUtilsMessengerCreateInfoEXT debug_ci(
-        {},
-        vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning | vk::DebugUtilsMessageSeverityFlagBitsEXT::eError,
-        vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral | vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation,
-        debug_callback);
+    vk::DebugUtilsMessengerCreateInfoEXT debug_ci;
+    if (enable_validation) {
+        debug_ci = vk::DebugUtilsMessengerCreateInfoEXT(
+            {},
+            vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning | vk::DebugUtilsMessageSeverityFlagBitsEXT::eError,
+            vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral | vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation,
+            debug_callback);
+    }
 
-    vk::InstanceCreateInfo instance_ci({}, &app_info, 1, layers, 1, inst_exts, &debug_ci);
+    vk::InstanceCreateInfo instance_ci({}, &app_info, layer_count, layers, ext_count, inst_exts,
+                                       enable_validation ? &debug_ci : nullptr);
     ctx.instance = vk::createInstance(instance_ci);
 
     auto phys_devices = ctx.instance.enumeratePhysicalDevices();
