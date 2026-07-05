@@ -187,20 +187,20 @@ class VKLayer:
         
         scores_np = np.concatenate(all_scores, axis=0)  # [nH, S, S]
         
-        # ── 5. Clean GPU state before attention kernel (prevents resource corruption) ──
-        usaf_vk.barrier()
-        
-        # ── 6. Softmax + V-proj via VK kernel ──
-        hscores = alloc((nH, S * S))
-        usaf_vk.upload(hscores, scores_np.reshape(nH, S * S).astype(np.float16))
-        hv_all = alloc((nKV, S, hd))
-        usaf_vk.upload(hv_all, v_heads.astype(np.float16))
-        h_attn = alloc((nH, S, hd))
-        usaf_vk.attn_softmax_pipe(hscores, hv_all, h_attn, nH, nKV, S, hd, 1)
-        
-        # ── 7. O-proj ──
-        attn_np = usaf_vk.download(h_attn, [nH, S, hd]).view(np.float16)
-        attn_flat = attn_np.transpose(1, 0, 2).reshape(B * S, nH * hd)
+        # CPU attention — guaranteed correct. VK kernel has persistent context
+        # corruption bug (works in isolation, fails in pipeline). Fix TBD.
+        attn_out = np.zeros((nH, S, hd), dtype=np.float32)
+        for kv_h in range(nKV):
+            for qi in range(n_rep):
+                qh = qi + kv_h * n_rep
+                s = scores_np[qh].copy()
+                for r in range(S):
+                    for c in range(r + 1, S): s[r, c] = -1e10
+                sm = s.max(axis=-1, keepdims=True)
+                se = np.exp(s - sm); se[s < -1e9] = 0
+                ss = se / np.maximum(se.sum(axis=-1, keepdims=True), 1e-10)
+                attn_out[qh] = np.dot(ss, v_heads[kv_h].astype(np.float32))
+        attn_flat = attn_out.transpose(1, 0, 2).reshape(B * S, nH * hd)
         
         h_attn_flat = alloc((B * S, nH * hd))
         usaf_vk.upload(h_attn_flat, attn_flat.astype(np.float16))
@@ -220,7 +220,7 @@ class VKLayer:
         post_norm = usaf_vk.download(h_post_norm, [B * S, H]).view(np.float16).reshape(B, S, H)
         
         # Cleanup
-        all_bufs = [hx, hrms, hq, hk, hv_buf, hcos, hsin, hq_rope, hk_rope, hscores, hv_all, h_attn, h_attn_flat, ho, h_residual, h_post_norm]
+        all_bufs = [hx, hrms, hq, hk, hv_buf, hcos, hsin, hq_rope, hk_rope, h_attn_flat, ho, h_residual, h_post_norm]
         if "self_attn.q_norm.weight" in self.bufs:
             all_bufs.extend([hq_normed, hk_normed, hq_rope_in, hk_rope_in])
         for h in all_bufs:
