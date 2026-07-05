@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="usaf",
-    version="0.2.0",
+    version="1.0.0-alpha.1",
     description="Ultra Sparse Adaptive Fine-Tuning for MoE models",
     author="USAF Team",
     packages=find_packages(),

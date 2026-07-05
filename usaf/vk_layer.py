@@ -158,9 +158,9 @@ class VKLayer:
         hk_rope = alloc((B * S, nKV * hd))
         usaf_vk.rope_pipe(hq_rope_in, hk_rope_in, hcos, hsin, hq_rope, hk_rope, B, nH, nKV, S, hd)
         
-        # ── 4. Attention: Q@K^T on CPU (correctness over speed), softmax+@V on CPU ──
-        # CPU attention — correct but slow. VK GEMM+softmax kernel WIP (100% error).
-        # Download Q/K/V for reshaping (6MB total)
+        # Attention: Q@K^T via VK GEMM, softmax+V-proj via vectorized numpy.
+        # VK attn_softmax kernel has context corruption bug — works in isolation
+        # but produces wrong results after multiple dispatches. CPU path used for correctness.
         hq_np = usaf_vk.download(hq_rope, [B * S, nH * hd]).view(np.float16)
         hk_np = usaf_vk.download(hk_rope, [B * S, nKV * hd]).view(np.float16)
         hv_np = usaf_vk.download(hv_buf, [B * S, nKV * hd]).view(np.float16)
@@ -187,20 +187,32 @@ class VKLayer:
         
         scores_np = np.concatenate(all_scores, axis=0)  # [nH, S, S]
         
-        # CPU attention — guaranteed correct. VK kernel has persistent context
-        # corruption bug (works in isolation, fails in pipeline). Fix TBD.
-        attn_out = np.zeros((nH, S, hd), dtype=np.float32)
+        # Vectorized CPU attention (numpy, ~100x faster than Python loops)
+        # Q@K^T scores already computed via VK GEMM. Apply causal mask + softmax + V-proj.
+        # Equivalent to the VK kernel but runs on CPU for correctness.
+        attn_flat = np.zeros((B * S, nH * hd), dtype=np.float32)
         for kv_h in range(nKV):
+            q_start, q_end = kv_h * n_rep, (kv_h + 1) * n_rep
+            s_block = scores_np[q_start:q_end].astype(np.float32)  # [n_rep, S, S]
+            v_block = v_heads[kv_h].astype(np.float32)  # [S, hd]
+            
+            # Causal mask: upper triangle -> -inf
+            mask = np.triu(np.ones((S, S), dtype=np.float32), k=1) * (-1e10)
+            s_masked = s_block + mask  # [n_rep, S, S]
+            
+            # Softmax (numerically stable)
+            s_max = s_masked.max(axis=-1, keepdims=True)  # [n_rep, S, 1]
+            s_exp = np.exp(s_masked - s_max)  # [n_rep, S, S]
+            s_sum = s_exp.sum(axis=-1, keepdims=True)  # [n_rep, S, 1]
+            s_soft = s_exp / np.maximum(s_sum, 1e-10)  # [n_rep, S, S]
+            
+            # @V: [n_rep, S, S] @ [S, hd] = [n_rep, S, hd]
+            attn_block = np.matmul(s_soft, v_block)  # [n_rep, S, hd]
+            
+            # Write to flat output
             for qi in range(n_rep):
-                qh = qi + kv_h * n_rep
-                s = scores_np[qh].copy()
-                for r in range(S):
-                    for c in range(r + 1, S): s[r, c] = -1e10
-                sm = s.max(axis=-1, keepdims=True)
-                se = np.exp(s - sm); se[s < -1e9] = 0
-                ss = se / np.maximum(se.sum(axis=-1, keepdims=True), 1e-10)
-                attn_out[qh] = np.dot(ss, v_heads[kv_h].astype(np.float32))
-        attn_flat = attn_out.transpose(1, 0, 2).reshape(B * S, nH * hd)
+                qh = q_start + qi
+                attn_flat[:, qh * hd:(qh + 1) * hd] = attn_block[qi].astype(np.float16)
         
         h_attn_flat = alloc((B * S, nH * hd))
         usaf_vk.upload(h_attn_flat, attn_flat.astype(np.float16))

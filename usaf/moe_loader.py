@@ -57,21 +57,6 @@ def load_quantized_state_dict(
     return loaded
 
 
-def _parse_expert_param_name(
-    full_name: str,
-    expert_module_name: str,
-) -> Optional[str]:
-    """Return the local parameter name if ``full_name`` belongs to ``expert_module_name``.
-
-    E.g. ``_parse_expert_param_name("model.layers.0.mlp.experts.gate_up_proj", "model.layers.0.mlp.experts")``
-    returns ``"gate_up_proj"``.
-    """
-    prefix = expert_module_name + "."
-    if full_name.startswith(prefix):
-        return full_name[len(prefix):]
-    return None
-
-
 class QuantizedExpertCache:
     """LRU cache that holds quantized expert weights on CPU and dequantizes on demand.
 
@@ -125,8 +110,8 @@ class QuantizedExpertCache:
         self._resident: Dict[str, Dict[str, torch.Tensor]] = {}
         self._resident_active: bool = False
 
+        # Vulkan GPU dequant buffers
         self._vk_q4: Dict[str, tuple] = {}
-        self._vk_enabled: bool = False
 
     def _build_index(self) -> None:
         """Index quantized parameters by their expert module name.
@@ -444,7 +429,6 @@ class QuantizedExpertCache:
             aidx_flat = aidx.reshape(-1).to(torch.long)
             vals = masters[fname].data.detach().to(torch.float16)
             base.reshape(-1).scatter_(0, aidx_flat, vals)
-        self._resident_synced = True
 
     def sync_resident(self, active_idx, masters):
         """Propagate optimizer master updates into resident fp16 tensors.
@@ -465,7 +449,6 @@ class QuantizedExpertCache:
             aidx_flat = aidx.reshape(-1).to(torch.long)
             vals = masters[fname].data.detach().to(torch.float16)
             base.reshape(-1).scatter_(0, aidx_flat, vals)
-        self._resident_synced = True
 
     def prefetch(self, expert_module_name: str) -> None:
         """Schedule async CPU dequantization of an expert module."""

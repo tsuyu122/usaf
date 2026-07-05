@@ -51,7 +51,6 @@ class DynamicSelector:
         self.selection = selection
         self._step_counter = 0
         self._active_mask: dict[str, torch.Tensor] = {}
-        self._initialized = False
 
     def should_reselect(self) -> bool:
         self._step_counter += 1
@@ -68,7 +67,6 @@ class DynamicSelector:
         else:
             selector = ThresholdSelector(99.98)
         self._active_mask = selector.select(scores)
-        self._initialized = True
         return self._active_mask
 
     @property

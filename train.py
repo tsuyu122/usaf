@@ -1,8 +1,8 @@
 """Qwen3-30B-A3B 12h training — curated bugfix+Vulkan dataset with USAF sparse fine-tuning."""
-import json, math, os, random, sys, time
+import json, math, os, random, time
 from pathlib import Path
 import psutil, torch
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig
 from safetensors import safe_open
 from usaf.qwen3moe_dml import patch_qwen3moe_for_dml
 from usaf.sparse_optim import SparseAdam
@@ -365,7 +365,9 @@ def eval_ppl(slist,n=8):
             cidx=s.get("_fidx")
             loss=model_fwd(ids,lbl,cache_idx=cidx)
             nt=(lbl!=-100).sum().item(); tl+=loss.item()*nt; tt+=nt
-        except: continue
+        except (IndexError, RuntimeError): continue
+        except Exception:
+            pass
     return (tl/max(tt,1),math.exp(tl/max(tt,1))) if tt>0 else (float("inf"),float("inf"))
 
 def log_jsonl(rec):
