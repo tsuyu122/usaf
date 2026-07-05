@@ -317,23 +317,18 @@ def fwd_bwd(batch,zero_store=True):
         for i in range(DETACH_AT+1,N_LAYERS):
             if i+1<N_LAYERS: cache.prefetch(_experts_name(i+1))
             xs.append(hidden)
-            # Vulkan accelerated Q/K/V projections -> native DML attention (verified: loss 1.8057)
+            # Vulkan full attention block -> post-norm hidden, DML handles MLP only
             if USE_VK and i in VK_LAYERS:
                 import numpy as np
                 h_np = hidden.cpu().numpy().astype(np.float16)
-                q_np, k_np, v_np = VK_LAYERS[i].forward(h_np, np.zeros((1,)), np.zeros((1,)))
-                q_t = torch.from_numpy(np.ascontiguousarray(q_np.astype(np.float32))).to(device).half()
-                k_t = torch.from_numpy(np.ascontiguousarray(k_np.astype(np.float32))).to(device).half()
-                v_t = torch.from_numpy(np.ascontiguousarray(v_np.astype(np.float32))).to(device).half()
-                class VKProj(torch.nn.Module):
-                    def __init__(self, tensor): super().__init__(); self.t = tensor
-                    def forward(self, x): return self.t
-                attn = model.model.layers[i].self_attn
-                _orig_q, _orig_k, _orig_v = attn.q_proj, attn.k_proj, attn.v_proj
-                attn.q_proj = VKProj(q_t); attn.k_proj = VKProj(k_t); attn.v_proj = VKProj(v_t)
-                hidden = model.model.layers[i](
-                    hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
-                attn.q_proj = _orig_q; attn.k_proj = _orig_k; attn.v_proj = _orig_v
+                cos_np = pe[0].cpu().numpy().astype(np.float16)
+                sin_np = pe[1].cpu().numpy().astype(np.float16)
+                post_attn_np, post_norm_np = VK_LAYERS[i].forward_full(h_np, cos_np, sin_np)
+                post_norm_t = torch.from_numpy(np.ascontiguousarray(post_norm_np.astype(np.float32))).to(device).half()
+                post_attn_t = torch.from_numpy(np.ascontiguousarray(post_attn_np.astype(np.float32))).to(device).half()
+                mlp_out = model.model.layers[i].mlp(post_norm_t)
+                # MLP residual: post_attn + mlp_out (not original hidden + mlp_out)
+                hidden = post_attn_t + mlp_out
             else:
                 hidden=model.model.layers[i](
                     hidden,attention_mask=mask,position_ids=pos_ids,position_embeddings=pe)

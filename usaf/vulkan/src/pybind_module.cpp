@@ -230,6 +230,31 @@ static void attn_softmax_pipelined(int scores_h, int v_h, int out_h,
     dispatch(ctx(), cp->pipeline, nH, 1, 1, &pc, sizeof(pc));
 }
 
+static void residual_add_pipelined(int a_h, int b_h, int out_h, int N) {
+    ensure_init();
+    auto& ba = get_buf(a_h); auto& bb = get_buf(b_h); auto& bo = get_buf(out_h);
+
+    auto* cp = get_or_create_pipeline("residual_add",
+        {{0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+         {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+         {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}},
+        sizeof(uint32_t));
+    if (!cp->pipeline.pipeline) {
+        auto shader = load_shader(ctx(), g_spirv_dir.empty() ? "spirv/residual_add.spv" : (g_spirv_dir + "/residual_add.spv").c_str(), "main");
+        std::vector<vk::PushConstantRange> push = {{vk::ShaderStageFlagBits::eCompute, 0, sizeof(uint32_t)}};
+        cp->pipeline = create_compute_pipeline(ctx(), shader, {cp->layout_bindings[0], cp->layout_bindings[1], cp->layout_bindings[2]}, push);
+    }
+
+    vk::DescriptorBufferInfo dbis[3] = {{ba.buffer, 0, ba.size}, {bb.buffer, 0, bb.size}, {bo.buffer, 0, bo.size}};
+    std::vector<vk::WriteDescriptorSet> writes(3);
+    for (int i = 0; i < 3; i++) writes[i].setDstSet(cp->pipeline.desc_set).setDstBinding(i)
+        .setDescriptorType(vk::DescriptorType::eStorageBuffer).setBufferInfo(dbis[i]);
+    update_descriptor_set(ctx(), cp->pipeline, writes);
+    struct { uint32_t N; } pc = {(uint32_t)N};
+    uint32_t gx = (N + 255) / 256;
+    dispatch(ctx(), cp->pipeline, gx, 1, 1, &pc, sizeof(pc));
+}
+
 static py::tuple rope_pipelined(int q_h, int k_h, int cos_h, int sin_h,
                                  int qo_h, int ko_h,
                                  int B, int nH, int nKV, int S, int hd) {
@@ -505,6 +530,8 @@ PYBIND11_MODULE(usaf_vk, m) {
     m.def("attn_softmax_pipe", &attn_softmax_pipelined, "Attention softmax + V-proj: out = softmax(scores) @ V",
           py::arg("scores_handle"), py::arg("v_handle"), py::arg("out_handle"),
           py::arg("nH"), py::arg("nKV"), py::arg("S"), py::arg("hd"), py::arg("causal") = 1);
+    m.def("residual_add_pipe", &residual_add_pipelined, "Element-wise add: out = a + b",
+          py::arg("a_handle"), py::arg("b_handle"), py::arg("out_handle"), py::arg("N"));
 
     // Cleanup on module unload
     auto atexit = py::module_::import("atexit");
