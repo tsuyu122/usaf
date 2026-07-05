@@ -144,7 +144,7 @@ python -m usaf.train --model mistralai/Mixtral-8x7B --dataset data.jsonl
 | CUDA + AMP | Production |
 | Multi-GPU (DataParallel) | Production |
 | DirectML (AMD) | Production |
-| Vulkan acceleration | Experimental |
+| Vulkan acceleration | Broken |
 | Held-out evaluation | Production |
 
 ## Hardware

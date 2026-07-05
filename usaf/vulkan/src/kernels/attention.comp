@@ -2,12 +2,12 @@
 #extension GL_EXT_shader_16bit_storage : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
-// Softmax + V-proj: one workgroup per head.
-// Input: scores [nH, S, S] (already scaled), V [nKV, S, hd]
-// Output: attention output [nH, S, hd]
+// Attention: softmax + V-proj. One workgroup per output row (nH*S workgroups).
+// Each workgroup has 256 threads. No large private arrays — uses shared memory.
 //
-// Uses 2-pass approach: pass 1 finds max, pass 2 computes exp sum + V-proj.
-// No large local arrays. 256 threads per workgroup, 2 rows per thread for S=512.
+// Input: scores [nH, S, S] (already scaled by 1/sqrt(hd))
+// Input: V [nKV, S, hd]
+// Output: attention output [nH, S, hd]
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -23,53 +23,93 @@ layout(push_constant) uniform Push {
     uint causal;
 } pc;
 
-shared float s_max[512];   // per-row max values
-shared float s_sum[512];   // per-row exp sums
+shared float s_scores[256];  // 256 scores per workgroup iteration
+shared float s_v[256];       // 256 V elements per dimension
 
 void main() {
-    uint head_q = gl_WorkGroupID.x;
-    uint tid = gl_LocalInvocationID.x;
-    if (head_q >= pc.nH) return;
+    uint row_idx = gl_WorkGroupID.x;  // 0 .. nH*S-1
+    uint tid = gl_LocalInvocationID.x; // 0 .. 255
     
+    if (row_idx >= pc.nH * pc.S) return;
+    
+    uint head_q = row_idx / pc.S;
+    uint r = row_idx % pc.S;  // query position
     uint n_rep = pc.nH / pc.nKV;
     uint head_kv = head_q / n_rep;
-    uint scores_off = head_q * pc.S * pc.S;
-    uint v_off = head_kv * pc.S * pc.hd;
-    uint out_off = head_q * pc.S * pc.hd;
     
-    // Each thread handles up to 2 rows (for S=512 with 256 threads)
-    for (uint r_idx = 0; r_idx < 2; r_idx++) {
-        uint r = tid + r_idx * 256;
-        if (r >= pc.S) break;
-        
-        // Pass 1: find max for numerical stability
-        float max_val = -1e10;
-        for (uint c = 0; c < pc.S; c++) {
-            if (pc.causal != 0 && c > r) continue;
-            float s = float(scores[scores_off + r * pc.S + c]);
-            if (s > max_val) max_val = s;
-        }
-        
-        // Pass 2: compute exp sum (store per-column exps in registers, accumulate)
-        float exp_sum = 0.0;
-        float weighted[128]; // max hd = 128
-        for (uint d = 0; d < pc.hd && d < 128; d++) weighted[d] = 0.0;
-        
-        for (uint c = 0; c < pc.S; c++) {
-            if (pc.causal != 0 && c > r) continue;
-            float s = float(scores[scores_off + r * pc.S + c]);
-            float e = exp(s - max_val);
-            exp_sum += e;
-            // Accumulate weighted V sum in this same pass
-            for (uint d = 0; d < pc.hd && d < 128; d++) {
-                weighted[d] += e * float(v[v_off + c * pc.hd + d]);
+    uint scores_off = head_q * pc.S * pc.S + r * pc.S;
+    uint v_off = head_kv * pc.S * pc.hd;
+    uint out_off = row_idx * pc.hd;
+    
+    // Pass 1: find max score for this row (cooperative)
+    float max_val = -1e10;
+    for (uint c_tile = 0; c_tile < pc.S; c_tile += 256) {
+        uint c = c_tile + tid;
+        float val = -1e10;
+        if (c < pc.S) {
+            if (pc.causal == 0 || c <= r) {
+                val = float(scores[scores_off + c]);
             }
         }
-        
-        // Normalize and write output
-        float inv_sum = 1.0 / (exp_sum + 1e-10);
-        for (uint d = 0; d < pc.hd && d < 128; d++) {
-            result[out_off + r * pc.hd + d] = float16_t(weighted[d] * inv_sum);
+        // Reduction within workgroup: each thread puts its value, then reduce
+        s_scores[tid] = val;
+        barrier();
+        // Simple reduction: just have each thread check all 256 values
+        // For 256 threads this is fine
+        for (uint i = 0; i < 256 && (c_tile + i) < pc.S; i++) {
+            if (s_scores[i] > max_val) max_val = s_scores[i];
         }
+        barrier();
+    }
+    
+    // Pass 2: compute exp sum
+    float exp_sum = 0.0;
+    for (uint c_tile = 0; c_tile < pc.S; c_tile += 256) {
+        uint c = c_tile + tid;
+        float val = 0.0;
+        if (c < pc.S) {
+            if (pc.causal == 0 || c <= r) {
+                val = exp(float(scores[scores_off + c]) - max_val);
+            }
+        }
+        s_scores[tid] = val;
+        barrier();
+        // Each thread sums a portion
+        float partial = 0.0;
+        for (uint i = 0; i < 256 && (c_tile + i) < pc.S; i++) {
+            partial += s_scores[i];
+        }
+        exp_sum += partial;
+        barrier();
+    }
+    
+    float inv_sum = 1.0 / (exp_sum + 1e-10);
+    
+    // Pass 3: weighted V sum for each dimension
+    // Each of 256 threads computes one output dimension
+    for (uint d = tid; d < pc.hd; d += 256) {
+        float weighted = 0.0;
+        for (uint c_tile = 0; c_tile < pc.S; c_tile += 256) {
+            uint c = c_tile;
+            // Load scores and V for this tile
+            for (uint i = 0; i < 256 && (c_tile + i) < pc.S; i++) {
+                uint col = c_tile + i;
+                if (pc.causal == 0 || col <= r) {
+                    float score = float(scores[scores_off + col]);
+                    float exp_s = exp(score - max_val);
+                    s_scores[i] = exp_s;
+                    s_v[i] = float(v[v_off + col * pc.hd + d]);
+                } else {
+                    s_scores[i] = 0.0;
+                    s_v[i] = 0.0;
+                }
+            }
+            barrier();
+            for (uint i = 0; i < 256 && (c_tile + i) < pc.S; i++) {
+                weighted += s_scores[i] * inv_sum * s_v[i];
+            }
+            barrier();
+        }
+        result[out_off + d] = float16_t(weighted);
     }
 }
