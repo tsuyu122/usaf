@@ -90,6 +90,13 @@ print(f"  Epochs: ~{STEPS*_EFF*SEQ/(len(train_samples)*SEQ):.1f}x over {len(trai
 
 # ── 2. Model (fully manual, streaming quantized) ──
 print(f"\n2/4  Model ({len(train_samples)} samples, {STEPS} steps)")
+# Dense-masked MoE forward + per-expert grad-capture protocol. Despite the name
+# this is the core USAF mechanism (not a DML-only workaround): it routes the
+# sparse expert gradients into the capture store via module._grad_capture.
+# It MUST be applied on every backend — without it the native HF forward runs
+# but the sparse grads stay zero, so training silently does nothing on CUDA.
+patch_qwen3moe_for_dml()
+
 if USE_CUDA:
     assert torch.cuda.is_available(), "CUDA not available"
     device = torch.device("cuda")
@@ -97,7 +104,7 @@ if USE_CUDA:
     print(f"  CUDA: {n_gpus} GPU(s) detected")
     for i in range(n_gpus):
         p = torch.cuda.get_device_properties(i)
-        print(f"    GPU {i}: {p.name} ({p.total_mem/1e9:.1f}GB)")
+        print(f"    GPU {i}: {p.name} ({p.total_memory/1e9:.1f}GB)")
     if USE_AMP:
         _amp_scaler = torch.cuda.amp.GradScaler()
         torch.backends.cudnn.benchmark = True
@@ -107,7 +114,6 @@ if USE_CUDA:
     else:
         _amp_scaler = None
 else:
-    patch_qwen3moe_for_dml()
     import torch_directml_native
     torch_directml_native.disable_tiled_resources(True)
     device = get_dml_device()

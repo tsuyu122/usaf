@@ -142,15 +142,21 @@ def parse_args(args=None) -> TrainConfig:
 # ── Device Setup ──
 def setup_device(config: TrainConfig) -> Tuple[torch.device, int, object]:
     """Configure device, AMP scaler, and multi-GPU."""
+    # Core USAF grad-capture forward — required on EVERY backend (CUDA included),
+    # otherwise the native HF forward runs but the sparse expert grads stay zero
+    # and training silently does nothing. Not a DML-only workaround.
+    from usaf.qwen3moe_dml import patch_qwen3moe_for_dml
+    patch_qwen3moe_for_dml()
+
     if config.use_cuda:
         assert torch.cuda.is_available(), "CUDA requested but not available"
         device = torch.device("cuda")
         n_gpus = torch.cuda.device_count()
-        
+
         for i in range(n_gpus):
             p = torch.cuda.get_device_properties(i)
-            print(f"  GPU {i}: {p.name} ({p.total_mem/1e9:.1f}GB)")
-        
+            print(f"  GPU {i}: {p.name} ({p.total_memory/1e9:.1f}GB)")
+
         scaler = torch.cuda.amp.GradScaler() if config.use_amp else None
         if scaler:
             torch.backends.cudnn.benchmark = True
@@ -159,9 +165,7 @@ def setup_device(config: TrainConfig) -> Tuple[torch.device, int, object]:
             print("  AMP + cuDNN benchmark enabled")
     else:
         try:
-            from usaf.qwen3moe_dml import patch_qwen3moe_for_dml
             from usaf.utils import get_dml_device
-            patch_qwen3moe_for_dml()
             import torch_directml_native
             torch_directml_native.disable_tiled_resources(True)
             device = get_dml_device()
@@ -169,7 +173,7 @@ def setup_device(config: TrainConfig) -> Tuple[torch.device, int, object]:
             device = torch.device("cpu")
         n_gpus = 1
         scaler = None
-    
+
     return device, n_gpus, scaler
 
 
@@ -185,7 +189,7 @@ def main(args=None):
     print(f"\nModel: {config.model_path}")
     from usaf.model_factory import detect_model, get_trainable_layers, get_param_patterns, get_router_path
     
-    vram = torch.cuda.get_device_properties(0).total_mem/1e9 if torch.cuda.is_available() else 0
+    vram = torch.cuda.get_device_properties(0).total_memory/1e9 if torch.cuda.is_available() else 0
     moe_cfg = detect_model(config.model_path, vram_gb=vram)
     
     if not moe_cfg.is_moe:
