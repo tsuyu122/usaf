@@ -317,4 +317,8 @@ void wait_idle(ComputeContext& ctx) {
     ctx.device.waitIdle();
 }
 
+void reset_pools(ComputeContext& ctx) {
+    ctx.device.resetCommandPool(ctx.cmd_pool);
+}
+
 } // namespace usaf::vkcore

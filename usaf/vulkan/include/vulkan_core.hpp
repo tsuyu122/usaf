@@ -89,6 +89,7 @@ void dispatch(ComputeContext& ctx, ComputePipeline& pipeline,
               const void* push_data = nullptr, uint32_t push_size = 0);
 
 void wait_idle(ComputeContext& ctx);
+void reset_pools(ComputeContext& ctx);
 
 uint32_t find_memory_type(ComputeContext& ctx, uint32_t type_bits,
                           vk::MemoryPropertyFlags props);

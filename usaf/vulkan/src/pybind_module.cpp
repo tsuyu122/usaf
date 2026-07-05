@@ -512,6 +512,8 @@ PYBIND11_MODULE(usaf_vk, m) {
     m.def("destroy_buf", &destroy_device_buf, "Destroy a buffer",
           py::arg("handle"));
     m.def("barrier", &memory_barrier, "Insert a memory barrier between dispatches");
+    m.def("reset_pools", []() { ensure_init(); reset_pools(ctx()); },
+          "Reset command and descriptor pools (recycle GPU resources)");
 
     // ── Fase 8: Pipelined kernels (dispatch to buffers, no upload/download) ──
     m.def("rmsnorm_pipe", &rmsnorm_pipelined, "RMSNorm pipelined: out = rmsnorm(x, w)",

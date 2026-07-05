@@ -1,0 +1,40 @@
+{
+  "model": "Qwen3-30B-A3B-q4",
+  "phase": "3c_12h",
+  "steps": 1,
+  "seq": 512,
+  "accum": 1,
+  "train_layers": [
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47
+  ],
+  "active": 24159176,
+  "skipped": 0,
+  "lr_peak": 0.0002,
+  "frac": 0.005,
+  "wd": 0.005,
+  "train_init": 7.8125,
+  "train_final": 7.8125,
+  "eval_init_ppl": 1,
+  "eval_final_ppl": 1,
+  "eval_init_loss": 0,
+  "eval_final_loss": 0,
+  "heldout_init_ppl": 1,
+  "heldout_final_ppl": 1,
+  "heldout_repos": [
+    "flecs",
+    "sfml",
+    "entt",
+    "box2d"
+  ],
+  "tokens_trained": 512,
+  "time_hours": 0.05,
+  "peak_ram": 14.9,
+  "dataset": "bugfix(46%)+vulkan_code(37%)+general(9%)"
+}
