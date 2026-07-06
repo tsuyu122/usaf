@@ -1,0 +1,83 @@
+=== boot ===
+cgroup RAM limit (/sys/fs/cgroup/memory.max): 32.21225472
+pip install transformers==5.12.1 ...
+pip rc=0
+usaf package parent: /kaggle/input/datasets/tsuyu122/usaf-src
+INPUT dirs: ['datasets']
+resolved MODEL_PATH (base): /kaggle/input/datasets/tsuyu122/qwen3-30b-a3b-base
+resolved QUANT_PATH: /kaggle/input/datasets/tsuyu122/qwen3-30b-a3b-q4/experts_q4.pt
+resolved DATASET_PATH: /kaggle/input/datasets/tsuyu122/usaf-dataset/train_dataset.jsonl
+CUDA devices: 2
+  GPU 0: Tesla T4, 15.6GB VRAM
+  GPU 1: Tesla T4, 15.6GB VRAM
+Single GPU mode
+
+=== Loading model === (RAM 1.0/33.7GB used)
+transformers 5.12.1
+Model: 48 layers, H=2048, heads=32/4, hd=128
+MoE: 128 experts, 8 active, intermediate=768
+Trainable: 4 layers (44-47)
+Model loaded on cuda
+Applied qwen3moe grad-capture forward patch
+Applied SPARSE expert dispatch (top-k routed, CUDA gather/scatter)
+Loading q4 dict (RAM 2.1/33.7GB used) ...
+q4 dict loaded: 96 entries (RAM 17.0/33.7GB used)
+
+=== Loading dataset ===
+Train: 363, Eval: 10, Heldout: 10
+Tokens: 5,120 over 20 steps
+/kaggle/src/script.py:357: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler()
+AMP (Automatic Mixed Precision) enabled
+CUDA optimizations: cudnn.benchmark + tf32 enabled
+
+=== Training setup ===
+
+=== Frozen precompute (4 samples) === (RAM 17.0/33.7GB used)
+  frozen 1/4 | 151s | RAM 18.8/33.7GB used
+Frozen precompute done: 4 samples in 598s (149.4s/sample)
+Freed frozen q4 (layers 0..43) (RAM 5.1/33.7GB used)
+Importance phase...
+  imp 1/3 | loss 1.6738 | 63s | RAM 10.6/33.7GB used
+  imp 2/3 | loss 1.1143 | 107s | RAM 10.9/33.7GB used
+  imp 3/3 | loss 1.5312 | 154s | RAM 11.2/33.7GB used
+Active: 12,079,588/2,415,919,104 (0.5000%)
+Building optimizer (RAM 16.2/33.7GB used) ...
+
+=== Training (20 steps) ===
+Batch: 1x1=1, Tokens/step: 256
+LR: 0.0002, Sparsity: 0.005, Reselect: every 50
+RAM: 14.3GB
+Probe loss (sample 0) BEFORE training: 1.6738
+  [#-------------------------]   5.0% | step 001/20 | loss 1.6738 | 4 tok/s | LR 2.0e-04 | RAM 14.3G | ETA 0.3h
+  [##-------------------------]  10.0% | step 002/20 | loss 1.1133 | 4 tok/s | LR 2.0e-04 | RAM 14.3G | ETA 0.3h
+  [###-------------------------]  15.0% | step 003/20 | loss 1.5088 | 4 tok/s | LR 2.0e-04 | RAM 14.3G | ETA 0.3h
+  [#####-------------------------]  20.0% | step 004/20 | loss 1.5215 | 4 tok/s | LR 1.9e-04 | RAM 14.3G | ETA 0.3h
+  [######-------------------------]  25.0% | step 005/20 | loss 1.3301 | 4 tok/s | LR 1.8e-04 | RAM 14.3G | ETA 0.3h
+  [#######-------------------------]  30.0% | step 006/20 | loss 1.0830 | 4 tok/s | LR 1.7e-04 | RAM 14.3G | ETA 0.2h
+  [########-------------------------]  35.0% | step 007/20 | loss 0.8984 | 4 tok/s | LR 1.6e-04 | RAM 14.3G | ETA 0.2h
+  [##########-------------------------]  40.0% | step 008/20 | loss 1.4072 | 4 tok/s | LR 1.5e-04 | RAM 14.3G | ETA 0.2h
+  [###########-------------------------]  45.0% | step 009/20 | loss 1.2119 | 4 tok/s | LR 1.3e-04 | RAM 14.3G | ETA 0.2h
+  [############-------------------------]  50.0% | step 010/20 | loss 1.0684 | 4 tok/s | LR 1.2e-04 | RAM 14.3G | ETA 0.2h
+  [#############-------------------------]  55.0% | step 011/20 | loss 0.7397 | 4 tok/s | LR 1.0e-04 | RAM 14.3G | ETA 0.1h
+  [###############-------------------------]  60.0% | step 012/20 | loss 1.3330 | 4 tok/s | LR 8.8e-05 | RAM 14.3G | ETA 0.1h
+  [################-------------------------]  65.0% | step 013/20 | loss 1.1523 | 4 tok/s | LR 7.4e-05 | RAM 14.3G | ETA 0.1h
+  [#################-------------------------]  70.0% | step 014/20 | loss 1.0596 | 4 tok/s | LR 6.1e-05 | RAM 14.3G | ETA 0.1h
+  [##################-------------------------]  75.0% | step 015/20 | loss 0.6738 | 4 tok/s | LR 4.9e-05 | RAM 14.3G | ETA 0.1h
+  [####################-------------------------]  80.0% | step 016/20 | loss 1.2949 | 4 tok/s | LR 3.9e-05 | RAM 14.3G | ETA 0.1h
+  [#####################-------------------------]  85.0% | step 017/20 | loss 1.1260 | 4 tok/s | LR 3.1e-05 | RAM 14.3G | ETA 0.1h
+  [######################-------------------------]  90.0% | step 018/20 | loss 1.0547 | 4 tok/s | LR 2.5e-05 | RAM 14.3G | ETA 0.0h
+  [#######################-------------------------]  95.0% | step 019/20 | loss 0.6475 | 4 tok/s | LR 2.1e-05 | RAM 14.3G | ETA 0.0h
+  [#########################-------------------------] 100.0% | step 020/20 | loss 1.2793 | 4 tok/s | LR 2.0e-05 | RAM 14.3G | ETA 0.0h
+
+=== Training complete ===
+Probe loss (sample 0): 1.6738 -> 1.1152 (delta -0.5586)
+Time: 0.3h
+Loss: 1.6738 -> 1.2793 (min: 0.6475)
+Peak RAM: 14.3GB
+Skipped: 0 steps
+Tok/s avg (all): 4.3
+Steady-state (excl 3 warmup): 60.0s/step, 4.3 tok/s
+Extrapolated 180 steps: 3.00h
+GPU: Tesla T4 | VRAM peak: 8.0GB
+Checkpoint saved: checkpoints/usaf_cuda_bench.pt

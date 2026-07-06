@@ -242,6 +242,51 @@ from usaf.qwen3moe_dml import patch_qwen3moe_for_dml
 patch_qwen3moe_for_dml()
 print("Applied qwen3moe grad-capture forward patch")
 
+# ---- SPARSE expert dispatch (CUDA) ------------------------------------------
+# The dml patch computes ALL 128 experts for every token (dense-masked, ~16x
+# wasted compute). On CUDA gather/scatter work, so route each expert to ONLY
+# its assigned tokens (top-k). Numerically identical to the dense-masked forward
+# (non-routed tokens had weight 0), just far less compute. Keeps the same
+# per-expert grad-capture protocol (store.add). Requires the sparse-store path
+# (TopKImportanceStore / SparseGradStore), which this benchmark uses.
+import torch.nn.functional as _F
+def sparse_qwen3_experts_forward(self, hidden_states, weights):
+    N, Hd = hidden_states.shape
+    final = torch.zeros(N, Hd, dtype=torch.float32, device=hidden_states.device)
+    gup, dwn = self.gate_up_proj, self.down_proj
+    capture = torch.is_grad_enabled() and getattr(self, "_grad_capture", None) is not None
+    if capture:
+        store, prefix = self._grad_capture
+        def _mk(full_name, ei):
+            def _hook(g):
+                store.add(full_name, ei, g)
+            return _hook
+    for ei in range(self.num_experts):
+        w_col = weights[:, ei]
+        idx = torch.nonzero(w_col, as_tuple=False).reshape(-1)
+        if idx.numel() == 0:
+            continue
+        x_e = hidden_states.index_select(0, idx)
+        wg = gup[ei].detach()
+        wd = dwn[ei].detach()
+        if capture:
+            wg.requires_grad_(True); wd.requires_grad_(True)
+            wg.register_hook(_mk(prefix + ".gate_up_proj", ei))
+            wd.register_hook(_mk(prefix + ".down_proj", ei))
+        gu = _F.linear(x_e, wg)
+        gate, up = gu.chunk(2, dim=-1)
+        cur = self.act_fn(gate) * up
+        cur = _F.linear(cur, wd)
+        cur = cur.float() * w_col.index_select(0, idx).float().unsqueeze(-1)
+        final = final.index_add(0, idx, cur)
+    return final.to(hidden_states.dtype)
+
+USE_SPARSE_DISPATCH = os.environ.get("DENSE", "0") != "1"
+if USE_SPARSE_DISPATCH:
+    from transformers.models.qwen3_moe import modeling_qwen3_moe as _mq
+    _mq.Qwen3MoeExperts.forward = sparse_qwen3_experts_forward
+    print("Applied SPARSE expert dispatch (top-k routed, CUDA gather/scatter)")
+
 # ===============================================
 # Q4 EXPERT CACHE
 # ===============================================
