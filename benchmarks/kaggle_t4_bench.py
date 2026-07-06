@@ -281,11 +281,63 @@ def sparse_qwen3_experts_forward(self, hidden_states, weights):
         final = final.index_add(0, idx, cur)
     return final.to(hidden_states.dtype)
 
-USE_SPARSE_DISPATCH = os.environ.get("DENSE", "0") != "1"
-if USE_SPARSE_DISPATCH:
+def batched_sparse_experts_forward(self, hidden_states, weights):
+    # Grouped/batched GEMM: group tokens by expert into a padded [E, cap, H]
+    # tensor and run ALL experts with 2 bmm launches (instead of a 128-iteration
+    # Python loop of tiny GEMMs). Numerically identical to the dense-masked path.
+    N, Hd = hidden_states.shape
+    E = self.num_experts
+    dev = hidden_states.device
+    gup, dwn = self.gate_up_proj, self.down_proj  # [E,2I,H], [E,H,I]
+
+    tok_idx, exp_idx = torch.nonzero(weights, as_tuple=True)  # top-k pairs
+    if tok_idx.numel() == 0:
+        return torch.zeros(N, Hd, dtype=hidden_states.dtype, device=dev)
+    counts = torch.bincount(exp_idx, minlength=E)
+    cap = int(counts.max().item())
+    order = torch.argsort(exp_idx, stable=True)
+    exp_s = exp_idx[order]; tok_s = tok_idx[order]
+    offs = torch.zeros(E, dtype=torch.long, device=dev)
+    offs[1:] = torch.cumsum(counts, 0)[:-1]
+    pos = torch.arange(exp_s.numel(), device=dev) - offs[exp_s]      # slot within expert
+    pad_tok = torch.zeros(E, cap, dtype=torch.long, device=dev)
+    pad_w = torch.zeros(E, cap, dtype=weights.dtype, device=dev)
+    pad_tok[exp_s, pos] = tok_s
+    pad_w[exp_s, pos] = weights[tok_s, exp_s]
+
+    x_b = hidden_states[pad_tok]                                     # [E,cap,H]
+    wg = gup.detach(); wd = dwn.detach()
+    capture = torch.is_grad_enabled() and getattr(self, "_grad_capture", None) is not None
+    if capture:
+        store, prefix = self._grad_capture
+        def _mk_all(full_name):
+            def _hook(g):                                           # g: [E,*,*]
+                for ei in range(E):
+                    store.add(full_name, ei, g[ei])
+            return _hook
+        wg.requires_grad_(True); wd.requires_grad_(True)
+        wg.register_hook(_mk_all(prefix + ".gate_up_proj"))
+        wd.register_hook(_mk_all(prefix + ".down_proj"))
+    gu = torch.bmm(x_b, wg.transpose(1, 2))                          # [E,cap,2I]
+    gate, up = gu.chunk(2, dim=-1)
+    cur = self.act_fn(gate) * up
+    cur = torch.bmm(cur, wd.transpose(1, 2))                         # [E,cap,H]
+    cur = cur.float() * pad_w.float().unsqueeze(-1)                  # route weight; padding=0
+    final = torch.zeros(N, Hd, dtype=torch.float32, device=dev)
+    final = final.index_add(0, pad_tok.reshape(-1), cur.reshape(-1, Hd))
+    return final.to(hidden_states.dtype)
+
+_MODE = os.environ.get("DISPATCH", "batched")  # batched | loop | dense
+if _MODE != "dense" and os.environ.get("DENSE", "0") != "1":
     from transformers.models.qwen3_moe import modeling_qwen3_moe as _mq
-    _mq.Qwen3MoeExperts.forward = sparse_qwen3_experts_forward
-    print("Applied SPARSE expert dispatch (top-k routed, CUDA gather/scatter)")
+    if _MODE == "loop":
+        _mq.Qwen3MoeExperts.forward = sparse_qwen3_experts_forward
+        print("Applied SPARSE expert dispatch: per-expert LOOP")
+    else:
+        _mq.Qwen3MoeExperts.forward = batched_sparse_experts_forward
+        print("Applied SPARSE expert dispatch: BATCHED grouped GEMM (2 bmm)")
+else:
+    print("Using DENSE-masked expert forward")
 
 # ===============================================
 # Q4 EXPERT CACHE
