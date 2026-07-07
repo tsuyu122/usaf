@@ -4,8 +4,6 @@ from transformers import AutoModelForCausalLM
 
 
 class ImportanceScorer:
-    # tabelas gigantes (vocab x hidden) cujo gradiente estoura a VRAM e que
-    # normalmente não queremos fine-tunar — excluídas do scoring por padrão
     DEFAULT_SKIP = ("embed_tokens", "lm_head")
 
     def __init__(
@@ -28,8 +26,6 @@ class ImportanceScorer:
         max_batches: int = 0,
     ) -> dict[str, torch.Tensor]:
         self.model.eval()
-        # score POR-ELEMENTO: soma de |grad| em cada posição, acumulada na CPU.
-        # É o que torna a seleção TopK significativa no nível de elemento.
         grad_accum: dict[str, torch.Tensor] = {}
 
         param_name_map = {}
@@ -45,8 +41,6 @@ class ImportanceScorer:
         MAX_CONSECUTIVE_SKIPS = 20
         total = max_batches if max_batches > 0 else len(dataloader)
         _t0 = _time.time()
-        # progresso impresso em UMA linha a cada N batches (sem flood de tqdm,
-        # que vira milhares de linhas quando a saída é capturada/redirecionada)
         log_every = max(1, total // 20)
         for batch in dataloader:
             if max_batches > 0 and batches_processed >= max_batches:
@@ -70,7 +64,6 @@ class ImportanceScorer:
                 try:
                     outputs = self.model(input_ids=input_ids, labels=labels)
                 except TypeError:
-                    # modelos multimodais (ex.: gemma4) exigem pixel_values explícito
                     outputs = self.model(input_ids=input_ids, labels=labels, pixel_values=None)
 
                 loss = outputs.loss
@@ -80,8 +73,6 @@ class ImportanceScorer:
 
                     for name, param in param_name_map.items():
                         if param.grad is not None:
-                            # CPU primeiro (transfere fp16), depois abs/float na CPU:
-                            # evita o spike de fp32 na VRAM que travava o driver DML
                             g = param.grad.detach().cpu().float().abs_()
                             if name in grad_accum:
                                 grad_accum[name] += g
@@ -91,7 +82,6 @@ class ImportanceScorer:
                 batches_processed += 1
                 consecutive_skips = 0
             except RuntimeError as e:
-                # um batch que estoura a VRAM não deve matar a run inteira
                 if "memory" in str(e).lower() or "allocate" in str(e).lower():
                     consecutive_skips += 1
                     print(f"\n[skip] batch sem memória, pulando: {str(e)[:60]}")
@@ -102,7 +92,6 @@ class ImportanceScorer:
                 else:
                     raise
             finally:
-                # libera os grads da GPU antes do próximo batch
                 self.model.zero_grad(set_to_none=True)
                 del input_ids, labels
                 if self.device.type == "privateuseone":
@@ -121,7 +110,6 @@ class ImportanceScorer:
         return scores
 
     def save_scores(self, scores: dict[str, torch.Tensor], path: str):
-        # fp16 basta para o ranking do TopK e corta o arquivo pela metade
         scores_fp16 = {k: v.half() for k, v in scores.items()}
         torch.save(scores_fp16, path)
 

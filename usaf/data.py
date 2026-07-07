@@ -44,9 +44,12 @@ def read_file_content(filepath: str, deduplicate_lines: bool = True) -> str:
         unique = []
         for line in lines:
             stripped = line.rstrip()
-            if stripped and stripped not in seen:
+            if not stripped:
+                unique.append(line)
+                continue
+            if stripped not in seen:
                 seen.add(stripped)
-            unique.append(line)
+                unique.append(line)
         content = "\n".join(unique)
     return content
 

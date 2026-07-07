@@ -19,10 +19,10 @@ def dml_experts_forward(self, hidden_states: torch.Tensor, weights: torch.Tensor
     """
     hs32 = hidden_states.float()
     final = torch.zeros_like(hs32)
-    weights_t = weights.t().contiguous()  # [E, N] — index dim 0 (DML-safe backward)
+    weights_t = weights.t().contiguous()
 
     for expert_idx in range(self.num_experts):
-        w = weights_t[expert_idx].float()  # [N]
+        w = weights_t[expert_idx].float()
         gu = F.linear(hs32, self.gate_up_proj[expert_idx].float())
         gate, up = gu.chunk(2, dim=-1)
         current = self.act_fn(gate) * up
@@ -36,20 +36,18 @@ def dml_experts_forward(self, hidden_states: torch.Tensor, weights: torch.Tensor
 def dml_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     """MoE block without topk in the gradient path and without one_hot."""
     batch_size, sequence_length, hidden_dim = hidden_states.shape
-    hs = hidden_states.view(-1, hidden_dim)  # [N, H]
+    hs = hidden_states.view(-1, hidden_dim)
 
     router = self.gate
-    router_logits = F.linear(hs, router.weight)                    # [N, E]
+    router_logits = F.linear(hs, router.weight)
     router_probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
 
-    # top-k mask WITHOUT scatter: compare against k-th largest value per token.
-    # topk runs only to find the threshold, inside no_grad (excluded from graph).
     with torch.no_grad():
-        top_val, _ = torch.topk(router_probs, router.top_k, dim=-1)  # [N, top_k]
-        thresh = top_val[:, -1:].clone()                             # [N, 1] k-th largest
-        mask = (router_probs >= thresh).to(router_probs.dtype)       # [N, E] hard top-k
+        top_val, _ = torch.topk(router_probs, router.top_k, dim=-1)
+        thresh = top_val[:, -1:].clone()
+        mask = (router_probs >= thresh).to(router_probs.dtype)
 
-    weights = router_probs * mask                                    # grad flows via router_probs
+    weights = router_probs * mask
     if router.norm_topk_prob:
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
     weights = weights.to(hidden_states.dtype)

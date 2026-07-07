@@ -72,20 +72,10 @@ def setup_streaming(
 
     state: dict[str, int] = {"resident": 0, "max": 0}
 
-    # The device copy is discarded after backward so the canonical CPU Parameter
-    # never receives a .grad.  Capture via post_accumulate_grad_hook instead.
     if not hasattr(model, '_expert_grads'):
         model._expert_grads: dict[str, torch.Tensor] = {}
     grad_store = model._expert_grads
 
-    # Copy-restore strategy (stable CPU memory):
-    #   - The canonical expert Parameter lives permanently on CPU — the optimizer
-    #     holds a reference and updates .data in-place.
-    #   - In pre_hook we put a *copy* on device into _parameters; post_hook restores
-    #     the canonical object.  Only the device copy churns each forward; the CPU
-    #     side never reallocates.
-    #   The old approach moved the same tensor CPU→device→CPU, re-creating CPU
-    #   tensors every pass, which blew past 32 GB RSS and segfaulted.
     def make_pre_hook(mod_name: str):
         def pre_hook(module: nn.Module, _args: list) -> None:
             canon: dict[str, nn.Parameter] = {}
@@ -133,10 +123,6 @@ def setup_streaming(
     if verbose:
         print(f"  hooks de streaming em {len(expert_modules)} modulos de experts")
 
-    # Reentrant checkpointing recomputes each layer synchronously inside its own
-    # backward pass and *frees* it before the next layer. Non-reentrant (default)
-    # stacks recomputes → multiple expert layers resident at once → OOM.
-    # Reentrant guarantees ≤1 layer at a time.
     try:
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": True}

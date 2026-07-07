@@ -24,7 +24,7 @@ import torch.nn.functional as F
 def dml_qwen3_experts_forward(self, hidden_states: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     """Dense-masked expert loop over detached per-expert 2D slices."""
     final = torch.zeros(hidden_states.shape, dtype=torch.float32, device=hidden_states.device)
-    weights_t = weights.t().contiguous()  # [E, N] — select on a transposed view errors on DML
+    weights_t = weights.t().contiguous()
     gup, dwn = self.gate_up_proj, self.down_proj
 
     capture = torch.is_grad_enabled() and getattr(self, "_grad_capture", None) is not None
@@ -32,9 +32,6 @@ def dml_qwen3_experts_forward(self, hidden_states: torch.Tensor, weights: torch.
         store, prefix = self._grad_capture
 
         if isinstance(store, dict):
-            # dense mode: full-shape CPU fp16 buffers (importance scoring).
-            # Pre-allocate the buffers on the main thread — a lazy 805MB alloc
-            # inside the autograd thread under RAM pressure hard-crashes.
             def _make_hook(full_name: str, full_shape, ei: int):
                 def _hook(g: torch.Tensor) -> None:
                     buf = store.get(full_name)
@@ -44,17 +41,12 @@ def dml_qwen3_experts_forward(self, hidden_states: torch.Tensor, weights: torch.
                     buf[ei] += g.detach().to(device="cpu", dtype=torch.float16)
                 return _hook
         else:
-            # sparse mode: store implements add(full_name, ei, grad_slice)
-            # and keeps only the active elements (training steps).
             def _make_hook(full_name: str, full_shape, ei: int):
                 def _hook(g: torch.Tensor) -> None:
                     store.add(full_name, ei, g)
                 return _hook
 
     for ei in range(self.num_experts):
-        # fp16 detached VIEWS (zero-copy): fp32 copies would pin ~2.4GB per
-        # layer in the graph until backward. Compute in fp16 (AMP + loss
-        # scaling), accumulate in fp32.
         wg = gup[ei].detach()
         wd = dwn[ei].detach()
         if capture:
@@ -75,19 +67,17 @@ def dml_qwen3_experts_forward(self, hidden_states: torch.Tensor, weights: torch.
 def dml_qwen3_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     """MoE block without topk in the gradient path and without one_hot."""
     batch_size, sequence_length, hidden_dim = hidden_states.shape
-    hs = hidden_states.view(-1, hidden_dim)  # [N, H]
+    hs = hidden_states.view(-1, hidden_dim)
 
     router = self.gate
-    router_logits = F.linear(hs, router.weight)                    # [N, E]
+    router_logits = F.linear(hs, router.weight)
     router_probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
 
-    # top-k mask WITHOUT scatter: compare against k-th largest value per token.
-    # topk runs only to find the threshold, inside no_grad (excluded from graph).
     with torch.no_grad():
-        top_val, _ = torch.topk(router_probs, router.top_k, dim=-1)  # [N, top_k]
-        thresh = top_val[:, -1:].clone()                             # [N, 1] k-th largest
-        mask = (router_probs >= thresh).to(router_probs.dtype)       # [N, E] hard top-k
-    weights = router_probs * mask                                    # grad flows via router_probs
+        top_val, _ = torch.topk(router_probs, router.top_k, dim=-1)
+        thresh = top_val[:, -1:].clone()
+        mask = (router_probs >= thresh).to(router_probs.dtype)
+    weights = router_probs * mask
     if router.norm_topk_prob:
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
     weights = weights.to(hidden_states.dtype)

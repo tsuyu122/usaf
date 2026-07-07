@@ -388,8 +388,20 @@ def dequantize_with_outliers(packed: Dict[str, torch.Tensor]) -> torch.Tensor:
     outlier_idx = packed["outlier_indices"]
     outlier_val = packed["outlier_values"]
 
-    x = dequantize_4bit(q, s, z, shape, group_size=group_size)
-    x_flat = x.flatten()
-    x_flat = x_flat.to(torch.float32)
+    numel = 1
+    for dim in shape:
+        numel *= dim
+
+    n_outliers = outlier_idx.numel()
+    clean_numel = numel - n_outliers
+
+    clean = dequantize_4bit(
+        q, s, z, torch.Size([clean_numel]), group_size=group_size
+    ).flatten().to(torch.float32)
+
+    x_flat = torch.empty(numel, dtype=torch.float32)
+    mask = torch.ones(numel, dtype=torch.bool)
+    mask[outlier_idx] = False
+    x_flat[mask] = clean
     x_flat[outlier_idx] = outlier_val.float()
     return x_flat.view(shape).to(torch.float16)
