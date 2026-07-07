@@ -12,8 +12,8 @@ def _kth_largest_threshold(scores: dict[str, torch.Tensor], k: int) -> float:
     cat = torch.cat([s.reshape(-1) for s in scores.values()])
     n = cat.numel()
     k = max(1, min(k, n))
-    arr = cat.numpy()  # compartilha memória (CPU); partition faz 1 cópia
-    kth = n - k        # índice do k-ésimo maior em ordem crescente
+    arr = cat.numpy()
+    kth = n - k
     threshold = float(np.partition(arr, kth)[kth])
     del cat, arr
     return threshold

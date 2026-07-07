@@ -94,13 +94,8 @@ class QuantizedExpertCache:
 
         self._cache: OrderedDict[str, Dict[str, torch.Tensor]] = OrderedDict()
 
-        # sparse overlays: full param name -> (flat idx CPU long, live 1D value
-        # tensor). Applied on top of the dequantized tensor, so trained active
-        # elements override the frozen 4-bit base without full fp16 masters.
         self.overlays: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
 
-        # async prefetch: dequantization of the NEXT layer runs on a worker
-        # thread (pure CPU) while the GPU computes the current one.
         self._prefetched: Dict[str, Future] = {}
         self._executor: Optional[ThreadPoolExecutor] = None
 
@@ -110,8 +105,8 @@ class QuantizedExpertCache:
         self._resident: Dict[str, Dict[str, torch.Tensor]] = {}
         self._resident_active: bool = False
 
-        # Vulkan GPU dequant buffers
         self._vk_q4: Dict[str, tuple] = {}
+        self._vk_enabled: bool = False
 
     def _build_index(self) -> None:
         """Index quantized parameters by their expert module name.
@@ -157,7 +152,6 @@ class QuantizedExpertCache:
 
         if expert_module_name in self._resident:
             cpu_params = self._get_resident(expert_module_name)
-            # also dequant any params NOT in resident (e.g. down_proj in partial mode)
             deq = self._dequant_cpu(expert_module_name)
             for k, v in deq.items():
                 if k not in cpu_params:
@@ -197,7 +191,6 @@ class QuantizedExpertCache:
             if entry is None:
                 continue
 
-            # Try VK GPU dequant first (Fase 13: streaming acceleration)
             vk_info = self._vk_q4_all.get(full_name) if hasattr(self, '_vk_q4_all') else None
             if vk_info is not None:
                 import usaf_vk
@@ -375,7 +368,6 @@ class QuantizedExpertCache:
         n = 0
         max_elems = 0
         for expert_name, entries in self._expert_to_params.items():
-            # Only upload layers within range
             parts = expert_name.split(".")
             if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
                 try:
@@ -582,7 +574,6 @@ class SparseGradStore:
         if lidx is None or lidx.device != g.device:
             lidx = local.to(g.device)
             self._dev_idx[key] = lidx
-        # .to(device=..., dtype=...) combinado ignora o dtype no DML — separar
         vals = g.detach().reshape(-1).gather(0, lidx).to("cpu").float()
         self.compact[full_name].index_add_(0, pos, vals)
 

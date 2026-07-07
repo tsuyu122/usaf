@@ -20,10 +20,6 @@ class SparseAdam:
         weight_decay: float = 0.01,
         compact_params: bool = False,
     ):
-        # compact_params: cada "param" é um vetor 1D só com os valores ATIVOS
-        # (alinhado com active_idx), não o tensor full-size. Usado com
-        # streaming quantizado + overlays, onde masters full-size (~4.8GB fp16)
-        # não cabem na RAM. Requer step(compact_grads=...).
         self.compact_params = compact_params
         self.lr = lr
         self.betas = betas
@@ -34,9 +30,9 @@ class SparseAdam:
         self._step = 0
 
         self._active_ids: list[str] = []
-        self._idx: dict[str, torch.Tensor] = {}       # flat active indices (CPU long)
-        self._idx_dev: dict[str, torch.Tensor] = {}   # cached indices on param device
-        self._m: dict[str, torch.Tensor] = {}         # momentum (CPU float32)
+        self._idx: dict[str, torch.Tensor] = {}
+        self._idx_dev: dict[str, torch.Tensor] = {}
+        self._m: dict[str, torch.Tensor] = {}
         self._v: dict[str, torch.Tensor] = {}
 
         if active_idx is not None:
@@ -112,7 +108,6 @@ class SparseAdam:
                 grad = g.detach().to(device="cpu", dtype=torch.float32)
             else:
                 idx_dev = self._device_idx(name, param)
-                # extrai só os gradientes ativos e traz pra CPU (estado vive em CPU)
                 grad = param.grad.detach().reshape(-1).index_select(0, idx_dev).cpu().float()
 
             if self.weight_decay > 0:
@@ -152,7 +147,7 @@ class SparseAdam:
             if current[name].numel() != self._named[name].numel():
                 continue
             self._named[name] = current[name]
-        self._idx_dev = {}  # device pode ter mudado (expert volta pra CPU)
+        self._idx_dev = {}
 
     def reselect(
         self,

@@ -18,12 +18,10 @@ class MoEConfig:
     expert_intermediate: int = 0
     is_moe: bool = False
     
-    # Parameter naming patterns
     expert_prefix: str = ""
     expert_param_names: List[str] = field(default_factory=lambda: ["gate_up_proj", "down_proj"])
     router_path: str = ""
     
-    # Auto-configured
     train_from: int = 0
     max_trainable_layers: int = 0
     estimated_vram_gb: float = 0
@@ -56,7 +54,6 @@ def detect_model(model_path: str, vram_gb: float = 0, system_ram_gb: float = 0) 
         vocab_size=cfg.vocab_size,
     )
     
-    # Detect MoE parameters
     config.num_experts = _detect_num_experts(cfg)
     config.num_experts_per_tok = _detect_experts_per_tok(cfg)
     config.expert_intermediate = _detect_expert_intermediate(cfg)
@@ -65,11 +62,9 @@ def detect_model(model_path: str, vram_gb: float = 0, system_ram_gb: float = 0) 
     if not config.is_moe:
         return config
     
-    # Map parameter naming conventions
     config.expert_prefix, config.expert_param_names, rpath = _detect_param_names(cfg, model_path)
     config.router_path = rpath
     
-    # Auto-configure training
     _auto_configure_training(config, vram_gb, system_ram_gb)
     
     return config
@@ -90,7 +85,7 @@ def _detect_experts_per_tok(cfg) -> int:
         val = getattr(cfg, attr, None)
         if val is not None and val > 0:
             return val
-    return 2  # default for most MoE models
+    return 2
 
 
 def _detect_expert_intermediate(cfg) -> int:
@@ -108,31 +103,26 @@ def _detect_param_names(cfg, model_path) -> Tuple[str, List[str], str]:
     architectures = getattr(cfg, 'architectures', [])
     arch_str = ' '.join(architectures).lower() if architectures else model_type
     
-    # Qwen3-MoE / Qwen2-MoE
     if 'qwen' in arch_str or 'qwen' in model_type:
         return ("model.layers.{i}.mlp.experts", 
                 ["gate_up_proj", "down_proj"],
                 ".mlp.gate.weight")
     
-    # Mixtral
     if 'mixtral' in arch_str:
         return ("model.layers.{i}.block_sparse_moe.experts",
                 ["w1", "w2", "w3"],
                 ".block_sparse_moe.gate.weight")
     
-    # OLMoE
     if 'olmoe' in arch_str:
         return ("model.layers.{i}.mlp.experts",
                 ["gate_proj", "up_proj", "down_proj"],
                 ".mlp.gate.weight")
     
-    # DeepSeek-MoE
     if 'deepseek' in arch_str:
         return ("model.layers.{i}.mlp.experts",
                 ["gate_proj", "up_proj", "down_proj"],
                 ".mlp.gate.weight")
     
-    # Default: assume Qwen3-MoE style (most common)
     return ("model.layers.{i}.mlp.experts",
             ["gate_up_proj", "down_proj"],
             ".mlp.gate.weight")
@@ -151,33 +141,26 @@ def _auto_configure_training(config: MoEConfig, vram_gb: float, system_ram_gb: f
     config.estimated_vram_gb = vram_gb
     config.estimated_system_ram_gb = system_ram_gb
     
-    # Calculate memory per trainable layer
-    # Each expert param: hidden_size × expert_intermediate × 2 (gate+up) + expert_intermediate × hidden_size (down)
-    # For fused gate_up: hidden_size × (expert_intermediate × 2)
-    # For separate gate/up/down: use config to determine
     n_params = len(config.expert_param_names)
     if n_params >= 2:
         expert_bytes = (config.hidden_size * config.expert_intermediate * n_params * 
-                       config.num_experts * 2) / 1e9  # fp16
+                       config.num_experts * 2) / 1e9
     else:
-        expert_bytes = 0.5  # fallback estimate
+        expert_bytes = 0.5
     
-    # Resident mode keeps trainable experts in RAM (fp16) + q4 buffers + optimizer state
-    resident_gb = expert_bytes * 0.5       # fp16 copy of trainable experts (~half kept resident)
-    q4_gb = expert_bytes * 0.25            # q4 packed format
-    optimizer_gb = expert_bytes * 0.5 * 2  # SparseAdam m+v
+    resident_gb = expert_bytes * 0.5
+    q4_gb = expert_bytes * 0.25
+    optimizer_gb = expert_bytes * 0.5 * 2
     overhead_gb = 0.5
     
     config.estimated_per_layer_gb = resident_gb + q4_gb + optimizer_gb + overhead_gb
     
-    # Configure trainable layers
-    usable_ram = system_ram_gb * 0.6  # leave 40% for OS + model
+    usable_ram = system_ram_gb * 0.6
     config.max_trainable_layers = max(1, min(
         config.num_layers,
         int(usable_ram / max(config.estimated_per_layer_gb, 0.1))
     ))
     
-    # Default: train top layers (closest to output, most task-specific)
     config.train_from = max(0, config.num_layers - config.max_trainable_layers)
 
 

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """USAF: Ultra Sparse Adaptive Fine-Tuning — Universal Training CLI.
 
 Supports any MoE model from HuggingFace. Auto-detects architecture and configures training.
@@ -23,21 +22,17 @@ def ram() -> float:
     return psutil.Process(os.getpid()).memory_info().rss / 1024**3
 
 
-# ── CLI ──
 def build_parser():
     p = argparse.ArgumentParser(description="USAF: Ultra Sparse Adaptive Fine-Tuning")
     
-    # Required
     p.add_argument("--model", type=str, required=True,
                    help="HuggingFace model ID or local path")
     p.add_argument("--dataset", type=str, required=True,
                    help="Path to JSONL dataset file")
     
-    # Quantization
     p.add_argument("--quant-path", type=str, default="",
                    help="Path to q4 experts file. Auto-detected if empty.")
     
-    # Training
     p.add_argument("--steps", type=int, default=180)
     p.add_argument("--epochs", type=float, default=0,
                    help="If >0, overrides --steps based on dataset size")
@@ -45,7 +40,6 @@ def build_parser():
     p.add_argument("--microbatch", type=int, default=2)
     p.add_argument("--accum", type=int, default=1)
     
-    # Sparsity
     p.add_argument("--frac", type=float, default=0.005)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--wd", type=float, default=0.005)
@@ -53,19 +47,16 @@ def build_parser():
                    help="First trainable layer (0=auto)")
     p.add_argument("--reselect-every", type=int, default=50)
     
-    # Features
     p.add_argument("--no-frozen-cache", action="store_true")
     p.add_argument("--no-resident", action="store_true")
     p.add_argument("--frozen-cache-n", type=int, default=0)
     p.add_argument("--eval-every", type=int, default=15)
     
-    # Backend
     p.add_argument("--cuda", action="store_true", default=None)
     p.add_argument("--no-cuda", action="store_true", default=None)
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-multi-gpu", action="store_true")
     
-    # Output
     p.add_argument("--tag", type=str, default="")
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--log-dir", type=str, default="logs")
@@ -73,7 +64,6 @@ def build_parser():
     return p
 
 
-# ── Configuration ──
 @dataclass
 class TrainConfig:
     model_path: str
@@ -105,7 +95,6 @@ def parse_args(args=None) -> TrainConfig:
     p = build_parser()
     ns = p.parse_args(args)
     
-    # Resolve CUDA flag
     use_cuda = ns.cuda
     if use_cuda is None and ns.no_cuda:
         use_cuda = False
@@ -139,12 +128,8 @@ def parse_args(args=None) -> TrainConfig:
     )
 
 
-# ── Device Setup ──
 def setup_device(config: TrainConfig) -> Tuple[torch.device, int, object]:
     """Configure device, AMP scaler, and multi-GPU."""
-    # Core USAF grad-capture forward — required on EVERY backend (CUDA included),
-    # otherwise the native HF forward runs but the sparse expert grads stay zero
-    # and training silently does nothing. Not a DML-only workaround.
     from usaf.qwen3moe_dml import patch_qwen3moe_for_dml
     patch_qwen3moe_for_dml()
 
@@ -177,7 +162,6 @@ def setup_device(config: TrainConfig) -> Tuple[torch.device, int, object]:
     return device, n_gpus, scaler
 
 
-# ── Main ──
 def main(args=None):
     config = parse_args(args)
     
@@ -185,7 +169,6 @@ def main(args=None):
     print("USAF — Ultra Sparse Adaptive Fine-Tuning")
     print("=" * 60)
     
-    # Model detection
     print(f"\nModel: {config.model_path}")
     from usaf.model_factory import detect_model, get_trainable_layers, get_param_patterns, get_router_path
     
@@ -202,26 +185,22 @@ def main(args=None):
     print(f"MoE: {moe_cfg.num_experts} experts, {moe_cfg.num_experts_per_tok} active, "
           f"intermediate={moe_cfg.expert_intermediate}")
     
-    # Configure trainable layers
     train_layers = get_trainable_layers(moe_cfg, config.train_from)
     print(f"Trainable: {len(train_layers)} layers "
           f"({min(train_layers) if train_layers else 0}-{max(train_layers) if train_layers else 0})")
     print(f"Param naming: {moe_cfg.expert_prefix} -> {moe_cfg.expert_param_names}")
     print(f"Router: {moe_cfg.router_path}")
     
-    # Device setup (must happen BEFORE model loading for DML patching)
     print(f"\nBackend: {'CUDA' if config.use_cuda else 'DirectML/CPU'}")
     device, n_gpus, scaler = setup_device(config)
     
     if config.use_multi_gpu and n_gpus > 1 and config.use_cuda:
         print(f"Multi-GPU: DataParallel across {n_gpus} GPUs")
     
-    # Dataset
     print(f"\nDataset: {config.dataset_path}")
     train_samples, eval_samples, heldout_samples = _load_dataset(
         config.dataset_path, config.seq_len)
     
-    # Calculate steps from epochs if requested
     if config.epochs > 0:
         eff_batch = config.microbatch * config.accum
         tokens_per_epoch = len(train_samples) * config.seq_len
@@ -231,20 +210,17 @@ def main(args=None):
     print(f"Steps: {config.steps}, Batch: {config.microbatch}×{config.accum}={eff_batch}")
     print(f"Tokens: {config.steps * eff_batch * config.seq_len:,}")
     
-    # Quant path auto-detection
     if not config.quant_path:
         model_name = config.model_path.split("/")[-1]
         config.quant_path = f"{model_name}-q4/experts_q4.pt"
     print(f"Q4 weights: {config.quant_path}")
     
-    # ── Load model ──
     print(f"\nLoading model...")
     model, cache, q_dict, wf, st_path = _load_model(config, moe_cfg, device)
     
     if config.use_multi_gpu and n_gpus > 1 and config.use_cuda:
         model = nn.DataParallel(model)
     
-    # Build training metadata
     param_patterns = get_param_patterns(moe_cfg)
     _train_names = []
     for li in sorted(train_layers):
@@ -258,7 +234,6 @@ def main(args=None):
     
     _shapes = {fn: _q_shape(fn) for fn in _train_names}
     
-    # Get transformer layers for the training loop (handles DataParallel)
     base = model.module if hasattr(model, 'module') else model
     if hasattr(base, 'model') and hasattr(base.model, 'layers'):
         transformer = base.model
@@ -273,7 +248,6 @@ def main(args=None):
     norm_fn = transformer.norm
     lm_head = base.lm_head
     
-    # ── Run training ──
     print(f"\nStarting training...")
     print(f"  Sparsity: {config.frac*100:.1f}%")
     print(f"  RigL: every {config.reselect_every} steps")
@@ -281,7 +255,6 @@ def main(args=None):
     print(f"  Frozen cache: {config.use_frozen_cache}")
     print(f"  RAM: {ram():.1f}GB\n")
     
-    # Delegate to the existing training pipeline
     _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                   train_samples, eval_samples, heldout_samples,
                   _train_names, _shapes, train_layers,
@@ -328,7 +301,6 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device):
             from transformers.models.qwen3_moe import Qwen3MoeForCausalLM
             model = Qwen3MoeForCausalLM(cfg)
     
-    # Find safetensor files
     import glob as _glob
     if os.path.isdir(config.model_path):
         st_path = config.model_path
@@ -371,12 +343,10 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device):
     
     print(f"  {n_loaded} non-expert params loaded")
     
-    # Load Q4 expert weights
     q_dict = torch.load(config.quant_path, map_location="cpu", weights_only=True)
     from usaf.moe_loader import QuantizedExpertCache
     cache = QuantizedExpertCache(q_dict, device, max_cached=1, group_size=128)
     
-    # Setup streaming hooks
     for mname, mod in model.named_modules():
         if not (mname.endswith(".mlp.experts") or mname.endswith(".block_sparse_moe.experts")):
             continue
@@ -426,7 +396,6 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     from usaf.sparse_optim import SparseAdam
     from usaf.quantization import dequantize_4bit
     
-    # Hooks for grad capture
     imp_store = TopKImportanceStore(_shapes, frac=FRAC)
     for mname, mod in model.named_modules():
         if not (mname.endswith(".mlp.experts") or mname.endswith(".block_sparse_moe.experts")):
@@ -463,7 +432,6 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         loss.backward()
         return loss.item()
     
-    # Importance phase
     print("Importance phase...")
     t0 = time.time()
     N_IMP = 3 if not os.environ.get("SMOKE_N") else 1
@@ -477,7 +445,6 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     te = sum(math.prod(_shapes[fn]) for fn in active_idx if fn in _shapes)
     print(f"Active: {ta:,}/{te:,} ({100*ta/max(te,1):.4f}%)")
     
-    # Masters + overlays
     masters = {}
     for fname, aidx in active_idx.items():
         aidx = aidx.reshape(-1).to(torch.long)
@@ -508,7 +475,6 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     opt = SparseAdam(masters, active_idx=active_idx, lr=LR_PEAK, weight_decay=WD, compact_params=True)
     print(f"Optimizer: {opt.optimizer_memory_mb:.1f}MB")
     
-    # Training loop
     def fwd_bwd(batch, zero_store=True):
         if isinstance(batch, dict):
             batch = [batch]

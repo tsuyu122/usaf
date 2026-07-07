@@ -9,7 +9,7 @@ import numpy as np
 import torch
 try:
     from torch.utils.tensorboard import SummaryWriter
-except ImportError:  # tensorboard opcional; nao bloqueia o import do pacote
+except ImportError:
     SummaryWriter = None
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
