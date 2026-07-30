@@ -25,6 +25,14 @@ env/
 .DS_Store
 Thumbs.db
 
+# CI / dev
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
 # Checkpoints & logs
 checkpoints/
 logs/
@@ -44,7 +52,7 @@ usaf/vulkan/build/
 # Kaggle
 kaggle_kernel/
 
-# Test/benchmark scripts
+# Test/benchmark scripts (root-level only)
 _bench_*.py
 _debug_*.py
 _demo_*.py

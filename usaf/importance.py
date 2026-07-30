@@ -1,10 +1,11 @@
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM
+from typing import Dict, Tuple, Optional
 
 
 class ImportanceScorer:
-    DEFAULT_SKIP = ("embed_tokens", "lm_head")
+    DEFAULT_SKIP: Tuple[str, ...] = ("embed_tokens", "lm_head")
 
     def __init__(
         self,
@@ -12,21 +13,21 @@ class ImportanceScorer:
         device: torch.device,
         dtype: torch.dtype,
         context_length: int = 2048,
-        skip_patterns: tuple = DEFAULT_SKIP,
+        skip_patterns: Optional[Tuple[str, ...]] = None,
     ):
         self.model = model
         self.device = device
         self.dtype = dtype
         self.context_length = context_length
-        self.skip_patterns = skip_patterns
+        self.skip_patterns = skip_patterns or self.DEFAULT_SKIP
 
     def compute_scores(
         self,
         dataloader: DataLoader,
         max_batches: int = 0,
-    ) -> dict[str, torch.Tensor]:
+    ) -> Dict[str, torch.Tensor]:
         self.model.eval()
-        grad_accum: dict[str, torch.Tensor] = {}
+        grad_accum: Dict[str, torch.Tensor] = {}
 
         param_name_map = {}
         for name, param in self.model.named_parameters():
@@ -84,10 +85,10 @@ class ImportanceScorer:
             except RuntimeError as e:
                 if "memory" in str(e).lower() or "allocate" in str(e).lower():
                     consecutive_skips += 1
-                    print(f"\n[skip] batch sem memória, pulando: {str(e)[:60]}")
+                    print(f"\n[skip] OOM skipping batch: {str(e)[:60]}")
                     if consecutive_skips >= MAX_CONSECUTIVE_SKIPS:
-                        print(f"  {MAX_CONSECUTIVE_SKIPS} OOMs seguidos, abortando scoring "
-                              f"com {batches_processed} batches válidos")
+                        print(f"  {MAX_CONSECUTIVE_SKIPS} consecutive OOMs, aborting scoring "
+                              f"with {batches_processed} valid batches")
                         break
                 else:
                     raise
@@ -100,7 +101,7 @@ class ImportanceScorer:
         for name, param in param_name_map.items():
             param.requires_grad = False
 
-        scores = {}
+        scores: Dict[str, torch.Tensor] = {}
         for name, param in self.model.named_parameters():
             if name in grad_accum:
                 scores[name] = grad_accum[name]
@@ -109,10 +110,10 @@ class ImportanceScorer:
 
         return scores
 
-    def save_scores(self, scores: dict[str, torch.Tensor], path: str):
+    def save_scores(self, scores: Dict[str, torch.Tensor], path: str) -> None:
         scores_fp16 = {k: v.half() for k, v in scores.items()}
         torch.save(scores_fp16, path)
 
     @staticmethod
-    def load_scores(path: str) -> dict[str, torch.Tensor]:
+    def load_scores(path: str) -> Dict[str, torch.Tensor]:
         return torch.load(path, map_location="cpu", weights_only=True)
