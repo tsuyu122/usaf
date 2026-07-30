@@ -1,4 +1,4 @@
-"""USAF: Ultra Sparse Adaptive Fine-Tuning — Universal Training CLI.
+"""USAF: Ultra Sparse Adaptive Fine-Tuning â€” Universal Training CLI.
 
 Supports any MoE model from HuggingFace. Auto-detects architecture and configures training.
 
@@ -20,6 +20,19 @@ import psutil
 
 def ram() -> float:
     return psutil.Process(os.getpid()).memory_info().rss / 1024**3
+
+
+def _get_tokenizer():
+    """Get the global tokenizer instance, if available."""
+    return getattr(_get_tokenizer, "_instance", None)
+
+
+def _set_tokenizer(tok):
+    _get_tokenizer._instance = tok
+
+
+def _set_model(model):
+    _set_tokenizer(getattr(model, "tokenizer", None))
 
 
 def build_parser():
@@ -68,6 +81,15 @@ def build_parser():
     p.add_argument("--export", type=str, default="",
                    help="Export merged weights path (e.g. experts_finetuned_q4.pt)")
     
+    p.add_argument("--eval-only", action="store_true",
+                   help="Skip training, only evaluate model/checkpoint")
+    p.add_argument("--eval-datasets", type=str, default="synthetic-cpp",
+                   help="Comma-separated list of eval datasets")
+    p.add_argument("--eval-samples", type=int, default=64,
+                   help="Max samples per eval dataset")
+    p.add_argument("--eval-report", type=str, default="",
+                   help="Path to save eval report JSON")
+    
     return p
 
 
@@ -99,6 +121,10 @@ class TrainConfig:
     resume_path: str = ""
     save_every: int = 50
     export_path: str = ""
+    eval_only: bool = False
+    eval_datasets: str = "synthetic-cpp"
+    eval_samples: int = 64
+    eval_report: str = ""
 
 
 def parse_args(args=None) -> TrainConfig:
@@ -138,6 +164,10 @@ def parse_args(args=None) -> TrainConfig:
         resume_path=ns.resume,
         save_every=ns.save_every,
         export_path=ns.export,
+        eval_only=ns.eval_only,
+        eval_datasets=ns.eval_datasets,
+        eval_samples=ns.eval_samples,
+        eval_report=ns.eval_report,
     )
 
 
@@ -179,7 +209,7 @@ def main(args=None):
     config = parse_args(args)
     
     print("=" * 60)
-    print("USAF — Ultra Sparse Adaptive Fine-Tuning")
+    print("USAF â€” Ultra Sparse Adaptive Fine-Tuning")
     print("=" * 60)
     
     print(f"\nModel: {config.model_path}")
@@ -220,7 +250,7 @@ def main(args=None):
         config.steps = max(1, int(config.epochs * tokens_per_epoch / (eff_batch * config.seq_len)))
     
     eff_batch = config.microbatch * config.accum
-    print(f"Steps: {config.steps}, Batch: {config.microbatch}×{config.accum}={eff_batch}")
+    print(f"Steps: {config.steps}, Batch: {config.microbatch}Ã—{config.accum}={eff_batch}")
     print(f"Tokens: {config.steps * eff_batch * config.seq_len:,}")
     
     if not config.quant_path:
@@ -279,6 +309,27 @@ def main(args=None):
     if config.export_path:
         print(f"  Export: {config.export_path}")
     print(f"  RAM: {ram():.1f}GB\n")
+    
+    if config.eval_only:
+        print("\n=== Eval-only mode (skipping training) ===\n")
+        from usaf.eval.benchmark import run_benchmark, BenchmarkConfig
+        from usaf.eval.report import save_report
+        
+        ds_list = [d.strip() for d in config.eval_datasets.split(",") if d.strip()]
+        eval_cfg = BenchmarkConfig(
+            datasets=ds_list,
+            max_samples=config.eval_samples,
+            seq_len=config.seq_len,
+        )
+        results = run_benchmark(
+            model, model.tokenizer if hasattr(model, "tokenizer") else _get_tokenizer(),
+            device, eval_cfg,
+            model_name=config.model_path,
+        )
+        results.print()
+        if config.eval_report:
+            save_report(results, config.eval_report)
+        return model
     
     _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                   train_samples, eval_samples, heldout_samples,

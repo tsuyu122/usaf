@@ -90,3 +90,12 @@ if _HAS_MOE_LOADER:
         "apply_captured_expert_grads",
         "load_and_stream",
     ]
+
+from .eval import (
+    compute_perplexity,
+    run_benchmark,
+    BenchmarkConfig,
+    BenchmarkResults,
+    save_report,
+    compare_reports,
+)
