@@ -8,6 +8,7 @@ from .trainer import USAFFineTuner
 from .evaluate import Evaluator
 from .olmoe_dml import patch_olmoe_for_dml, dml_experts_forward, dml_moe_block_forward
 from .olmoe_streaming import setup_streaming, apply_captured_expert_grads, sync_expert_grads_to_cpu
+from .checkpoint import save_sparse_checkpoint, load_sparse_checkpoint, export_merged_weights, get_checkpoint_metadata
 from .qwen3moe_dml import patch_qwen3moe_for_dml, dml_qwen3_experts_forward, dml_qwen3_moe_block_forward
 
 _HAS_QUANTIZATION: bool = False

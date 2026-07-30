@@ -61,6 +61,13 @@ def build_parser():
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--log-dir", type=str, default="logs")
     
+    p.add_argument("--resume", type=str, default="",
+                   help="Path to sparse checkpoint to resume from")
+    p.add_argument("--save-every", type=int, default=50,
+                   help="Save checkpoint every N steps (0=no mid-training saves)")
+    p.add_argument("--export", type=str, default="",
+                   help="Export merged weights path (e.g. experts_finetuned_q4.pt)")
+    
     return p
 
 
@@ -89,6 +96,9 @@ class TrainConfig:
     tag: str = ""
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
+    resume_path: str = ""
+    save_every: int = 50
+    export_path: str = ""
 
 
 def parse_args(args=None) -> TrainConfig:
@@ -125,6 +135,9 @@ def parse_args(args=None) -> TrainConfig:
         tag=ns.tag,
         checkpoint_dir=ns.checkpoint_dir,
         log_dir=ns.log_dir,
+        resume_path=ns.resume,
+        save_every=ns.save_every,
+        export_path=ns.export,
     )
 
 
@@ -248,17 +261,30 @@ def main(args=None):
     norm_fn = transformer.norm
     lm_head = base.lm_head
     
+    resume_ckpt = None
+    if config.resume_path and os.path.exists(config.resume_path):
+        print(f"Resuming from checkpoint: {config.resume_path}")
+        from usaf.checkpoint import load_sparse_checkpoint
+        resume_ckpt = load_sparse_checkpoint(config.resume_path)
+        print(f"  Resumed at step {resume_ckpt.get('step', 0)}, "
+              f"{len(resume_ckpt.get('losses', []))} logged losses")
+
     print(f"\nStarting training...")
     print(f"  Sparsity: {config.frac*100:.1f}%")
     print(f"  RigL: every {config.reselect_every} steps")
     print(f"  Resident: {config.use_resident}")
     print(f"  Frozen cache: {config.use_frozen_cache}")
+    if resume_ckpt:
+        print(f"  Resume: step {resume_ckpt['step']}")
+    if config.export_path:
+        print(f"  Export: {config.export_path}")
     print(f"  RAM: {ram():.1f}GB\n")
     
     _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                   train_samples, eval_samples, heldout_samples,
                   _train_names, _shapes, train_layers,
-                  layers, embed, rotary, norm_fn, lm_head)
+                  layers, embed, rotary, norm_fn, lm_head,
+                  resume_ckpt=resume_ckpt)
     
     return model
 
@@ -376,7 +402,8 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device):
 def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                   train_samples, eval_samples, heldout_samples,
                   _train_names, _shapes, train_layers,
-                  layers, embed, rotary, norm_fn, lm_head):
+                  layers, embed, rotary, norm_fn, lm_head,
+                  resume_ckpt=None):
     """Run the full training loop using pre-extracted layer references."""
     
     N_LAYERS = moe_cfg.num_layers
@@ -395,12 +422,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     from usaf.moe_loader import TopKImportanceStore, SparseGradStore
     from usaf.sparse_optim import SparseAdam
     from usaf.quantization import dequantize_4bit
-    
-    imp_store = TopKImportanceStore(_shapes, frac=FRAC)
-    for mname, mod in model.named_modules():
-        if not (mname.endswith(".mlp.experts") or mname.endswith(".block_sparse_moe.experts")):
-            continue
-        mod._grad_capture = (imp_store, mname)
+    from usaf.checkpoint import save_sparse_checkpoint
     
     def _prelude(input_ids):
         hidden = embed(input_ids)
@@ -420,46 +442,71 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         return nn.functional.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
     
-    def fwd_bwd_imp(sample):
-        ids = torch.tensor([sample["input_ids"]], dtype=torch.long).to(device)
-        lbl = torch.tensor([sample["labels"]], dtype=torch.long).to(device)
-        hidden, pos_ids, pe, mask = _prelude(ids)
-        for i in range(N_LAYERS):
-            hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
-        cache.evict_all()
-        h_last = hidden.detach().requires_grad_(True)
-        loss = _head_loss(h_last, lbl)
-        loss.backward()
-        return loss.item()
-    
-    print("Importance phase...")
-    t0 = time.time()
-    N_IMP = 3 if not os.environ.get("SMOKE_N") else 1
-    for imp_i in range(N_IMP):
-        s = train_samples[imp_i % len(train_samples)]
-        loss_imp = fwd_bwd_imp(s)
-        print(f"  imp {imp_i+1}/{N_IMP} | loss {loss_imp:.4f} | {time.time()-t0:.0f}s")
-    
-    active_idx = imp_store.select(FRAC)
-    ta = sum(i.numel() for i in active_idx.values())
-    te = sum(math.prod(_shapes[fn]) for fn in active_idx if fn in _shapes)
-    print(f"Active: {ta:,}/{te:,} ({100*ta/max(te,1):.4f}%)")
-    
-    masters = {}
-    for fname, aidx in active_idx.items():
-        aidx = aidx.reshape(-1).to(torch.long)
-        entry = q_dict.get(fname)
-        if entry is None:
-            continue
-        if isinstance(entry, dict):
-            t = dequantize_4bit(entry["q"], entry["s"], entry["z"], entry["shape"], group_size=128)
-        else:
-            t = dequantize_4bit(entry[0], entry[1], entry[2], entry[3], group_size=128)
-        vals = t.reshape(-1).index_select(0, aidx).float()
-        del t
-        p = nn.Parameter(vals, requires_grad=False)
-        masters[fname] = p
-        cache.overlays[fname] = (aidx, p)
+    if resume_ckpt is None:
+        imp_store = TopKImportanceStore(_shapes, frac=FRAC)
+        for mname, mod in model.named_modules():
+            if not (mname.endswith(".mlp.experts") or mname.endswith(".block_sparse_moe.experts")):
+                continue
+            mod._grad_capture = (imp_store, mname)
+        
+        def fwd_bwd_imp(sample):
+            ids = torch.tensor([sample["input_ids"]], dtype=torch.long).to(device)
+            lbl = torch.tensor([sample["labels"]], dtype=torch.long).to(device)
+            hidden, pos_ids, pe, mask = _prelude(ids)
+            for i in range(N_LAYERS):
+                hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+            cache.evict_all()
+            h_last = hidden.detach().requires_grad_(True)
+            loss = _head_loss(h_last, lbl)
+            loss.backward()
+            return loss.item()
+        
+        print("Importance phase...")
+        t0 = time.time()
+        N_IMP = 3 if not os.environ.get("SMOKE_N") else 1
+        for imp_i in range(N_IMP):
+            s = train_samples[imp_i % len(train_samples)]
+            loss_imp = fwd_bwd_imp(s)
+            print(f"  imp {imp_i+1}/{N_IMP} | loss {loss_imp:.4f} | {time.time()-t0:.0f}s")
+        
+        active_idx = imp_store.select(FRAC)
+        ta = sum(i.numel() for i in active_idx.values())
+        te = sum(math.prod(_shapes[fn]) for fn in active_idx if fn in _shapes)
+        print(f"Active: {ta:,}/{te:,} ({100*ta/max(te,1):.4f}%)")
+        
+        masters = {}
+        for fname, aidx in active_idx.items():
+            aidx = aidx.reshape(-1).to(torch.long)
+            entry = q_dict.get(fname)
+            if entry is None:
+                continue
+            if isinstance(entry, dict):
+                t = dequantize_4bit(entry["q"], entry["s"], entry["z"], entry["shape"], group_size=128)
+            else:
+                t = dequantize_4bit(entry[0], entry[1], entry[2], entry[3], group_size=128)
+            vals = t.reshape(-1).index_select(0, aidx).float()
+            del t
+            p = nn.Parameter(vals, requires_grad=False)
+            masters[fname] = p
+            cache.overlays[fname] = (aidx, p)
+        
+        losses = []
+        start_step = 1
+    else:
+        print(f"Resuming: restoring active_idx ({len(resume_ckpt['active_idx'])} tensors) "
+              f"and masters ({len(resume_ckpt['masters'])} tensors)")
+        active_idx = {k: v.to(torch.long) for k, v in resume_ckpt["active_idx"].items()}
+        masters = {}
+        for fname, vals in resume_ckpt["masters"].items():
+            p = nn.Parameter(vals.float(), requires_grad=False)
+            masters[fname] = p
+            aidx = active_idx[fname].reshape(-1).to(torch.long)
+            cache.overlays[fname] = (aidx, p)
+        losses = list(resume_ckpt.get("losses", []))
+        start_step = resume_ckpt.get("step", 0) + 1
+        if start_step > STEPS:
+            print(f"Checkpoint step {start_step-1} >= total steps {STEPS}, nothing to train")
+            return losses
     
     sparse_store = SparseGradStore(active_idx, _shapes)
     for mname, mod in model.named_modules():
@@ -467,12 +514,15 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             continue
         mod._grad_capture = (sparse_store, mname)
     
-    if USE_RESIDENT:
+    if USE_RESIDENT and resume_ckpt is None:
         cache.make_resident(train_layers)
         cache.apply_resident_overlays(active_idx, masters)
         cache._prefetch_disabled = True
     
     opt = SparseAdam(masters, active_idx=active_idx, lr=LR_PEAK, weight_decay=WD, compact_params=True)
+    if resume_ckpt is not None and "optimizer" in resume_ckpt:
+        opt.load_state_dict(resume_ckpt["optimizer"])
+        print(f"  Optimizer state restored (step {opt._step})")
     print(f"Optimizer: {opt.optimizer_memory_mb:.1f}MB")
     
     def fwd_bwd(batch, zero_store=True):
@@ -520,7 +570,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     loss_scale = 4096.0
     
     print(f"\n=== Training ({STEPS} steps) ===\n")
-    for step in range(1, STEPS + 1):
+    for step in range(start_step, STEPS + 1):
         t_step = time.time()
         
         if step <= max(1, int(STEPS * 0.05)):
@@ -567,8 +617,22 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         eta_h = (STEPS - step) * dt / 3600
         tok_s = ACCUM * MICROBATCH * SEQ / dt
         
-        print(f"  {step:3d}/{STEPS} | loss {step_loss:.4f} | {tok_s:.0f} tok/s | "
-              f"LR {lr:.1e} | RAM {ram():.1f}G | ETA {eta_h:.1f}h", flush=True)
+        log_msg = f"  {step:3d}/{STEPS} | loss {step_loss:.4f} | {tok_s:.0f} tok/s | LR {lr:.1e} | RAM {ram():.1f}G | ETA {eta_h:.1f}h"
+        if resume_ckpt is not None:
+            log_msg += f" | resumed"
+        print(log_msg, flush=True)
+        
+        if config.save_every > 0 and step % config.save_every == 0:
+            ckpt_path = os.path.join(config.checkpoint_dir, f"sparse_step-{step}.pt")
+            save_sparse_checkpoint(
+                ckpt_path, masters, active_idx, opt.state_dict(),
+                {"model": config.model_path, "steps": STEPS, "frac": FRAC,
+                 "lr": LR_PEAK, "seq_len": SEQ, "microbatch": MICROBATCH, "accum": ACCUM,
+                 "train_from": config.train_from, "reselect_every": RESELECT_EVERY,
+                 "save_every": config.save_every, "tag": config.tag},
+                step, losses, list(train_layers), metric=step_loss,
+            )
+            print(f"  >>> checkpoint saved: {ckpt_path}", flush=True)
     
     t_total = time.time() - t_start
     skipped = sum(1 for l in losses if not math.isfinite(l))
@@ -578,6 +642,20 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     print(f"Loss: {losses[0]:.4f} -> {losses[-1]:.4f}")
     print(f"Skipped: {skipped}/{STEPS} steps")
     print(f"Peak RAM: {ram():.1f}GB")
+    
+    if config.export_path:
+        print(f"\nExporting merged weights to {config.export_path}...")
+        try:
+            from usaf.checkpoint import export_merged_weights
+            export_path = export_merged_weights(
+                config.quant_path,
+                {k: v.detach().cpu() for k, v in masters.items()},
+                {k: v.cpu() for k, v in active_idx.items()},
+                config.export_path,
+            )
+            print(f"  Exported: {export_path}")
+        except Exception as e:
+            print(f"  Export failed: {e}")
     
     return losses
 
