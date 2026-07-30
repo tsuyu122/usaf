@@ -10,6 +10,9 @@ from .olmoe_dml import patch_olmoe_for_dml, dml_experts_forward, dml_moe_block_f
 from .olmoe_streaming import setup_streaming, apply_captured_expert_grads, sync_expert_grads_to_cpu
 from .qwen3moe_dml import patch_qwen3moe_for_dml, dml_qwen3_experts_forward, dml_qwen3_moe_block_forward
 
+_HAS_QUANTIZATION: bool = False
+_HAS_MOE_LOADER: bool = False
+
 try:
     from .quantization import (
         quantize_4bit,
@@ -24,7 +27,7 @@ try:
     )
     _HAS_QUANTIZATION = True
 except ImportError:
-    _HAS_QUANTIZATION = False
+    pass
 
 try:
     from .moe_loader import (
@@ -38,7 +41,7 @@ try:
     )
     _HAS_MOE_LOADER = True
 except ImportError:
-    _HAS_MOE_LOADER = False
+    pass
 
 __all__ = [
     "USAFConfig",

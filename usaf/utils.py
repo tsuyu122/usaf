@@ -1,4 +1,6 @@
 import torch
+from typing import Dict, Any
+
 try:
     import torch_directml
     HAS_DML = True
@@ -14,12 +16,6 @@ def get_dml_device(device_id: int = 0) -> torch.device:
 
 
 def load_model_to_dml(model: torch.nn.Module, device: torch.device) -> torch.nn.Module:
-    """Move model to DML device.
-
-    Do NOT use low_cpu_mem_usage=True when loading — it enables the accelerate
-    dispatch which creates thousands of internal steps and fails with
-    'RuntimeError: unknown error' on DML. Load without it, then call this.
-    """
     model.to(device)
     return model
 
@@ -45,5 +41,5 @@ def estimate_optimizer_memory(num_active_params: int, dtype: torch.dtype = torch
     return num_active_params * bytes_per_param * 2
 
 
-def move_batch_to_device(batch: dict, device: torch.device) -> dict:
+def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}

@@ -1,6 +1,6 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -17,7 +17,7 @@ class USAFConfig:
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
 
-    cpp_extensions: tuple = (".h", ".hpp", ".cpp", ".c", ".cc", ".cxx", ".hxx")
+    cpp_extensions: Tuple[str, ...] = (".h", ".hpp", ".cpp", ".c", ".cc", ".cxx", ".hxx")
     max_file_size_mb: int = 1
     deduplicate_lines: bool = True
     train_split: float = 0.95
@@ -32,7 +32,7 @@ class USAFConfig:
 
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
-    betas: tuple = (0.9, 0.999)
+    betas: Tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
 
     batch_size: int = 1
