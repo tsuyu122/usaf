@@ -14,7 +14,7 @@ import fnmatch
 import math
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future
-from typing import Dict, Tuple, Optional, List, Any, Union
+from typing import Dict, Tuple, Optional, List, Any, Union, Set
 
 import torch
 import torch.nn as nn
@@ -152,10 +152,18 @@ class QuantizedExpertCache:
 
         if expert_module_name in self._resident:
             cpu_params = self._get_resident(expert_module_name)
-            deq = self._dequant_cpu(expert_module_name)
-            for k, v in deq.items():
-                if k not in cpu_params:
-                    cpu_params[k] = v
+            # Dequantize ONLY the params that are not already resident. The
+            # previous code ran a full 4-bit dequant of every param and then
+            # discarded the result whenever the resident cache already had
+            # it, so "dequant once, use forever" was false: evict_all() after
+            # every forward kept the LRU cold and each forward re-paid the
+            # dequant. It is only genuinely needed for params excluded from
+            # the resident set (make_resident(only_params=[...])).
+            missing = {
+                ln for _, ln in self._expert_to_params.get(expert_module_name, [])
+            } - set(cpu_params.keys())
+            if missing:
+                cpu_params.update(self._dequant_cpu(expert_module_name, only=missing))
             gpu_params = {k: t.to(self._device) for k, t in cpu_params.items()}
             self._cache[expert_module_name] = gpu_params
             return {
@@ -180,13 +188,23 @@ class QuantizedExpertCache:
             for pname, t in gpu_params.items()
         }
 
-    def _dequant_cpu(self, expert_module_name: str) -> Dict[str, torch.Tensor]:
+    def _dequant_cpu(self, expert_module_name: str,
+                    only: Optional[Set[str]] = None) -> Dict[str, torch.Tensor]:
         """Dequantize an expert module's params to CPU fp16 (overlay applied).
 
         Uses VK GPU dequant when _vk_q4_all has buffers for this param.
+
+        Args:
+            expert_module_name: Full dotted module name, e.g. "model.layers.0.mlp.experts".
+            only: Optional set of *local* parameter names to dequantize. Any
+                param not in the set is skipped, so a caller that already
+                holds some params in fp16 (e.g. the resident cache) does not
+                pay for a full 4-bit dequant of data it already has.
         """
         cpu_params: Dict[str, torch.Tensor] = {}
         for full_name, local_name in self._expert_to_params.get(expert_module_name, []):
+            if only is not None and local_name not in only:
+                continue
             entry = self._q_dict.get(full_name)
             if entry is None:
                 continue
