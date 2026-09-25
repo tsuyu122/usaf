@@ -77,3 +77,34 @@ def test_sparse_adam_load_state_dict():
     sd["step"] = 5
     opt.load_state_dict(sd)
     assert opt._step == 5
+
+def test_sparse_adam_reselect_preserves_momentum():
+    """A RigL reselection must not wipe the Adam moments.
+
+    Rebuilding the state from scratch on every reselection resets m and v to
+    zero while keeping the step counter, so the bias correction no longer
+    matches the moment tensors and the optimizer effectively restarts every
+    RESELECT_EVERY steps. Elements that remain active must carry their
+    moments across the reselection.
+    """
+    params = {"w": torch.nn.Parameter(torch.zeros(10))}
+    opt = SparseAdam(
+        params, active_idx={"w": torch.tensor([1, 2, 3, 4, 5])},
+        lr=0.1, weight_decay=0.0,
+    )
+    for _ in range(3):
+        opt.step(compact_grads={"w": torch.full((5,), 0.01)})
+    m_before = opt._m["w"].clone()
+    step_before = opt._step
+
+    # Keep {2,3,4} from the old set and add two new elements, 7 and 8.
+    opt.reselect(params, {"w": torch.tensor([2, 3, 4, 7, 8])})
+
+    assert opt._step == step_before, "step counter was reset by reselect()"
+    m_after = opt._m["w"]
+    assert torch.allclose(m_after[:3], m_before[1:4]), (
+        "surviving elements lost their Adam momentum"
+    )
+    assert torch.all(m_after[3:] == 0), (
+        "newly activated elements should start with zero momentum"
+    )
