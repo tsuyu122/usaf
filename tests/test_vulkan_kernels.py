@@ -27,15 +27,33 @@ def _load_vk():
     return usaf_vk
 
 
-def _spirv_dir():
-    # The runtime loader resolves SPIR-V relative to the module, so look next
-    # to the build tree the test is running against.
+def _spirv_dir(usaf_vk=None):
+    # The compiled shaders sit next to the build tree that produced the
+    # extension module, which is not necessarily inside the repository - an
+    # out-of-tree build puts it elsewhere entirely. Look there first, then
+    # fall back to the in-tree layout.
+    candidates = []
+    if usaf_vk is not None:
+        mod_dir = os.path.dirname(os.path.abspath(usaf_vk.__file__))
+        candidates.append(mod_dir)
+        candidates.append(os.path.dirname(mod_dir))
     here = os.path.dirname(os.path.abspath(__file__))
-    for up in (here, os.path.dirname(here), os.path.dirname(os.path.dirname(here))):
-        cand = os.path.join(up, "spirv")
-        if os.path.isfile(os.path.join(cand, "attention.spv")):
-            return cand
-    pytest.skip("compiled SPIR-V not found (build the usaf_vk target first)")
+    candidates += [
+        here,
+        os.path.dirname(here),
+        os.path.dirname(os.path.dirname(here)),
+    ]
+    env = os.environ.get("USAF_VK_SPIRV_DIR")
+    if env:
+        candidates.insert(0, env)
+    for cand in candidates:
+        spv = os.path.join(cand, "spirv")
+        if os.path.isfile(os.path.join(spv, "attention.spv")):
+            return spv
+    pytest.skip(
+        "compiled SPIR-V not found (build the usaf_vk target, or point "
+        "USAF_VK_SPIRV_DIR at the directory containing it)"
+    )
 
 
 def _attention(usaf_vk, scores, v, nH, nKV, S, hd, causal):
@@ -82,7 +100,7 @@ CASES = [
 @pytest.mark.parametrize("nH,nKV,S,hd,causal", CASES)
 def test_attention_kernel_matches_torch(nH, nKV, S, hd, causal):
     usaf_vk = _load_vk()
-    usaf_vk.set_spirv_path(_spirv_dir())
+    usaf_vk.set_spirv_path(_spirv_dir(usaf_vk))
     torch.manual_seed(0)
     scores = torch.randn(nH, S, S).half()
     v = torch.randn(nKV, S, hd).half()

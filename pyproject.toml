@@ -99,6 +99,9 @@ ignore = ["E501"]
 "usaf/importance.py" = ["N806"]
 "usaf/*_dml.py" = ["N812"]
 "usaf/moe_loader.py" = ["E701"]
+# The Vulkan test helpers mirror the argument names of the native extension
+# (nH, nKV, S) so each call reads like the C++ signature it drives.
+"tests/test_vulkan_kernels.py" = ["N803", "N806"]
 # E402: usaf/__init__.py builds __all__ conditionally, then imports the public
 # API it just registered.
 "usaf/__init__.py" = ["E402"]
