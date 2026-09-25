@@ -98,31 +98,16 @@ def _detect_expert_intermediate(cfg) -> int:
 
 
 def _detect_param_names(cfg, model_path) -> Tuple[str, List[str], str]:
-    """Detect parameter naming conventions based on model architecture."""
-    model_type = getattr(cfg, 'model_type', '').lower()
-    architectures = getattr(cfg, 'architectures', [])
-    arch_str = ' '.join(architectures).lower() if architectures else model_type
-    
-    if 'qwen' in arch_str or 'qwen' in model_type:
-        return ("model.layers.{i}.mlp.experts", 
-                ["gate_up_proj", "down_proj"],
-                ".mlp.gate.weight")
-    
-    if 'mixtral' in arch_str:
-        return ("model.layers.{i}.block_sparse_moe.experts",
-                ["w1", "w2", "w3"],
-                ".block_sparse_moe.gate.weight")
-    
-    if 'olmoe' in arch_str:
-        return ("model.layers.{i}.mlp.experts",
-                ["gate_proj", "up_proj", "down_proj"],
-                ".mlp.gate.weight")
-    
-    if 'deepseek' in arch_str:
-        return ("model.layers.{i}.mlp.experts",
-                ["gate_proj", "up_proj", "down_proj"],
-                ".mlp.gate.weight")
-    
+    """Detect parameter naming conventions based on model architecture.
+
+    From transformers >= 4.53 every supported MoE family (Qwen3-MoE, Mixtral,
+    OLMoE) exposes a *fused* expert container with 3D parameters named
+    gate_up_proj / down_proj under ".mlp.experts". Older transformers used
+    block_sparse_moe with per-expert w1/w2/w3 for Mixtral and separate
+    gate_proj/up_proj/down_proj for OLMoE; that layout is no longer produced
+    by the installed transformers, so the legacy branches are gone and every
+    family resolves to the fused names below.
+    """
     return ("model.layers.{i}.mlp.experts",
             ["gate_up_proj", "down_proj"],
             ".mlp.gate.weight")

@@ -172,9 +172,19 @@ def parse_args(args=None) -> TrainConfig:
 
 
 def setup_device(config: TrainConfig) -> Tuple[torch.device, int, object]:
-    """Configure device, AMP scaler, and multi-GPU."""
+    """Configure device, AMP scaler, and multi-gPU."""
+    # Install the dense-masked MoE forward patches. These are what route the
+    # sparse expert gradients into the capture store: without them the native
+    # forward never calls _grad_capture and sparse training silently does
+    # nothing. Each family gets its own patch because the expert container
+    # class and the router API differ, even though from transformers>=4.53
+    # they all share the fused gate_up_proj/down_proj layout.
     from usaf.qwen3moe_dml import patch_qwen3moe_for_dml
+    from usaf.olmoe_dml import patch_olmoe_for_dml
+    from usaf.mixtral_dml import patch_mixtral_for_dml
     patch_qwen3moe_for_dml()
+    patch_olmoe_for_dml()
+    patch_mixtral_for_dml()
 
     if config.use_cuda:
         assert torch.cuda.is_available(), "CUDA requested but not available"
@@ -371,6 +381,17 @@ def _load_dataset(path: str, seq_len: int):
     return samples[:n_train], samples[n_train:n_train+10], samples[n_train+10:n_train+20]
 
 
+def _expert_module_names(moe_cfg) -> Set[str]:
+    """Return the set of expert module names for this architecture.
+
+    Derived from the *detected* expert_prefix (e.g. "model.layers.{i}.mlp.experts")
+    instead of hardcoding a ".mlp.experts" suffix. The previous suffix check
+    never matched architectures whose experts live under a different path,
+    silently leaving the forward hooks uninstalled.
+    """
+    return {moe_cfg.expert_prefix.format(i=i) for i in range(moe_cfg.num_layers)}
+
+
 def _load_model(config: TrainConfig, moe_cfg, device: torch.device):
     """Load model with quantized expert streaming."""
     from transformers import AutoConfig
@@ -399,10 +420,11 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device):
             for key in sf.keys():
                 wf[key] = os.path.basename(fn)
     
+    _expert_modules = _expert_module_names(moe_cfg)
     mp = dict(model.named_parameters())
     n_loaded = 0
     for name in sorted(wf.keys()):
-        if ".mlp.experts." in name or ".block_sparse_moe." in name:
+        if any(name.startswith(m + ".") for m in _expert_modules):
             continue
         if name not in mp:
             continue
@@ -432,7 +454,7 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device):
     cache = QuantizedExpertCache(q_dict, device, max_cached=1, group_size=128)
     
     for mname, mod in model.named_modules():
-        if not (mname.endswith(".mlp.experts") or mname.endswith(".block_sparse_moe.experts")):
+        if mname not in _expert_modules:
             continue
         mod._parameters.clear()
         if hasattr(mod, '_buffers'):
@@ -465,6 +487,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     """Run the full training loop using pre-extracted layer references."""
     
     N_LAYERS = moe_cfg.num_layers
+    _expert_modules = _expert_module_names(moe_cfg)
     DETACH_AT = min(train_layers) - 1
     MICROBATCH = config.microbatch
     ACCUM = config.accum
@@ -503,7 +526,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     if resume_ckpt is None:
         imp_store = TopKImportanceStore(_shapes, frac=FRAC)
         for mname, mod in model.named_modules():
-            if not (mname.endswith(".mlp.experts") or mname.endswith(".block_sparse_moe.experts")):
+            if mname not in _expert_modules:
                 continue
             mod._grad_capture = (imp_store, mname)
         
@@ -592,7 +615,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     
     sparse_store = SparseGradStore(active_idx, _shapes)
     for mname, mod in model.named_modules():
-        if not (mname.endswith(".mlp.experts") or mname.endswith(".block_sparse_moe.experts")):
+        if mname not in _expert_modules:
             continue
         mod._grad_capture = (sparse_store, mname)
     
