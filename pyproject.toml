@@ -48,6 +48,10 @@ train = [
 vk = [
     "pybind11>=2.11.0",
 ]
+data = [
+    "datasets>=2.21.0",
+    "tqdm>=4.66.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/tsuyu122/usaf"

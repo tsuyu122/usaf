@@ -20,6 +20,9 @@ class ImportanceScorer:
         self.dtype = dtype
         self.context_length = context_length
         self.skip_patterns = skip_patterns or self.DEFAULT_SKIP
+        # Parameters that received no gradient in the last compute_scores()
+        # call, and were therefore left out of the returned scores.
+        self.unobserved: list[str] = []
 
     def compute_scores(
         self,
@@ -101,12 +104,27 @@ class ImportanceScorer:
         for name, param in param_name_map.items():
             param.requires_grad = False
 
-        scores: dict[str, torch.Tensor] = {}
-        for name, param in self.model.named_parameters():
-            if name in grad_accum:
-                scores[name] = grad_accum[name]
-            else:
-                scores[name] = torch.zeros(param.shape, dtype=torch.float32, device="cpu")
+        # A parameter that never received a gradient has no evidence of
+        # importance, which is not the same as evidence of no importance.
+        # The previous code filled those with zeros, and the selectors rank on
+        # 'score >= threshold', so a zero-filled tensor is indistinguishable
+        # from a genuinely unimportant one and gets selected whenever the
+        # threshold lands at or below zero. Unobserved parameters are now
+        # omitted from the returned scores and listed on self.unobserved.
+        scores: dict[str, torch.Tensor] = dict(grad_accum)
+        self.unobserved: list[str] = [
+            name for name in param_name_map if name not in grad_accum
+        ]
+        if self.unobserved:
+            print(f"  importance: {len(self.unobserved)} of "
+                  f"{len(param_name_map)} parameters received no gradient and "
+                  f"are excluded from the score ranking", flush=True)
+        if not scores:
+            raise RuntimeError(
+                "no parameter accumulated a gradient; the importance pass "
+                "scored nothing (every batch OOMed or the model has no "
+                "trainable parameters)"
+            )
 
         return scores
 
