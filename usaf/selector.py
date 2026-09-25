@@ -1,9 +1,9 @@
-import torch
+
 import numpy as np
-from typing import Optional, Dict
+import torch
 
 
-def _kth_largest_threshold(scores: Dict[str, torch.Tensor], k: int) -> float:
+def _kth_largest_threshold(scores: dict[str, torch.Tensor], k: int) -> float:
     cat = torch.cat([s.reshape(-1) for s in scores.values()])
     n = cat.numel()
     k = max(1, min(k, n))
@@ -18,7 +18,7 @@ class TopKSelector:
     def __init__(self, k: int):
         self.k = k
 
-    def select(self, scores: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def select(self, scores: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         if not scores:
             return {}
         threshold = _kth_largest_threshold(scores, self.k)
@@ -29,7 +29,7 @@ class ThresholdSelector:
     def __init__(self, percentile: float):
         self.percentile = percentile
 
-    def select(self, scores: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def select(self, scores: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         cat = torch.cat([s.reshape(-1) for s in scores.values()])
         n = cat.numel()
         idx = min(max(int(n * self.percentile / 100.0), 0), n - 1)
@@ -45,7 +45,7 @@ class DynamicSelector:
         self.reselect_every_n_steps = reselect_every_n_steps
         self.selection = selection
         self._step_counter = 0
-        self._active_mask: Dict[str, torch.Tensor] = {}
+        self._active_mask: dict[str, torch.Tensor] = {}
 
     def should_reselect(self) -> bool:
         self._step_counter += 1
@@ -53,9 +53,9 @@ class DynamicSelector:
 
     def update_mask(
         self,
-        scores: Dict[str, torch.Tensor],
-        k: Optional[int] = None,
-    ) -> Dict[str, torch.Tensor]:
+        scores: dict[str, torch.Tensor],
+        k: int | None = None,
+    ) -> dict[str, torch.Tensor]:
         k = k or self.initial_k
         if self.selection == "topk":
             selector = TopKSelector(k)
@@ -65,5 +65,5 @@ class DynamicSelector:
         return self._active_mask
 
     @property
-    def active_mask(self) -> Dict[str, torch.Tensor]:
+    def active_mask(self) -> dict[str, torch.Tensor]:
         return self._active_mask

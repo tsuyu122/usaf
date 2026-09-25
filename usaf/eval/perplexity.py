@@ -1,6 +1,5 @@
 import math
 import time
-from typing import Dict, List
 
 import torch
 
@@ -9,13 +8,13 @@ import torch
 def compute_perplexity(
     model,
     tokenizer,
-    texts: List[str],
+    texts: list[str],
     device: torch.device,
     seq_len: int = 512,
     batch_size: int = 1,
     desc: str = "Evaluating",
     verbose: bool = True,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
     total_tokens = 0

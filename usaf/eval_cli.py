@@ -7,13 +7,12 @@ Usage:
 """
 import argparse
 import json
-import time
-import torch
 from pathlib import Path
 
-from .eval.benchmark import run_benchmark, BenchmarkConfig
+import torch
+
+from .eval.benchmark import BenchmarkConfig, BenchmarkResults, run_benchmark
 from .eval.report import save_report
-from .eval.datasets import SYNTHETIC_TEXTS
 
 
 def build_parser():
@@ -61,7 +60,6 @@ def main():
         print(f"Loading checkpoint: {ns.checkpoint}")
         ckpt = torch.load(ns.checkpoint, map_location="cpu", weights_only=True)
         for fname, aidx in ckpt.get("active_idx", {}).items():
-            fname_full = fname
             trained = ckpt["masters"][fname]
             for n, p in model.named_parameters():
                 if n.endswith("." + fname):
@@ -95,7 +93,7 @@ def main():
         from .eval.report import compare_reports
         prev_path = Path(ns.compare)
         if prev_path.exists():
-            with open(prev_path, "r") as f:
+            with open(prev_path) as f:
                 prev_data = json.load(f)
             prev_results = BenchmarkResults(
                 config=BenchmarkConfig(**prev_data.get("config", {})),

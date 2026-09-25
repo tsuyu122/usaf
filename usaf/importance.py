@@ -1,11 +1,11 @@
+
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM
-from typing import Dict, Tuple, Optional
 
 
 class ImportanceScorer:
-    DEFAULT_SKIP: Tuple[str, ...] = ("embed_tokens", "lm_head")
+    DEFAULT_SKIP: tuple[str, ...] = ("embed_tokens", "lm_head")
 
     def __init__(
         self,
@@ -13,7 +13,7 @@ class ImportanceScorer:
         device: torch.device,
         dtype: torch.dtype,
         context_length: int = 2048,
-        skip_patterns: Optional[Tuple[str, ...]] = None,
+        skip_patterns: tuple[str, ...] | None = None,
     ):
         self.model = model
         self.device = device
@@ -25,9 +25,9 @@ class ImportanceScorer:
         self,
         dataloader: DataLoader,
         max_batches: int = 0,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         self.model.eval()
-        grad_accum: Dict[str, torch.Tensor] = {}
+        grad_accum: dict[str, torch.Tensor] = {}
 
         param_name_map = {}
         for name, param in self.model.named_parameters():
@@ -101,7 +101,7 @@ class ImportanceScorer:
         for name, param in param_name_map.items():
             param.requires_grad = False
 
-        scores: Dict[str, torch.Tensor] = {}
+        scores: dict[str, torch.Tensor] = {}
         for name, param in self.model.named_parameters():
             if name in grad_accum:
                 scores[name] = grad_accum[name]
@@ -110,10 +110,10 @@ class ImportanceScorer:
 
         return scores
 
-    def save_scores(self, scores: Dict[str, torch.Tensor], path: str) -> None:
+    def save_scores(self, scores: dict[str, torch.Tensor], path: str) -> None:
         scores_fp16 = {k: v.half() for k, v in scores.items()}
         torch.save(scores_fp16, path)
 
     @staticmethod
-    def load_scores(path: str) -> Dict[str, torch.Tensor]:
+    def load_scores(path: str) -> dict[str, torch.Tensor]:
         return torch.load(path, map_location="cpu", weights_only=True)

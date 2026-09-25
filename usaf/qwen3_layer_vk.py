@@ -8,7 +8,9 @@ Strategy:
 Full forward matches the HF golden_capture.py reference (dense MoE for validation).
 """
 
-import os, sys
+import os
+import sys
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -163,8 +165,7 @@ def qwen3_layer_forward_vk(
     nKV = W.num_kv_heads
     hd = W.head_dim
     n_exp = expert_gate_up.shape[0]
-    inter = expert_gate_up.shape[1] // 2
-    device = hidden.device
+    expert_gate_up.shape[1] // 2
 
     # 1. Input RMSNorm
     hs = hidden.reshape(-1, H)  # [B*S, H]
@@ -218,7 +219,7 @@ def qwen3_layer_forward_vk(
 
     # 8. MoE (sparse dispatch: only process tokens assigned to each expert)
     moe = torch.zeros_like(x2)  # [B*S, H]
-    n_tokens = B * S
+    B * S
 
     # Build per-expert token lists from topk indices
     for ei in range(n_exp):

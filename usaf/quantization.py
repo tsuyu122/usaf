@@ -8,7 +8,7 @@ Two 4-bit values packed per int8: low nibble = first, high nibble = second.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import torch
 
@@ -21,7 +21,7 @@ def _round_ste(x: torch.Tensor) -> torch.Tensor:
 def quantize_4bit(
     tensor: torch.Tensor,
     group_size: int = 128,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Size]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Size]:
     """Quantize a float tensor to 4-bit per-group HQQ format.
 
     Each group of ``group_size`` elements gets its own fp16 scale and zero point.
@@ -133,10 +133,10 @@ def dequantize_4bit(
 
 
 def quantize_state_dict(
-    state_dict: Dict[str, torch.Tensor],
+    state_dict: dict[str, torch.Tensor],
     group_size: int = 128,
     min_size: int = 256,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Quantize all tensors in a state dict above ``min_size`` elements.
 
     Scalar tensors (0-dim) and small tensors are left as-is (float16).
@@ -152,7 +152,7 @@ def quantize_state_dict(
     Returns:
         Dict with the same keys; quantized entries are sub-dicts.
     """
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
 
     for name, param in state_dict.items():
         if not isinstance(param, torch.Tensor):
@@ -169,7 +169,7 @@ def quantize_state_dict(
     return out
 
 
-def dequantize_state_dict(q_dict: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+def dequantize_state_dict(q_dict: dict[str, Any]) -> dict[str, torch.Tensor]:
     """Dequantize a state dict produced by ``quantize_state_dict``.
 
     Args:
@@ -178,7 +178,7 @@ def dequantize_state_dict(q_dict: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     Returns:
         Plain state dict with all tensors as float16.
     """
-    out: Dict[str, torch.Tensor] = {}
+    out: dict[str, torch.Tensor] = {}
 
     for name, entry in q_dict.items():
         if isinstance(entry, dict) and "q" in entry:
@@ -196,7 +196,7 @@ def dequantize_state_dict(q_dict: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     return out
 
 
-def estimate_quantized_size(num_params: int, bits: int = 4) -> Dict[str, float]:
+def estimate_quantized_size(num_params: int, bits: int = 4) -> dict[str, float]:
     """Estimate memory footprint for a quantized tensor.
 
     Args:
@@ -225,10 +225,10 @@ def estimate_quantized_size(num_params: int, bits: int = 4) -> Dict[str, float]:
 
 
 def estimate_quantized_state_dict_size(
-    state_dict: Dict[str, torch.Tensor],
+    state_dict: dict[str, torch.Tensor],
     group_size: int = 128,
     min_size: int = 256,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Estimate memory savings from quantizing a state dict.
 
     Args:
@@ -317,7 +317,7 @@ def reconstruction_error(
 
 def _compute_per_group_minmax(
     x_2d: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-group min and max."""
     x_min = x_2d.amin(dim=1, keepdim=True)
     x_max = x_2d.amax(dim=1, keepdim=True)
@@ -328,7 +328,7 @@ def quantize_with_outliers(
     tensor: torch.Tensor,
     group_size: int = 128,
     outlier_fraction: float = 0.01,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """HQQ-style quantization with outlier sparsification.
 
     Outliers are stored separately in fp16. Only the remaining values
@@ -378,7 +378,7 @@ def quantize_with_outliers(
     }
 
 
-def dequantize_with_outliers(packed: Dict[str, torch.Tensor]) -> torch.Tensor:
+def dequantize_with_outliers(packed: dict[str, torch.Tensor]) -> torch.Tensor:
     """Dequantize a tensor packed by ``quantize_with_outliers``."""
     q = packed["q"]
     s = packed["s"]

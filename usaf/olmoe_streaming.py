@@ -17,7 +17,7 @@ def _is_expert_param(name: str) -> bool:
 def _move_module_tensors(module: nn.Module, target: torch.device) -> None:
     """Move a single module's params and buffers to *target*, reassigning Parameter
     objects instead of touching ``.data``.
-    
+
     DML rejects ``param.data = x.to(dev)`` (incompatible tensor type) in both
     directions. Reassigning the Parameter in ``module._parameters`` is the only
     reliable path.  ``.grad`` is carried over on the same device as ``.data``.

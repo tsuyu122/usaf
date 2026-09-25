@@ -1,10 +1,6 @@
 import json
 import math
 from pathlib import Path
-from typing import Dict
-from dataclasses import asdict
-
-from .benchmark import BenchmarkResults
 
 
 def save_report(results, path, pretty=True):

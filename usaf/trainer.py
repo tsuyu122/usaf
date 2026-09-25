@@ -1,27 +1,25 @@
 import math
-import json
-import time
 import random
+import time
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
+
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     SummaryWriter = None
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from .cache import ActivationCache
 from .config import USAFConfig
-from .data import CppDataset, create_dataloader
+from .evaluate import Evaluator
 from .importance import ImportanceScorer
 from .selector import DynamicSelector
 from .sparse_optim import SparseAdam
-from .cache import ActivationCache
-from .evaluate import Evaluator
-from .utils import get_dml_device, count_parameters, estimate_optimizer_memory
+from .utils import count_parameters, get_dml_device
 
 
 class USAFFineTuner:
@@ -95,7 +93,7 @@ class USAFFineTuner:
         self.evaluator = Evaluator(self.model, self.device, self.tokenizer)
 
         self.scores: dict[str, torch.Tensor] = {}
-        self._optimizer: Optional[SparseAdam] = None
+        self._optimizer: SparseAdam | None = None
 
     def _get_all_params(self) -> list[torch.nn.Parameter]:
         return [p for p in self.model.parameters() if p.requires_grad]
@@ -131,7 +129,7 @@ class USAFFineTuner:
         self,
         train_dataloader,
         val_dataloader,
-        resume_checkpoint: Optional[str] = None,
+        resume_checkpoint: str | None = None,
     ):
         config = self.config
 
