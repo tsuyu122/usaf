@@ -1,4 +1,4 @@
-"""USAF Evaluation CLI — benchmark any model without training.
+"""USAF Evaluation CLI â€” benchmark any model without training.
 
 Usage:
     python -m usaf.eval_cli --model Qwen/Qwen3-30B-A3B
