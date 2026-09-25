@@ -5,12 +5,13 @@ Extraído de train_qwen3_12h.py para reuso em scripts de avaliação
 validada — este helper é para inferência/scoring.
 """
 import os
-import torch
-from transformers import AutoConfig
-from safetensors import safe_open
 
-from .qwen3moe_dml import patch_qwen3moe_for_dml
+import torch
+from safetensors import safe_open
+from transformers import AutoConfig
+
 from .moe_loader import QuantizedExpertCache
+from .qwen3moe_dml import patch_qwen3moe_for_dml
 from .utils import get_dml_device
 
 

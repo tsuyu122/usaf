@@ -1,13 +1,12 @@
 import os
 import random
 from pathlib import Path
-from typing import Iterator, Optional
 
 import torch
 from datasets import Dataset, DatasetDict, concatenate_datasets
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 
 def collect_source_files(root_dir: str, extensions: tuple, max_size_mb: int = 1) -> list[str]:
@@ -31,7 +30,7 @@ def read_file_content(filepath: str, deduplicate_lines: bool = True) -> str:
     content = None
     for enc in encodings:
         try:
-            with open(filepath, "r", encoding=enc) as f:
+            with open(filepath, encoding=enc) as f:
                 content = f.read()
             break
         except (UnicodeDecodeError, UnicodeError):
@@ -92,8 +91,8 @@ def preprocess_dataset(
     shuffle_repos: bool = True,
     seed: int = 42,
 ) -> DatasetDict:
-    import tempfile
     import shutil
+    import tempfile
 
     random.seed(seed)
     files = collect_source_files(cloned_projects_dir, cpp_extensions, max_file_size_mb)

@@ -1,16 +1,14 @@
-import json
 import time
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional
+from dataclasses import asdict, dataclass, field
 
-from .perplexity import compute_perplexity
 from .datasets import get_eval_texts
+from .perplexity import compute_perplexity
 
 
 @dataclass
 class BenchmarkConfig:
-    datasets: List[str] = field(default_factory=lambda: ["synthetic-cpp"])
-    dataset_paths: Dict[str, str] = field(default_factory=dict)
+    datasets: list[str] = field(default_factory=lambda: ["synthetic-cpp"])
+    dataset_paths: dict[str, str] = field(default_factory=dict)
     max_samples: int = 64
     seq_len: int = 512
     batch_size: int = 1
@@ -20,7 +18,7 @@ class BenchmarkConfig:
 @dataclass
 class BenchmarkResults:
     config: BenchmarkConfig
-    results: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    results: dict[str, dict[str, float]] = field(default_factory=dict)
     timestamp: float = 0.0
     elapsed: float = 0.0
     model_name: str = ""
@@ -38,7 +36,7 @@ class BenchmarkResults:
                   f"{tokens:>6,d} tok  {tps:>7.1f} tok/s")
         print(f"{'=' * 60}")
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         return {
             "model": self.model_name,
             "timestamp": self.timestamp,

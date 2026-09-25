@@ -50,7 +50,6 @@ file(MAKE_DIRECTORY ${SPIRV_DIR})
 set(KERNEL_SRC
     src/kernels/test_add.comp
     src/kernels/rmsnorm_fp16.comp
-    src/kernels/rmsnorm_simple.comp
     src/kernels/gemm_fp16.comp
     src/kernels/rope_fp16.comp
     src/kernels/dequant_q4.comp

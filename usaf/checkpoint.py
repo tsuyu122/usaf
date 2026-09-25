@@ -7,26 +7,23 @@ weights to produce a deployable model.
 """
 from __future__ import annotations
 
-import json
-import math
 import os
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import torch
 
 
 def save_sparse_checkpoint(
     path: str,
-    masters: Dict[str, torch.nn.Parameter],
-    active_idx: Dict[str, torch.Tensor],
-    optimizer_state: Dict[str, Any],
-    config: Dict[str, Any],
+    masters: dict[str, torch.nn.Parameter],
+    active_idx: dict[str, torch.Tensor],
+    optimizer_state: dict[str, Any],
+    config: dict[str, Any],
     step: int,
-    losses: List[float],
-    train_layers: List[int],
-    metric: Optional[float] = None,
+    losses: list[float],
+    train_layers: list[int],
+    metric: float | None = None,
 ) -> str:
     path = str(path)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -48,7 +45,7 @@ def save_sparse_checkpoint(
 
 def load_sparse_checkpoint(
     path: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     state = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(state, dict) or state.get("format") != "usaf-sparse-v1":
         raise ValueError(f"Not a valid USAF sparse checkpoint: {path}")
@@ -57,16 +54,16 @@ def load_sparse_checkpoint(
 
 def export_merged_weights(
     quant_path: str,
-    masters: Dict[str, torch.Tensor],
-    active_idx: Dict[str, torch.Tensor],
+    masters: dict[str, torch.Tensor],
+    active_idx: dict[str, torch.Tensor],
     output_path: str,
     group_size: int = 128,
 ) -> str:
     from usaf.quantization import dequantize_4bit, quantize_state_dict
 
-    q_dict: Dict[str, Any] = torch.load(quant_path, map_location="cpu", weights_only=True)
+    q_dict: dict[str, Any] = torch.load(quant_path, map_location="cpu", weights_only=True)
 
-    merged_fp16: Dict[str, torch.Tensor] = {}
+    merged_fp16: dict[str, torch.Tensor] = {}
     for fname, entry in q_dict.items():
         if isinstance(entry, dict) and "q" in entry:
             t = dequantize_4bit(
@@ -92,7 +89,7 @@ def export_merged_weights(
     return output_path
 
 
-def get_checkpoint_metadata(path: str) -> Dict[str, Any]:
+def get_checkpoint_metadata(path: str) -> dict[str, Any]:
     state = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(state, dict):
         return {"error": "invalid checkpoint"}

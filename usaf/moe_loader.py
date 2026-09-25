@@ -7,23 +7,22 @@ expert layer consumes GPU memory.
 
 from __future__ import annotations
 
-import numpy as np
-import torch
-import gc
 import fnmatch
-import math
+import gc
+import re
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, Future
-from typing import Dict, Tuple, Optional, List, Any, Union, Set
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
-from .quantization import dequantize_4bit, dequantize_state_dict
+from .quantization import dequantize_4bit
 
 
 def save_quantized_state_dict(
-    q_dict: Dict[str, Any],
+    q_dict: dict[str, Any],
     path: str,
     *,
     _use_new_zipfile_serialization: bool = True,
@@ -39,8 +38,8 @@ def save_quantized_state_dict(
 
 def load_quantized_state_dict(
     path: str,
-    map_location: Union[str, torch.device] = "cpu",
-) -> Dict[str, Any]:
+    map_location: str | torch.device = "cpu",
+) -> dict[str, Any]:
     """Load a quantized state dict from disk.
 
     Args:
@@ -82,30 +81,36 @@ class QuantizedExpertCache:
 
     def __init__(
         self,
-        quantized_dict: Dict[str, Any],
+        quantized_dict: dict[str, Any],
         device: torch.device,
         max_cached: int = 2,
         group_size: int = 128,
+        expert_prefix: str = "model.layers.{i}.mlp.experts",
     ) -> None:
         self._q_dict = quantized_dict
         self._device = device
         self._max_cached = max(max_cached, 1)
         self._group_size = group_size
+        # Expert module naming convention for this architecture, e.g.
+        # "model.layers.{i}.mlp.experts". Inferred from the quantized keys when
+        # possible so the cache does not silently address the wrong modules on a
+        # layout that names its experts differently.
+        self._expert_prefix = expert_prefix
 
-        self._cache: OrderedDict[str, Dict[str, torch.Tensor]] = OrderedDict()
+        self._cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
 
-        self.overlays: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.overlays: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
-        self._prefetched: Dict[str, Future] = {}
-        self._executor: Optional[ThreadPoolExecutor] = None
+        self._prefetched: dict[str, Future] = {}
+        self._executor: ThreadPoolExecutor | None = None
 
-        self._expert_to_params: Dict[str, List[Tuple[str, str]]] = {}
+        self._expert_to_params: dict[str, list[tuple[str, str]]] = {}
         self._build_index()
 
-        self._resident: Dict[str, Dict[str, torch.Tensor]] = {}
+        self._resident: dict[str, dict[str, torch.Tensor]] = {}
         self._resident_active: bool = False
 
-        self._vk_q4: Dict[str, tuple] = {}
+        self._vk_q4: dict[str, tuple] = {}
         self._vk_enabled: bool = False
 
     def _build_index(self) -> None:
@@ -116,7 +121,7 @@ class QuantizedExpertCache:
         the expert module name is ``model.layers.0.mlp.experts`` and the local
         parameter name is ``gate_up_proj``.
         """
-        expert_to_params: Dict[str, List[Tuple[str, str]]] = {}
+        expert_to_params: dict[str, list[tuple[str, str]]] = {}
 
         for full_name in self._q_dict:
             parts = full_name.rsplit(".", 1)
@@ -127,7 +132,28 @@ class QuantizedExpertCache:
 
         self._expert_to_params = expert_to_params
 
-    def get_expert_weights(self, expert_module_name: str) -> Dict[str, torch.nn.Parameter]:
+        # Infer the expert module prefix from the actual keys when the caller
+        # did not supply one explicitly. Every key has the shape
+        # "<prefix with layer index>.<param>", so the common part across layers
+        # identifies the convention without hardcoding ".mlp.experts".
+        if expert_to_params:
+            # Derive the convention from the keys themselves instead of
+            # hardcoding ".mlp.experts". An expert module name is
+            # "<stem><layer index><tail>"; replacing the index with {i} gives
+            # the prefix, e.g. "model.layers.3.mlp.experts" ->
+            # "model.layers.{i}.mlp.experts". Taking the stem from ONE module
+            # and confirming the rest agree keeps this from being fooled by a
+            # prefix that itself ends in a digit.
+            pat = re.compile(r"^(?P<stem>.*?\.)(?P<idx>\d+)(?P<tail>\..*)?$")
+            forms = set()
+            for mod_name in expert_to_params:
+                m = pat.match(mod_name)
+                if m and m.group("stem"):
+                    forms.add(m.group("stem") + "{i}" + (m.group("tail") or ""))
+            if len(forms) == 1:
+                self._expert_prefix = forms.pop()
+
+    def get_expert_weights(self, expert_module_name: str) -> dict[str, torch.nn.Parameter]:
         """Return dequantized fp16 Parameters for *expert_module_name*, on GPU.
 
         If the expert is already in the LRU cache it is promoted (move-to-end).
@@ -189,7 +215,7 @@ class QuantizedExpertCache:
         }
 
     def _dequant_cpu(self, expert_module_name: str,
-                    only: Optional[Set[str]] = None) -> Dict[str, torch.Tensor]:
+                    only: set[str] | None = None) -> dict[str, torch.Tensor]:
         """Dequantize an expert module's params to CPU fp16 (overlay applied).
 
         Uses VK GPU dequant when _vk_q4_all has buffers for this param.
@@ -201,7 +227,7 @@ class QuantizedExpertCache:
                 holds some params in fp16 (e.g. the resident cache) does not
                 pay for a full 4-bit dequant of data it already has.
         """
-        cpu_params: Dict[str, torch.Tensor] = {}
+        cpu_params: dict[str, torch.Tensor] = {}
         for full_name, local_name in self._expert_to_params.get(expert_module_name, []):
             if only is not None and local_name not in only:
                 continue
@@ -241,9 +267,9 @@ class QuantizedExpertCache:
             cpu_params[local_name] = t
         return cpu_params
 
-    def _get_resident(self, expert_module_name: str) -> Dict[str, torch.Tensor]:
+    def _get_resident(self, expert_module_name: str) -> dict[str, torch.Tensor]:
         """Return resident fp16 params with overlay applied. Uses VK GPU dequant when enabled."""
-        out: Dict[str, torch.Tensor] = {}
+        out: dict[str, torch.Tensor] = {}
         for local_name, base in self._resident[expert_module_name].items():
             full_name = f"{expert_module_name}.{local_name}"
             if self._vk_enabled and full_name in self._vk_q4:
@@ -273,10 +299,10 @@ class QuantizedExpertCache:
                 if key.startswith(prefix):
                     del self._q_dict[key]
                     dropped += 1
-            expert_name = f"model.layers.{li}.mlp.experts"
+            expert_name = self._expert_prefix.format(i=li)
             self._expert_to_params.pop(expert_name, None)
             self._prefetched.pop(expert_name, None)
-        import gc; gc.collect()
+        gc.collect()
 
     def make_resident(self, train_layers, dequant_batch: int = 8, only_params=None) -> None:
         """Dequantize trainable-layer experts once to fp16 CPU RAM.
@@ -287,11 +313,11 @@ class QuantizedExpertCache:
         """
         self._resident_active = False
         for li in sorted(train_layers):
-            expert_name = f"model.layers.{li}.mlp.experts"
+            expert_name = self._expert_prefix.format(i=li)
             entries = self._expert_to_params.get(expert_name)
             if not entries:
                 continue
-            res: Dict[str, torch.Tensor] = {}
+            res: dict[str, torch.Tensor] = {}
             for full_name, local_name in entries:
                 if only_params is not None and local_name not in only_params:
                     continue
@@ -319,7 +345,8 @@ class QuantizedExpertCache:
     def setup_vk_dequant(self, train_layers):
         """Upload q4 weights to Vulkan buffers for GPU dequant."""
         try:
-            import os, sys
+            import os
+            import sys
             sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vulkan', 'build', 'Release'))
             os.add_dll_directory(os.environ.get('VULKAN_SDK', 'C:/VulkanSDK/1.4.341.1') + '/Bin')
             import usaf_vk
@@ -331,7 +358,7 @@ class QuantizedExpertCache:
         max_elems = 0
         n_uploaded = 0
         for li in sorted(train_layers):
-            expert_name = f"model.layers.{li}.mlp.experts"
+            expert_name = self._expert_prefix.format(i=li)
             entries = self._expert_to_params.get(expert_name)
             if not entries:
                 continue
@@ -374,7 +401,8 @@ class QuantizedExpertCache:
             max_layers: Only upload layers with index < max_layers (default: all)
         """
         try:
-            import os, sys
+            import os
+            import sys
             sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vulkan', 'build', 'Release'))
             os.add_dll_directory(os.environ.get('VULKAN_SDK', 'C:/VulkanSDK/1.4.341.1') + '/Bin')
             import usaf_vk
@@ -512,7 +540,7 @@ class QuantizedExpertCache:
         self._cache.clear()
 
     @property
-    def cached_experts(self) -> List[str]:
+    def cached_experts(self) -> list[str]:
         """Names of experts currently cached on GPU (most recent first)."""
         return list(reversed(self._cache.keys()))
 
@@ -552,12 +580,12 @@ class SparseGradStore:
 
     def __init__(
         self,
-        active_idx: Dict[str, torch.Tensor],
-        shapes: Dict[str, Any],
+        active_idx: dict[str, torch.Tensor],
+        shapes: dict[str, Any],
     ) -> None:
-        self.compact: Dict[str, torch.Tensor] = {}
-        self._maps: Dict[str, Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = {}
-        self._dev_idx: Dict[Tuple[str, int], torch.Tensor] = {}
+        self.compact: dict[str, torch.Tensor] = {}
+        self._maps: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        self._dev_idx: dict[tuple[str, int], torch.Tensor] = {}
 
         for name, idx in active_idx.items():
             idx = idx.reshape(-1).to(device="cpu", dtype=torch.long)
@@ -567,7 +595,7 @@ class SparseGradStore:
             for s in shape[1:]:
                 slice_size *= int(s)
             e_of = torch.div(idx, slice_size, rounding_mode="floor")
-            per_expert: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+            per_expert: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
             for ei in torch.unique(e_of).tolist():
                 ei = int(ei)
                 pos = (e_of == ei).nonzero(as_tuple=False).reshape(-1)
@@ -607,12 +635,12 @@ class TopKImportanceStore:
     Same ``add`` protocol as SparseGradStore.
     """
 
-    def __init__(self, shapes: Dict[str, Any], frac: float, cand_mult: float = 2.0) -> None:
+    def __init__(self, shapes: dict[str, Any], frac: float, cand_mult: float = 2.0) -> None:
         self._shapes = shapes
         self._frac = frac
         self._cand = cand_mult
-        self._vals: Dict[str, Dict[int, torch.Tensor]] = {n: {} for n in shapes}
-        self._idx: Dict[str, Dict[int, torch.Tensor]] = {n: {} for n in shapes}
+        self._vals: dict[str, dict[int, torch.Tensor]] = {n: {} for n in shapes}
+        self._idx: dict[str, dict[int, torch.Tensor]] = {n: {} for n in shapes}
 
     def zero_(self) -> None:
         for n in self._vals:
@@ -628,10 +656,10 @@ class TopKImportanceStore:
         self._vals[full_name][int(ei)] = v
         self._idx[full_name][int(ei)] = i.to(torch.long) + int(ei) * flat.numel()
 
-    def select(self, frac: float | None = None) -> Dict[str, torch.Tensor]:
+    def select(self, frac: float | None = None) -> dict[str, torch.Tensor]:
         """Merge per-expert candidates into global flat active indices."""
         frac = self._frac if frac is None else frac
-        out: Dict[str, torch.Tensor] = {}
+        out: dict[str, torch.Tensor] = {}
         for name, shape in self._shapes.items():
             if not self._vals[name]:
                 continue
@@ -667,12 +695,12 @@ def _move_module_tensors_to(module: nn.Module, target: torch.device) -> None:
 
 def setup_quantized_streaming(
     model: nn.Module,
-    quantized_dict: Dict[str, Any],
+    quantized_dict: dict[str, Any],
     device: torch.device,
     *,
     max_cached_experts: int = 2,
     group_size: int = 128,
-    expert_pattern: str = "*.mlp.experts",
+    expert_pattern: str | None = None,
     verbose: bool = True,
 ) -> nn.Module:
     """Stream quantized expert weights from CPU to GPU during forward passes.
@@ -687,25 +715,34 @@ def setup_quantized_streaming(
         device:             Target GPU device.
         max_cached_experts: LRU cache size.
         group_size:         Group size used during quantization.
-        expert_pattern:     Glob pattern matching expert module names.
+        expert_pattern:     Glob matching expert module names. None (the
+                            default) derives it from the quantized keys, so a
+                            non-standard expert layout still matches.
         verbose:            Print summary statistics.
 
     Returns:
         Model with streaming hooks installed.
     """
+    # Build the cache first so the expert naming convention is inferred from
+    # the quantized keys, then derive the matching glob from that prefix.
+    # The previous hardcoded default "*.mlp.experts" matched nothing on any
+    # architecture that names its experts differently, so no hooks were
+    # installed and the experts silently ran on their (cleared) meta tensors.
     cache = QuantizedExpertCache(
         quantized_dict,
         device=device,
         max_cached=max_cached_experts,
         group_size=group_size,
     )
+    if expert_pattern is None:
+        expert_pattern = cache._expert_prefix.format(i="*")
 
-    cpu = torch.device("cpu")
+    torch.device("cpu")
 
     n_gpu = n_cpu = 0
     bytes_gpu = bytes_cpu = 0
 
-    expert_module_names: List[str] = []
+    expert_module_names: list[str] = []
     for mname, mod in model.named_modules():
         is_expert = fnmatch.fnmatch(mname, expert_pattern)
         if is_expert:
@@ -729,9 +766,9 @@ def setup_quantized_streaming(
         print(f"  CPU (4-bit):      {n_cpu} entradas, ~{bytes_cpu / 1e9:.2f}GB")
         print(f"  Cache LRU:        {max_cached_experts} experts max")
 
-    state: Dict[str, int] = {"resident": 0, "max": 0}
+    state: dict[str, int] = {"resident": 0, "max": 0}
 
-    model._expert_grads: Dict[str, torch.Tensor] = {}
+    model._expert_grads: dict[str, torch.Tensor] = {}
     grad_store = model._expert_grads
 
     def make_pre_hook(mod_name: str):
@@ -763,7 +800,7 @@ def setup_quantized_streaming(
 
     model._stream_state = state
 
-    expert_modules: List[nn.Module] = []
+    expert_modules: list[nn.Module] = []
     for name, mod in model.named_modules():
         if name in expert_module_names:
             expert_modules.append(mod)
@@ -787,7 +824,7 @@ def setup_quantized_streaming(
     return model
 
 
-def get_quantized_cache(model: nn.Module) -> Optional[QuantizedExpertCache]:
+def get_quantized_cache(model: nn.Module) -> QuantizedExpertCache | None:
     """Retrieve the ``QuantizedExpertCache`` attached to a model by
     ``setup_quantized_streaming``."""
     return getattr(model, "_quantized_cache", None)
@@ -802,7 +839,7 @@ def apply_captured_expert_grads(
     Expert module parameters are ephemeral (cleared after each forward).
     Gradients captured via ``post_accumulate_grad_hook`` are transferred back.
     """
-    store: Dict[str, torch.Tensor] = getattr(model, "_expert_grads", {})
+    store: dict[str, torch.Tensor] = getattr(model, "_expert_grads", {})
     if not store:
         return 0
 

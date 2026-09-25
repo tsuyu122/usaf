@@ -5,8 +5,12 @@ Training resumes from layer DETACH_AT+1. Decoupled from the model: build receive
 a callback ``compute_hidden(sample) -> [SEQ, H]``.
 """
 from __future__ import annotations
-import hashlib, json, os
-from typing import Callable, Optional
+
+import hashlib
+import json
+import os
+from collections.abc import Callable
+
 import numpy as np
 import torch
 
@@ -23,7 +27,7 @@ def dataset_fingerprint(samples, detach_at: int, src: str) -> str:
 
 
 def load_frozen_cache(samples, seq: int, hidden: int, detach_at: int,
-                      src: str, path: str) -> Optional[np.ndarray]:
+                      src: str, path: str) -> np.ndarray | None:
     """Return read-only memmap if fingerprint matches, else None."""
     meta_path = path + ".json"
     if not (os.path.exists(path) and os.path.exists(meta_path)):

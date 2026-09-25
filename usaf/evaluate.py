@@ -1,8 +1,8 @@
 import math
+
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from .utils import get_dml_device
 
 
 class Evaluator:
