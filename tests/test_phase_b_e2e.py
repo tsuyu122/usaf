@@ -6,14 +6,17 @@ via TopK active_idx, SparseAdam (scatter_, refresh), perplexity eval.
 
 If this passes, the real model on DML will pass too. Runs in <2 min.
 """
-import re, time, math
+import math
+import re
+
 import pytest
 import torch
-from transformers import AutoConfig
 from transformers.models.olmoe.modeling_olmoe import OlmoeForCausalLM
+
 from usaf.olmoe_dml import patch_olmoe_for_dml
-from usaf.olmoe_streaming import setup_streaming, apply_captured_expert_grads
+from usaf.olmoe_streaming import apply_captured_expert_grads, setup_streaming
 from usaf.sparse_optim import SparseAdam
+
 # eval_olmoe is an external helper that is not shipped with this package.
 # Import it lazily: importing it at module scope broke pytest collection for the
 # whole suite (ModuleNotFoundError) even for the tests that do not need it.
@@ -88,6 +91,22 @@ def test_b1_streaming_smoke():
     n_captured = apply_captured_expert_grads(model)
     n_grad = sum(1 for p in model.parameters() if p.grad is not None)
     assert n_grad > 0, "B1: no params got gradients"
+    # The previous assertion also passed when the sparse expert capture
+    # silently produced nothing, because the router gradients alone were
+    # enough to make n_grad positive. Require that the expert path itself
+    # contributed, and that those gradients are finite and nonzero.
+    assert n_captured > 0, (
+        "B1: no expert gradients were captured - the sparse path did not run"
+    )
+    expert_grads = [
+        p.grad for n, p in model.named_parameters() if p.grad is not None
+    ]
+    assert all(torch.isfinite(g).all() for g in expert_grads), (
+        "B1: a captured expert gradient is not finite"
+    )
+    assert any(g.abs().sum().item() > 0 for g in expert_grads), (
+        "B1: every captured gradient is exactly zero"
+    )
 
 
 def test_b2_importance_scoring():

@@ -72,7 +72,23 @@ def build_frozen_cache(samples, seq: int, hidden: int, detach_at: int, src: str,
 
 
 def get_hidden(cache: np.ndarray, idx: int, device, dtype=torch.float16) -> torch.Tensor:
-    """Return hidden@DETACH_AT as [1, SEQ, H] on the target device."""
+    """Return hidden@DETACH_AT as [1, SEQ, H] on the target device.
+
+    Raises IndexError when ``idx`` is outside the cache. Callers relied on that
+    to fall back to a full forward pass, but the fallback was silent: a sample
+    whose index was not in the cache simply stopped being evaluated, and an
+    evaluation over no samples at all returned inf rather than failing.
+    """
+    n = len(cache)
+    if not isinstance(idx, (int,)) or isinstance(idx, bool):
+        idx = int(idx)
+    if idx < 0:
+        idx += n
+    if idx < 0 or idx >= n:
+        raise IndexError(
+            f"frozen cache index {idx} is out of range for a cache holding "
+            f"{n} samples; this sample was never cached"
+        )
     arr = np.array(cache[idx], copy=True)
     t = torch.from_numpy(np.ascontiguousarray(arr)).to(device=device, dtype=dtype)
     return t.unsqueeze(0)
