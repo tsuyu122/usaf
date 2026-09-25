@@ -8,7 +8,6 @@ def test_package_import():
     assert hasattr(usaf, "ImportanceScorer")
     assert hasattr(usaf, "TopKSelector")
     assert hasattr(usaf, "SparseAdam")
-    assert hasattr(usaf, "USAFFineTuner")
     assert hasattr(usaf, "Evaluator")
 
 

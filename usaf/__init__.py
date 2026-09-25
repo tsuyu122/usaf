@@ -9,7 +9,6 @@ from .olmoe_streaming import apply_captured_expert_grads, setup_streaming, sync_
 from .qwen3moe_dml import dml_qwen3_experts_forward, dml_qwen3_moe_block_forward, patch_qwen3moe_for_dml
 from .selector import DynamicSelector, ThresholdSelector, TopKSelector
 from .sparse_optim import SparseAdam
-from .trainer import USAFFineTuner
 
 _HAS_QUANTIZATION: bool = False
 _HAS_MOE_LOADER: bool = False
@@ -54,7 +53,6 @@ __all__ = [
     "DynamicSelector",
     "SparseAdam",
     "ActivationCache",
-    "USAFFineTuner",
     "Evaluator",
     "patch_olmoe_for_dml",
     "dml_experts_forward",
