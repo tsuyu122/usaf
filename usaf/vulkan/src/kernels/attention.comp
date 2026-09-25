@@ -85,31 +85,29 @@ void main() {
     
     float inv_sum = 1.0 / (exp_sum + 1e-10);
     
-    // Pass 3: weighted V sum for each dimension
-    // Each of 256 threads computes one output dimension
-    for (uint d = tid; d < pc.hd; d += 256) {
+    // Pass 3: weighted V sum.
+    //
+    // Correctness fix: the previous version looped "for (d = tid; d < hd; d += 256)"
+    // and issued barrier() inside that loop. Whenever hd < 256 the threads with
+    // tid >= hd never entered the loop, so those barriers sat in non-uniform
+    // control flow - undefined behaviour in GLSL/Vulkan, and the s_scores / s_v
+    // shared arrays were then written and read across a partially-executed
+    // barrier. That produced wrong results (measured max abs error 1.99 vs a
+    // torch reference).
+    //
+    // The fix removes shared memory from this pass entirely: every thread owns
+    // one output dimension in a private register accumulator and strides over
+    // the sequence. All threads execute the same trip counts, so no barrier is
+    // needed and no uniformity violation is possible.
+    if (tid < pc.hd) {
+        uint d = tid;
         float weighted = 0.0;
-        for (uint c_tile = 0; c_tile < pc.S; c_tile += 256) {
-            uint c = c_tile;
-            // Load scores and V for this tile
-            for (uint i = 0; i < 256 && (c_tile + i) < pc.S; i++) {
-                uint col = c_tile + i;
-                if (pc.causal == 0 || col <= r) {
-                    float score = float(scores[scores_off + col]);
-                    float exp_s = exp(score - max_val);
-                    s_scores[i] = exp_s;
-                    s_v[i] = float(v[v_off + col * pc.hd + d]);
-                } else {
-                    s_scores[i] = 0.0;
-                    s_v[i] = 0.0;
-                }
+        for (uint col = 0; col < pc.S; ++col) {
+            if (pc.causal == 0 || col <= r) {
+                float score = float(scores[scores_off + col]);
+                weighted += exp(score - max_val) * float(v[v_off + col * pc.hd + d]);
             }
-            barrier();
-            for (uint i = 0; i < 256 && (c_tile + i) < pc.S; i++) {
-                weighted += s_scores[i] * inv_sum * s_v[i];
-            }
-            barrier();
         }
-        result[out_off + d] = float16_t(weighted);
+        result[out_off + d] = float16_t(weighted * inv_sum);
     }
 }
