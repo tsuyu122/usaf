@@ -106,11 +106,17 @@ if USE_CUDA:
         p = torch.cuda.get_device_properties(i)
         print(f"    GPU {i}: {p.name} ({p.total_memory/1e9:.1f}GB)")
     if USE_AMP:
-        _amp_scaler = torch.cuda.amp.GradScaler()
+        # No torch.cuda.amp.GradScaler: the sparse gradients are captured into a
+        # custom store via module hooks, not into param.grad, so
+        # GradScaler.unscale_/step/update would never run and its 65536 scale
+        # factor would leak into the captured gradients. The loop scales the
+        # loss by loss_scale before backward and divides by loss_scale*ACCUM in
+        # the step, which is exactly what the working DirectML path does.
+        _amp_scaler = None
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        print(f"  AMP + cuDNN benchmark + TF32 enabled")
+        print(f"  AMP (manual loss scaling) + cuDNN benchmark + TF32 enabled")
     else:
         _amp_scaler = None
 else:
@@ -347,10 +353,7 @@ def fwd_bwd(batch,zero_store=True):
 
     h_last=hidden.detach().requires_grad_(True)
     loss=_head_loss(h_last,labels)
-    if _amp_scaler is not None:
-        _amp_scaler.scale(loss*loss_scale).backward()
-    else:
-        (loss*loss_scale).backward()
+    (loss*loss_scale).backward()
     g=h_last.grad
 
     for j in range(len(xs)-1,-1,-1):
