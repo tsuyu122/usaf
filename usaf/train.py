@@ -185,12 +185,19 @@ def setup_device(config: TrainConfig) -> Tuple[torch.device, int, object]:
             p = torch.cuda.get_device_properties(i)
             print(f"  GPU {i}: {p.name} ({p.total_memory/1e9:.1f}GB)")
 
-        scaler = torch.cuda.amp.GradScaler() if config.use_amp else None
-        if scaler:
+        # NOTE: deliberately no torch.cuda.amp.GradScaler. The sparse-gradient
+        # path captures grads into a custom store via module hooks, not into
+        # param.grad, so GradScaler.unscale_/step/update would never run and its
+        # fixed 65536 scale factor would leak into the captured gradients. Manual
+        # loss scaling (loss*loss_scale before backward, divided by
+        # loss_scale*ACCUM in the step loop) is used instead - the same scheme
+        # the working DirectML path in the root train.py uses.
+        scaler = None
+        if config.use_amp:
             torch.backends.cudnn.benchmark = True
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            print("  AMP + cuDNN benchmark enabled")
+            print("  AMP (manual loss scaling) + cuDNN benchmark + TF32 enabled")
     else:
         try:
             from usaf.utils import get_dml_device
@@ -622,10 +629,12 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         h_last = hidden.detach().requires_grad_(True)
         loss = _head_loss(h_last, lbl)
         
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        # Scale the loss before backward so fp16 gradients do not underflow to
+        # zero; the step loop divides the captured grads by loss_scale*ACCUM to
+        # recover the true gradient. Reading loss_scale from the enclosing
+        # scope is safe: fwd_bwd is only invoked from the training loop, after
+        # loss_scale has been initialised.
+        (loss * loss_scale).backward()
         
         g = h_last.grad
         for j in range(len(xs) - 1, -1, -1):
