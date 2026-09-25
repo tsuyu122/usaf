@@ -276,7 +276,8 @@ def main(args=None):
     print(f"Q4 weights: {config.quant_path}")
     
     print(f"\nLoading model...")
-    model, cache, q_dict, wf, st_path = _load_model(config, moe_cfg, device)
+    model, cache, q_dict, wf, st_path, router_params = _load_model(
+        config, moe_cfg, device, train_layers)
     
     if config.use_multi_gpu and n_gpus > 1 and config.use_cuda:
         model = nn.DataParallel(model)
@@ -352,6 +353,7 @@ def main(args=None):
                   train_samples, eval_samples, heldout_samples,
                   _train_names, _shapes, train_layers,
                   layers, embed, rotary, norm_fn, lm_head,
+                  router_params=router_params,
                   resume_ckpt=resume_ckpt)
     
     return model
@@ -392,7 +394,23 @@ def _expert_module_names(moe_cfg) -> Set[str]:
     return {moe_cfg.expert_prefix.format(i=i) for i in range(moe_cfg.num_layers)}
 
 
-def _load_model(config: TrainConfig, moe_cfg, device: torch.device):
+def _layer_is_trainable(param_name: str, train_layers: Set[int]) -> bool:
+    """Return True if param_name belongs to one of the trainable layers.
+
+    Parses "model.layers.<i>...." and compares <i> against the trainable set.
+    """
+    parts = param_name.split(".")
+    if "layers" not in parts:
+        return False
+    try:
+        idx = int(parts[parts.index("layers") + 1])
+    except (IndexError, ValueError):
+        return False
+    return idx in train_layers
+
+
+def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
+                train_layers: Set[int]):
     """Load model with quantized expert streaming."""
     from transformers import AutoConfig
     from safetensors import safe_open
@@ -406,6 +424,11 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device):
             from transformers.models.qwen3_moe import Qwen3MoeForCausalLM
             model = Qwen3MoeForCausalLM(cfg)
     
+    # Router bookkeeping: suffix (from the detected config) and the dict of
+    # trainable gate params, returned so _run_training can optimize them.
+    router_suffix = moe_cfg.router_path
+    router_params: Dict[str, nn.Parameter] = {}
+
     import glob as _glob
     if os.path.isdir(config.model_path):
         st_path = config.model_path
@@ -434,8 +457,16 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device):
         obj = model
         for p in parts[:-1]:
             obj = getattr(obj, p)
+        # The router (gate) of each trainable layer is trained alongside the
+        # sparse experts. For MoE models the gate decides which experts fire
+        # and is the single highest-leverage parameter to update - LoRA-style
+        # adapter methods cannot touch it. Mark it requires_grad and collect
+        # it for a separate optimizer (see _run_training).
+        train_gate = (name.endswith(router_suffix) and _layer_is_trainable(name, train_layers))
         obj._parameters[parts[-1]] = nn.Parameter(
-            tensor.to(device=device), requires_grad=False)
+            tensor.to(device=device), requires_grad=train_gate)
+        if train_gate:
+            router_params[name] = obj._parameters[parts[-1]]
         n_loaded += 1
     
     for mn, mod in model.named_modules():
@@ -476,13 +507,14 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device):
         mod.register_forward_pre_hook(make_pre(mname))
         mod.register_forward_hook(make_post())
     
-    return model, cache, q_dict, wf, st_path
+    return model, cache, q_dict, wf, st_path, router_params
 
 
 def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                   train_samples, eval_samples, heldout_samples,
                   _train_names, _shapes, train_layers,
                   layers, embed, rotary, norm_fn, lm_head,
+                  router_params=None,
                   resume_ckpt=None):
     """Run the full training loop using pre-extracted layer references."""
     
@@ -624,6 +656,16 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         cache.apply_resident_overlays(active_idx, masters)
         cache._prefetch_disabled = True
     
+    # Separate optimizer for the router (gate) weights.
+    # Adam on fp16 DirectML falls back to CPU and produces NaN, so we use
+    # plain SGD with momentum - the same choice the root train.py makes.
+    router_opt = None
+    if router_params:
+        router_opt = torch.optim.SGD(list(router_params.values()), lr=LR_PEAK,
+                                      momentum=0.9, weight_decay=WD)
+        _rn = sum(p.numel() for p in router_params.values())
+        print(f"  Router gates: {len(router_params)} params, {_rn:,} elements, SGD+momentum")
+
     opt = SparseAdam(masters, active_idx=active_idx, lr=LR_PEAK, weight_decay=WD, compact_params=True)
     if resume_ckpt is not None and "optimizer" in resume_ckpt:
         opt.load_state_dict(resume_ckpt["optimizer"])
@@ -688,6 +730,9 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         opt.lr = lr
         
         sparse_store.zero_()
+        if router_params:
+            for p in router_params.values():
+                p.grad = None
         step_loss = 0.0
         
         for a in range(ACCUM):
@@ -704,10 +749,23 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         
         denom = loss_scale * ACCUM
         cg = {n: v / denom for n, v in sparse_store.compact.items()}
+        # Router grads were captured by autograd in the re-backward pass and
+        # are already divided by loss_scale there, so unscale by the
+        # accumulation factor only (same treatment as the root train.py).
+        for p in router_params.values() if router_params else ():
+            if p.grad is not None:
+                p.grad.data.div_(ACCUM)
         finite = all(torch.isfinite(v).all().item() for v in cg.values())
+        if router_params:
+            finite = finite and all(
+                torch.isfinite(p.grad).all().item()
+                for p in router_params.values() if p.grad is not None
+            )
         
         if finite:
             opt.step(compact_grads=cg)
+            if router_opt is not None:
+                router_opt.step()
             if USE_RESIDENT:
                 cache.sync_resident(active_idx, masters)
             good_streak += 1
