@@ -1,4 +1,4 @@
-"""USAF: Ultra Sparse Adaptive Fine-Tuning â€” Universal Training CLI.
+"""USAF: Ultra Sparse Adaptive Fine-Tuning - Universal Training CLI.
 
 Supports any MoE model from HuggingFace. Auto-detects architecture and configures training.
 
@@ -7,7 +7,7 @@ Usage:
     usaf train --model deepseek-ai/DeepSeek-MoE-16B --dataset data.jsonl --steps 360
     python -m usaf.train --help
 """
-import argparse, json, math, os, random, sys, time, gc
+import argparse, json, math, os, random, sys, time, gc, warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass
@@ -226,7 +226,7 @@ def main(args=None):
     config = parse_args(args)
     
     print("=" * 60)
-    print("USAF â€” Ultra Sparse Adaptive Fine-Tuning")
+    print("USAF — Ultra Sparse Adaptive Fine-Tuning")
     print("=" * 60)
     
     print(f"\nModel: {config.model_path}")
@@ -394,6 +394,63 @@ def _expert_module_names(moe_cfg) -> Set[str]:
     return {moe_cfg.expert_prefix.format(i=i) for i in range(moe_cfg.num_layers)}
 
 
+def _rebuild_inv_freq(rotary_mod, cfg) -> torch.Tensor:
+    """Recompute a RoPE module inv_freq buffer from the model config.
+
+    The model is materialised on the meta device, so every buffer - including
+    inv_freq - starts out without real storage. We rebuild it with the same
+    routine transformers itself uses (ROPE_INIT_FUNCTIONS), driven by the
+    config, so the rotary dimension, theta and any rope_scaling are honoured
+    instead of being guessed.
+    """
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    # rope_type lives in config.rope_parameters on transformers 5.x and in
+    # config.rope_scaling (or top-level rope_theta) on 4.x. The "default"
+    # type has no entry in ROPE_INIT_FUNCTIONS - it is computed by the rotary
+    # class itself, so we dispatch to that static method when present.
+    rp = getattr(cfg, "rope_parameters", None) or getattr(cfg, "rope_scaling", None) or {}
+    rope_type = rp.get("rope_type", rp.get("type", "default"))
+    default_fn = getattr(type(rotary_mod), "compute_default_rope_parameters", None)
+    if rope_type == "default" and callable(default_fn):
+        # transformers 5.17 deprecates the device kwarg (removed in 5.18).
+        # Inspect the signature so we neither emit a FutureWarning on 5.17
+        # nor crash with a TypeError on 5.18+.
+        import inspect as _inspect
+        _params = _inspect.signature(default_fn).parameters
+        if "device" in _params:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FutureWarning)
+                inv_freq, attn_scaling = default_fn(cfg, device=torch.device("cpu"))
+        else:
+            inv_freq, attn_scaling = default_fn(cfg)
+    else:
+        if rope_type not in ROPE_INIT_FUNCTIONS:
+            raise ValueError(f"unsupported rope_type {rope_type!r}")
+        inv_freq, attn_scaling = ROPE_INIT_FUNCTIONS[rope_type](
+            cfg, device=torch.device("cpu"), seq_len=None
+        )
+    head_dim = getattr(cfg, "head_dim", None) or (
+        cfg.hidden_size // cfg.num_attention_heads
+    )
+    # partial_rotary_factor shrinks the rotary dim below head_dim (Phi-3 etc).
+    prf = getattr(cfg, "partial_rotary_factor", 1.0) or 1.0
+    rot_dim = int(head_dim * prf)
+    # Some rope init helpers return a bare tensor rather than a
+    # (inv_freq, scaling) tuple depending on version; normalise both.
+    if isinstance(inv_freq, (tuple, list)):
+        inv_freq, attn_scaling = inv_freq[0], inv_freq[1]
+    if attn_scaling and attn_scaling != 1.0 and hasattr(rotary_mod, "attention_scaling"):
+        rotary_mod.attention_scaling = attn_scaling
+    expected = rot_dim // 2
+    if inv_freq.shape[0] != expected:
+        raise ValueError(
+            f"rebuilt RoPE inv_freq has {inv_freq.shape[0]} entries but "
+            f"rotary dim {rot_dim} (head_dim={head_dim}, "
+            f"partial_rotary_factor={prf}) requires {expected}"
+        )
+    return inv_freq
+
+
 def _layer_is_trainable(param_name: str, train_layers: Set[int]) -> bool:
     """Return True if param_name belongs to one of the trainable layers.
 
@@ -473,10 +530,16 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
         for bn, b in list(mod._buffers.items()):
             if b is not None and b.device.type == "meta":
                 if bn == "inv_freq":
-                    hd_v = getattr(mod, "dim", getattr(mod, "head_dim", 128))
-                    base = getattr(mod, "base", 1000000.0)
-                    inv = 1.0 / (base ** (torch.arange(0, hd_v, 2, dtype=torch.float32) / hd_v))
-                    mod._buffers[bn] = inv.to(dtype=torch.float16, device=device)
+                    # Rebuild RoPE exactly the way transformers does, from
+                    # the config. The previous code guessed the rotary dim
+                    # with getattr(mod, "dim", getattr(mod, "head_dim", 128)),
+                    # but rotary modules expose neither attribute, so it
+                    # always fell through to a hardcoded 128. On a model
+                    # whose real head_dim differs that produced an inv_freq
+                    # of the wrong length, and the forward died with
+                    # "The size of tensor a (8) must match tensor b (128)".
+                    mod._buffers[bn] = _rebuild_inv_freq(mod, cfg).to(
+                        device=device)
     
     print(f"  {n_loaded} non-expert params loaded")
     
