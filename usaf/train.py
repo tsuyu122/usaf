@@ -501,15 +501,39 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             mod._grad_capture = (imp_store, mname)
         
         def fwd_bwd_imp(sample):
+            """Forward+backward used only by the importance phase.
+
+            The expert weights are injected into the modules by forward
+            pre-hooks, so the sparse-gradient hooks registered on them only
+            fire if the backward pass actually walks back through the decoder
+            layers. Detaching the final hidden state (h_last) severs the graph
+            produced by the forward loop, so a plain loss.backward() would only
+            ever reach h_last itself and the experts would receive no gradient
+            at all.
+
+            We therefore keep the per-layer inputs, and after computing the
+            head loss we re-run each captured layer in reverse, threading the
+            incoming gradient through it manually. This mirrors what
+            fwd_bwd() below does during real training.
+            """
             ids = torch.tensor([sample["input_ids"]], dtype=torch.long).to(device)
             lbl = torch.tensor([sample["labels"]], dtype=torch.long).to(device)
             hidden, pos_ids, pe, mask = _prelude(ids)
+            xs_imp = []
             for i in range(N_LAYERS):
+                xs_imp.append(hidden)
                 hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
             cache.evict_all()
             h_last = hidden.detach().requires_grad_(True)
             loss = _head_loss(h_last, lbl)
             loss.backward()
+            g_imp = h_last.grad
+            for j in range(len(xs_imp) - 1, -1, -1):
+                x2 = xs_imp[j].detach().requires_grad_(True)
+                out = layers[j](x2, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+                out.backward(g_imp)
+                g_imp = x2.grad
+                cache.evict_all()
             return loss.item()
         
         print("Importance phase...")
