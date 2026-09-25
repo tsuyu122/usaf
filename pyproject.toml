@@ -1,13 +1,13 @@
 [build-system]
 requires = ["setuptools>=64.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "usaf"
 version = "1.0.0-alpha.1"
 description = "Ultra Sparse Adaptive Fine-Tuning for MoE models"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
     { name = "USAF Team" },
@@ -15,13 +15,13 @@ authors = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
     "torch>=2.4.0",
-    "transformers>=4.46.0",
+    "transformers>=4.53.0",
     "safetensors>=0.4.0",
     "numpy>=1.26.0",
     "psutil>=5.9.0",
