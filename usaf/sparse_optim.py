@@ -133,30 +133,64 @@ class SparseAdam:
                 flat = param.data.reshape(-1)
                 flat.scatter_(0, idx_dev, flat.gather(0, idx_dev) + delta)
 
-    def refresh(self, model):
-        """Re-bind current model Parameters by name (needed for streaming experts).
+    def refresh(self, model) -> None:
+        """Re-bind current model Parameters by name (streaming experts).
 
-        Expert hooks reassign ``module._parameters[name]`` each fwd/bwd cycle,
-        so stored references become stale. The sparse state (idx/m/v) is indexed
-        by name and stays valid; we only re-point to the live objects.
+        Expert hooks reassign ``module._parameters[name]`` on every
+        fwd/bwd cycle, so the references captured at construction go stale
+        after the first backward. The sparse state (idx/m/v) is keyed by name
+        and stays valid, so only the Parameter objects are re-pointed.
+
+        A tensor whose element count differs is skipped on purpose: with
+        ``compact_params=True`` the optimizer owns compact 1D masters whose
+        size deliberately differs from the streamed expert tensor.
         """
         current = dict(model.named_parameters())
         for name in self._active_ids:
-            if name not in current:
+            new = current.get(name)
+            if new is None or new.numel() != self._named[name].numel():
                 continue
-            if current[name].numel() != self._named[name].numel():
-                continue
-            self._named[name] = current[name]
+            self._named[name] = new
         self._idx_dev = {}
 
     def reselect(
         self,
         named_params: dict[str, torch.nn.Parameter],
-        new_active_mask: dict[str, torch.Tensor],
-    ):
+        new_active_idx: dict[str, torch.Tensor],
+    ) -> None:
+        """Rebind to a new active set after a RigL reselection.
+
+        Adam moments for elements that stay active are carried over, so the
+        optimizer state is not reset every reselection. The previous version
+        called _build_state(), which reallocated m and v to zero and kept the
+        old step count - every reselection therefore wiped the momentum and
+        desynchronised the bias correction from the moment tensors.
+
+        Args:
+            named_params: name -> live Parameter for each active tensor.
+            new_active_idx: name -> 1D CPU long tensor of active flat indices.
+        """
+        prev_m, prev_v, prev_idx = self._m, self._v, self._idx
         self._named = dict(named_params)
-        self._idx_dev = {}
-        self._build_state(new_active_mask)
+        self._build_state_from_idx(new_active_idx)
+
+        for name in self._active_ids:
+            old_idx, new_i = prev_idx.get(name), self._idx.get(name)
+            if old_idx is None or new_i is None:
+                continue
+            # Map each new active index back to its position in the old set so
+            # the surviving elements keep their m/v. The lookup must be sized
+            # by the larger of the two index ranges, because a newly activated
+            # element can sit beyond every previously active index.
+            span = int(max(old_idx.max().item(), new_i.max().item())) + 1
+            lookup = torch.full((span,), -1, dtype=torch.long)
+            lookup[old_idx] = torch.arange(old_idx.numel(), dtype=torch.long)
+            pos = lookup[new_i]
+            keep = pos >= 0
+            if not bool(keep.any()):
+                continue
+            self._m[name][keep] = prev_m[name][pos[keep]]
+            self._v[name][keep] = prev_v[name][pos[keep]]
 
     def state_dict(self) -> dict:
         """State for checkpoint/resume (m/v/step; idx comes from active_idx)."""
