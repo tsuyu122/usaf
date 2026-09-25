@@ -201,13 +201,34 @@ class SparseAdam:
         }
 
     def load_state_dict(self, sd: dict) -> None:
+        """Restore optimizer state from a checkpoint.
+
+        The previous version skipped any tensor whose element count did not
+        match and reported nothing, so a checkpoint whose active set no longer
+        lines up with the current one restored the step counter while leaving
+        m and v at zero - Adam then divided by a bias correction derived from
+        a step count it had no moments for. Mismatches are now reported.
+        """
         self._step = int(sd["step"])
-        for n, t in sd["m"].items():
-            if n in self._m and t.numel() == self._m[n].numel():
-                self._m[n] = t.clone().float()
-        for n, t in sd["v"].items():
-            if n in self._v and t.numel() == self._v[n].numel():
-                self._v[n] = t.clone().float()
+        skipped: list[str] = []
+        for field, store in (("m", self._m), ("v", self._v)):
+            for n, t in sd.get(field, {}).items():
+                if n not in store:
+                    skipped.append(f"{field}:{n} (not active now)")
+                    continue
+                if t.numel() != store[n].numel():
+                    skipped.append(
+                        f"{field}:{n} ({t.numel()} vs {store[n].numel()} elements)"
+                    )
+                    continue
+                store[n] = t.clone().float()
+        if skipped:
+            raise ValueError(
+                "optimizer state does not match the active set; "
+                + f"{len(skipped)} tensor(s) skipped: "
+                + ", ".join(skipped[:5])
+                + (" ..." if len(skipped) > 5 else "")
+            )
 
     @property
     def num_active_params(self) -> int:

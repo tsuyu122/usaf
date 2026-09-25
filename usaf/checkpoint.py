@@ -64,27 +64,58 @@ def export_merged_weights(
     q_dict: dict[str, Any] = torch.load(quant_path, map_location="cpu", weights_only=True)
 
     merged_fp16: dict[str, torch.Tensor] = {}
+    unsupported: list[str] = []
     for fname, entry in q_dict.items():
         if isinstance(entry, dict) and "q" in entry:
             t = dequantize_4bit(
                 entry["q"], entry["s"], entry["z"], entry["shape"],
                 group_size=entry.get("group_size", group_size),
             )
+        elif isinstance(entry, (tuple, list)) and len(entry) == 4:
+            # The loader accepts the positional (q, s, z, shape) form as
+            # well. Honouring it here too, instead of skipping, is what keeps
+            # an export from silently dropping tensors and producing a model
+            # that looks complete but is missing experts.
+            t = dequantize_4bit(
+                entry[0], entry[1], entry[2], entry[3],
+                group_size=group_size,
+            )
         elif isinstance(entry, torch.Tensor):
             t = entry.to(torch.float16)
         else:
+            unsupported.append(fname)
             continue
 
         if fname in masters and fname in active_idx:
             aidx = active_idx[fname].reshape(-1).to(torch.long)
-            trained = masters[fname].detach().to(torch.float16)
+            trained = masters[fname].detach().to(torch.float16).reshape(-1)
+            if trained.numel() != aidx.numel():
+                raise ValueError(
+                    f"{fname}: active_idx has {aidx.numel()} entries but the "
+                    f"trained master has {trained.numel()}"
+                )
             t_flat = t.reshape(-1).clone()
             t_flat.scatter_(0, aidx, trained)
             t = t_flat.reshape(t.shape)
 
         merged_fp16[fname] = t
 
+    if unsupported:
+        raise ValueError(
+            f"{len(unsupported)} quantized entr(y/ies) are in a format this "
+            f"exporter cannot read; refusing to emit an incomplete model. "
+            f"First few: {unsupported[:3]}"
+        )
+    if not merged_fp16:
+        raise ValueError(
+            f"nothing could be dequantized from {quant_path}; the export "
+            f"would have been empty"
+        )
+
     merged_q4 = quantize_state_dict(merged_fp16, group_size=group_size)
+    parent = os.path.dirname(str(output_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     torch.save(merged_q4, output_path)
     return output_path
 
