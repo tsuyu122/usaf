@@ -1,3 +1,15 @@
+"""Declarative configuration for USAF runs.
+
+Status: this dataclass is a public convenience surface (it is re-exported from
+``usaf`` and exercised by the test suite), but it is NOT what the training
+entrypoints read. ``usaf/train.py`` is driven by its own ``TrainConfig`` and
+the root ``train.py`` by module-level environment variables. The fields here
+cover the full experimental surface (data curation, early stopping, activation
+cache placement) that the shipped entrypoints do not yet expose.
+
+Use ``usaf.train.TrainConfig`` or the documented environment variables when you
+actually want to run a training; treat this as a schema for wiring one up.
+"""
 from dataclasses import dataclass
 from pathlib import Path
 
