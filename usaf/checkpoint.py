@@ -88,14 +88,21 @@ def export_merged_weights(
 
         if fname in masters and fname in active_idx:
             aidx = active_idx[fname].reshape(-1).to(torch.long)
-            trained = masters[fname].detach().to(torch.float16).reshape(-1)
+            trained = masters[fname].detach().reshape(-1)
             if trained.numel() != aidx.numel():
                 raise ValueError(
                     f"{fname}: active_idx has {aidx.numel()} entries but the "
                     f"trained master has {trained.numel()}"
                 )
+            if aidx.numel() and int(aidx.max()) >= t.numel():
+                raise ValueError(
+                    f"{fname}: active index {int(aidx.max())} is outside the "
+                    f"tensor ({t.numel()} elements)"
+                )
             t_flat = t.reshape(-1).clone()
-            t_flat.scatter_(0, aidx, trained)
+            # scatter_ requires matching dtypes; the dequantized tensor and the
+            # stored master do not necessarily share one.
+            t_flat.scatter_(0, aidx, trained.to(t_flat.dtype))
             t = t_flat.reshape(t.shape)
 
         merged_fp16[fname] = t

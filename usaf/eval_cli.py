@@ -59,17 +59,60 @@ def main():
     if ns.checkpoint and ns.model:
         print(f"Loading checkpoint: {ns.checkpoint}")
         ckpt = torch.load(ns.checkpoint, map_location="cpu", weights_only=True)
+        # The checkpoint keys are the full parameter names, so they match the
+        # model keys directly. The previous code compared with
+        # n.endswith('.' + fname), which prepends a dot to an already-fully
+        # qualified name: no key could ever match, the loop fell through, and
+        # the base model was evaluated and reported as if it were fine-tuned.
+        params = dict(model.named_parameters())
+        applied = 0
+        missing: list[str] = []
         for fname, aidx in ckpt.get("active_idx", {}).items():
-            trained = ckpt["masters"][fname]
-            for n, p in model.named_parameters():
-                if n.endswith("." + fname):
-                    p.data = p.data.reshape(-1)
-                    p.data.scatter_(0, aidx.to(torch.long), trained.to(p.dtype))
-                    p.data = p.data.reshape(
-                        ckpt.get("shapes", {}).get(fname, p.data.shape)
-                    )
-                    break
-        print(f"  Checkpoint applied (step {ckpt.get('step', '?')})")
+            trained = ckpt.get("masters", {}).get(fname)
+            if trained is None:
+                missing.append(f"{fname} (no master)")
+                continue
+            p = params.get(fname)
+            if p is None:
+                missing.append(f"{fname} (not in model)")
+                continue
+            aidx = aidx.reshape(-1).to(torch.long)
+            if aidx.numel() == 0:
+                missing.append(f"{fname} (no active elements)")
+                continue
+            # scatter_ requires self.dtype == src.dtype, and the checkpoint
+            # masters are stored in the dtype they were saved with, which is
+            # not necessarily the dtype the model was loaded in.
+            trained = trained.reshape(-1).to(p.dtype)
+            if trained.numel() != aidx.numel():
+                raise ValueError(
+                    f"{fname}: checkpoint has {aidx.numel()} active indices "
+                    f"but {trained.numel()} trained values"
+                )
+            if int(aidx.max()) >= p.numel():
+                raise ValueError(
+                    f"{fname}: active index {int(aidx.max())} is outside the "
+                    f"parameter ({p.numel()} elements) - the checkpoint does "
+                    f"not belong to this model"
+                )
+            original_shape = p.shape
+            with torch.no_grad():
+                p.data.copy_(p.data.reshape(-1).scatter(0, aidx, trained))
+            p.data = p.data.reshape(original_shape)
+            applied += 1
+        if missing:
+            raise KeyError(
+                f"{len(missing)} checkpoint tensor(s) do not match the model; "
+                f"refusing to evaluate a partially applied checkpoint. "
+                f"First few: {missing[:3]}"
+            )
+        if applied == 0:
+            raise ValueError(
+                "the checkpoint contained no active tensors that matched the "
+                "model; nothing was applied"
+            )
+        print(f"  Checkpoint applied to {applied} tensors "
+              f"(step {ckpt.get('step', '?')})")
     elif ns.checkpoint:
         print("ERROR: --model is required with --checkpoint")
         return

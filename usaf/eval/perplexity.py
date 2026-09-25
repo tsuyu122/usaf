@@ -52,7 +52,16 @@ def compute_perplexity(
                 ppl_now = math.exp(total_loss / max(total_tokens, 1))
                 print(f"  {desc}: {n_processed}/{total_samples} | current PPL {ppl_now:.2f}")
 
-    avg_loss = total_loss / max(total_tokens, 1)
+    if total_tokens == 0:
+        # Every sample either returned loss=None or was fully masked. The
+        # previous code computed 0.0/1 and reported perplexity 1.0, which is
+        # indistinguishable from a perfect model in a results file.
+        raise RuntimeError(
+            f"no tokens were scored over {total_samples} sample(s); the "
+            f"model returned no loss for any of them"
+        )
+
+    avg_loss = total_loss / total_tokens
     perplexity = math.exp(avg_loss)
     elapsed = time.time() - t0
 
