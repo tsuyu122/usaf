@@ -13,7 +13,6 @@ flow ("for d = tid; d < hd; d += 256"), which is undefined behaviour in
 GLSL/Vulkan and produced a max abs error of 1.99 against this reference.
 """
 import os
-import sys
 
 import numpy as np
 import pytest

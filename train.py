@@ -47,6 +47,7 @@ USE_AMP=os.environ.get("USE_AMP","1")=="1"                    # Automatic Mixed 
 USE_MULTI_GPU=os.environ.get("USE_MULTI_GPU","1")=="1"        # DataParallel multi-GPU
 FROZEN_CACHE_PATH=f"checkpoints/frozen_cache_12h{_TAG}_d{min(TRAIN_LAYERS)-1}.npy"
 FROZEN_CACHE=None                        # set after importance selection
+_frozen_fallback_reported=[False]       # one-shot warning when a batch misses the cache
 VK_LAYERS={}                             # layer_idx -> VKLayer
 DETACH_AT=min(TRAIN_LAYERS)-1
 assert TRAIN_LAYERS==set(range(min(TRAIN_LAYERS),max(TRAIN_LAYERS)+1)),"TRAIN_LAYERS must be contiguous"
@@ -325,7 +326,14 @@ def fwd_bwd(batch,zero_store=True):
             from usaf.frozen_cache import get_hidden
             try:
                 fh=torch.cat([get_hidden(FROZEN_CACHE,s["_fidx"],device) for s in batch],dim=0)
-            except (IndexError, ValueError):
+            except (IndexError, ValueError) as e:
+                # A batch whose samples were never cached falls back to a full
+                # forward pass. Reported once so a partially cached run is
+                # visible instead of merely being slower.
+                if not _frozen_fallback_reported:
+                    print(f"    [cache] {e}; falling back to a full forward "
+                          f"pass for uncached batches (set FROZEN_EVAL=1 to cache them)")
+                _frozen_fallback_reported[0]=True
                 fh=None
         if fh is not None:
             hidden=fh
@@ -383,18 +391,38 @@ def fwd_bwd(batch,zero_store=True):
 
 @torch.no_grad()
 def eval_ppl(slist,n=8):
-    tl=tt=0.0
+    """Token-weighted loss and perplexity over the first ``n`` samples.
+
+    A sample whose frozen-cache index is missing falls back to a full forward
+    pass, but that used to be an indistinguishable 'continue': a run with
+    FROZEN_EVAL=0 caches only training samples, so every evaluation sample
+    was skipped, and when all of them were skipped the function returned
+    (inf, inf) - a number that reads like a real result in the log and in
+    results/*.json. The fallback is now counted and printed, and returning
+    inf without having scored at least one sample is an error.
+    """
+    tl=tt=0.0; scored=0; fell_back=0
     for s in slist[:n]:
         ids=torch.tensor(s["input_ids"],dtype=torch.long).unsqueeze(0).to(device)
         lbl=torch.tensor(s["labels"],dtype=torch.long).unsqueeze(0).to(device)
+        cidx=s.get("_fidx")
+        if cidx is not None and FROZEN_CACHE is not None:
+            if cidx < 0 or cidx >= len(FROZEN_CACHE):
+                cidx=None; fell_back+=1
         try:
-            cidx=s.get("_fidx")
             loss=model_fwd(ids,lbl,cache_idx=cidx)
-            nt=(lbl!=-100).sum().item(); tl+=loss.item()*nt; tt+=nt
-        except (IndexError, RuntimeError): continue
-        except Exception:
-            pass
-    return (tl/max(tt,1),math.exp(tl/max(tt,1))) if tt>0 else (float("inf"),float("inf"))
+            nt=(lbl!=-100).sum().item(); tl+=loss.item()*nt; tt+=nt; scored+=1
+        except (IndexError, RuntimeError) as e:
+            raise RuntimeError(f"evaluation failed for a sample: {e}") from e
+    if fell_back:
+        print(f"    [eval] {fell_back} sample(s) not in the frozen cache "
+              f"(FROZEN_EVAL=0?); scored with a full forward pass instead")
+    if tt<=0:
+        raise RuntimeError(
+            f"evaluation scored 0 tokens over {min(n,len(slist))} samples; "
+            f"refusing to report an infinite perplexity as a result"
+        )
+    return tl/tt, math.exp(tl/tt)
 
 def log_jsonl(rec):
     Path("logs").mkdir(exist_ok=True)

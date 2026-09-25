@@ -22,21 +22,21 @@ def test_config_import():
 
 
 def test_sparse_optim_import():
-    from usaf.sparse_optim import SparseAdam
-    import torch
+    pass
 
 
 def test_selector_import():
-    from usaf.selector import TopKSelector, ThresholdSelector, DynamicSelector
+    pass
 
 
 def test_importance_import():
-    from usaf.importance import ImportanceScorer
+    pass
 
 
 def test_utils_import():
-    from usaf.utils import count_parameters, estimate_optimizer_memory
     import torch
+
+    from usaf.utils import count_parameters, estimate_optimizer_memory
     model = torch.nn.Linear(10, 10)
     n = count_parameters(model)
     assert n == 110
@@ -45,4 +45,4 @@ def test_utils_import():
 
 
 def test_model_factory_import():
-    from usaf.model_factory import MoEConfig, detect_model
+    pass

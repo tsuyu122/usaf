@@ -2,9 +2,10 @@
 
 import math
 import os
+from unittest.mock import MagicMock
+
 import pytest
 import torch
-from unittest.mock import MagicMock
 
 
 @pytest.fixture
@@ -24,8 +25,8 @@ def mock_tokenizer():
 
 
 def test_get_eval_texts_synthetic():
-    from usaf.eval.datasets import get_eval_texts, SYNTHETIC_TEXTS
-    import os
+
+    from usaf.eval.datasets import get_eval_texts
     texts = get_eval_texts("synthetic-cpp", max_samples=4)
     assert len(texts) == 4
     assert isinstance(texts[0], str)
@@ -62,7 +63,8 @@ def test_eval_dataset():
 def test_compute_perplexity_synthetic_model():
     """Integration test with a tiny random transformer."""
     from transformers import AutoConfig
-    from transformers.models.gpt2 import GPT2LMHeadModel, GPT2Tokenizer
+    from transformers.models.gpt2 import GPT2LMHeadModel
+
     from usaf.eval.perplexity import compute_perplexity
 
     cfg = AutoConfig.for_model("gpt2", vocab_size=256, n_embd=64, n_layer=2, n_head=4)
@@ -98,7 +100,7 @@ def test_benchmark_config_defaults():
 
 
 def test_benchmark_results():
-    from usaf.eval.benchmark import BenchmarkResults, BenchmarkConfig
+    from usaf.eval.benchmark import BenchmarkConfig, BenchmarkResults
     cfg = BenchmarkConfig(max_samples=4, verbose=False)
     results = BenchmarkResults(
         config=cfg,
@@ -111,8 +113,8 @@ def test_benchmark_results():
 
 
 def test_save_and_compare_reports(tmp_path):
-    from usaf.eval.benchmark import BenchmarkResults, BenchmarkConfig
-    from usaf.eval.report import save_report, compare_reports
+    from usaf.eval.benchmark import BenchmarkConfig, BenchmarkResults
+    from usaf.eval.report import compare_reports, save_report
 
     cfg = BenchmarkConfig(max_samples=4, verbose=False)
     before = BenchmarkResults(
@@ -139,7 +141,7 @@ def test_save_and_compare_reports(tmp_path):
 
 
 def test_compare_reports_empty_datasets():
-    from usaf.eval.benchmark import BenchmarkResults, BenchmarkConfig
+    from usaf.eval.benchmark import BenchmarkConfig, BenchmarkResults
     from usaf.eval.report import compare_reports
 
     cfg = BenchmarkConfig(max_samples=4, verbose=False)
@@ -150,7 +152,7 @@ def test_compare_reports_empty_datasets():
 
 
 def test_run_benchmark_with_mock_model():
-    from usaf.eval.benchmark import run_benchmark, BenchmarkConfig
+    from usaf.eval.benchmark import BenchmarkConfig, run_benchmark
 
     model = MagicMock()
     model.eval.return_value = None

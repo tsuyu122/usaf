@@ -1,7 +1,7 @@
 """Tests for weight selectors (TopK, Threshold, Dynamic)."""
 import torch
 
-from usaf.selector import TopKSelector, ThresholdSelector, DynamicSelector
+from usaf.selector import DynamicSelector, ThresholdSelector, TopKSelector
 
 
 def test_topk_selector_empty():
