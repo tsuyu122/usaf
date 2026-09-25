@@ -4,7 +4,7 @@
 
 Fine-tune MoE models on hardware that can barely run inference.
 
-Qwen3-30B-A3B (used in all benchmarks on this page) needs 60GB in fp16. Full fine-tuning needs 120GB+. USAF trains 26M out of 4.8B parameters on a 12GB GPU — the only method that works on AMD and the only one that trains expert weights and the router.
+Qwen3-30B-A3B (used in all benchmarks on this page) needs 60GB in fp16. Full fine-tuning needs 120GB+. USAF trains 24,159,176 out of 4,831,838,208 expert parameters (0.5%) on a 12GB GPU, plus the router — the only method here that works on AMD and that trains expert weights and the router.
 
 ---
 
@@ -16,36 +16,41 @@ Every existing fine-tuning method either won't load on this hardware or won't to
 
 ## Comparison
 
-Qwen3-30B-A3B, 180 steps. LoRA/QLoRA/DoRA numbers are estimates — no public benchmarks exist for these methods on this model at this scale. Where a method can't run, I explain why.
+Qwen3-30B-A3B, 180 steps. **Only the USAF column was measured.** Every other
+entry is a reasoned expectation, marked with `~`, not a benchmark: no
+side-by-side run of these methods on this model at this scale exists, and
+this project did not run one.
 
 |  | USAF | LoRA | QLoRA | DoRA | Full FT |
 |---|---|---|---|---|---|
-| **Runs on 12GB** | Yes | No | No | No | No |
-| **Runs on 24GB** | Yes | No | Maybe | No | No |
-| **Runs on AMD** | Yes | No | No | No | No |
-| **Min VRAM (NVIDIA)** | 12GB | ~60GB | ~24GB | ~60GB | ~120GB |
+| **Runs on 12GB** | measured | Won't load | Won't load | Won't load | Won't load |
+| **Runs on 24GB** | expected | Won't load | ~ (fits in 4-bit) | Won't load | Won't load |
+| **Runs on AMD** | measured | No | No | No | No |
+| **Min VRAM (NVIDIA)** | measured (12GB) | ~60GB | ~24GB | ~60GB | ~120GB |
 | **Trains expert weights** | Yes | No | No | No | Yes |
 | **Trains router** | Yes | No | No | No | Yes |
-| **Time (RX 6750 XT)** | 7.8h | Won't load | Won't load | Won't load | Won't load |
-| **Time (A100)** | ~20min | ~8min | ~15min | ~10min | ~40min |
-| **In-domain PPL** | 2.76 | ~2.80 | ~2.90 | ~2.78 | ~2.60 |
+| **Time (RX 6750 XT)** | measured 7.64h | Won't load | Won't load | Won't load | Won't load |
+| **Time (A100)** | not measured | not measured | not measured | not measured | not measured |
+| **In-domain PPL** | measured 2.76 | ~2.80 | ~2.90 | ~2.78 | ~2.60 |
 
 LoRA and QLoRA train adapter matrices on frozen weights. USAF trains the actual expert weights and router — it just picks which ones matter. For MoE models, the gate determines model behavior more than any single expert weight.
 
 ### Why USAF Takes Longer on Big GPUs
 
-On an A100, USAF is slower per-step because it does more work:
+USAF does more work per step than an adapter method, because it computes
+gradients for a fixed fraction of every expert tensor rather than for a pair of
+small adapters:
 
 | Operation | USAF | LoRA |
 |---|---|---|
-| Forward pass | ~3ms/layer (same) | ~3ms/layer |
-| Backward | ~30ms/layer (26M params) | ~0.5ms/layer (100K params) |
-| RigL dense pass (every 50 steps) | ~60s each | N/A |
-| Optimizer | SparseAdam (26M) | AdamW (100K) |
+| Active parameters | 24,159,176 (0.5% of experts) | ~100K (adapters only) |
+| Optimizer | SparseAdam over the active set | AdamW over the adapters |
+| RigL dense pass (every 50 steps) | 214-219s (measured, 3 passes in this run) | N/A |
 
-USAF computes gradients for 26M parameters per step vs ~100K for LoRA — **260× more gradient work**. That it's only 2-3× slower is the entire point of sparse training.
-
-On consumer hardware, the comparison is simpler: USAF runs. LoRA doesn't.
+That is roughly **240x more trainable parameters** than a typical LoRA
+configuration, which is the trade this method makes: quality for throughput.
+The per-layer timings below were never measured on an A100 and are therefore
+not quoted here.
 
 ## Results
 
@@ -53,63 +58,89 @@ On consumer hardware, the comparison is simpler: USAF runs. LoRA doesn't.
 
 | Metric | Before | After |
 |---|---|---|
-| Loss | 1.43 | 1.00 (-30%) |
+| Loss (first step) | 1.4316 | 0.9985 (final step) |
+| Loss (mean of last 10 steps) | — | 1.1654 (-18.6% vs first step) |
 | In-domain PPL | 2.83 | 2.76 |
-| Held-out PPL | 4.52 | 4.24 (-6%) |
+| Held-out PPL | 4.52 | 4.24 (-6.2%) |
 | Steps skipped (NaN) | — | 0 / 180 |
+| Wall clock | — | 7.64h (117s/step median) |
+| Peak RAM | — | 19.0GB |
 
-Held-out repositories (Flecs, SFML, EnTT, Box2D) improved alongside training data — generalization, not memorization.
+The headline loss move depends on what you average. The final step lands at
+0.9985, but single steps are noisy (the run's minimum is 0.5742 and step 2
+was *higher* than step 1), so quoting the last step alone overstates the
+improvement. Against the mean of the last 10 steps the reduction is 18.6%,
+which is the number to trust.
+
+The held-out set is a separate split drawn from repositories outside the
+training distribution, so its improvement is evidence of generalization
+rather than memorization. The per-repository breakdown is written to
+`results/qwen3_12h.json` as `heldout_repos`.
 
 ## Why Sparse Training Works for MoE
 
 **Not all weights matter.** MoE models route each token to a handful of experts. Most weights never activate for a given input. The importance phase finds the 0.5% with highest gradient magnitude.
 
-**The router is leverage.** Training the gating network (2M parameters) changes which experts fire. A single step drops loss by 0.65. Adapter methods can't touch the router.
+**The router is leverage.** Training the gating network changes which experts fire, and adapter methods cannot reach it. The router is trained alongside the sparse experts with its own SGD optimizer.
 
-**Sparsity adapts.** RigL reselection replaces underperforming weights every 50 steps. The active set evolves — turnover starts at ~92% and drops as the model converges.
+**Sparsity adapts.** RigL reselection replaces underperforming weights every 50 steps. The active set stays fixed at 0.5% of experts, but its membership churns: across the three reselections in the reference run, 1.9M, 1.4M and 4.3M of the 24.16M active elements were retained, i.e. turnover of roughly 82-94% per pass.
 
-**Resident caching kills the bottleneck.** 4-bit dequantization is slow on CPU (400ms per tensor). Trainable layers keep fp16 copies in RAM — dequant once, use forever.
+**Resident caching kills the bottleneck.** 4-bit dequantization is slow on CPU (400ms per tensor). Trainable layers keep fp16 copies in RAM, so a layer is dequantized once into resident storage and every later forward reads the fp16 copy. Residency is on by default (`USE_RESIDENT=1`); when more than 8 layers are trainable only `gate_up_proj` is kept resident, because keeping every expert tensor in fp16 would exceed RAM.
 
 ## Quick Start
 
 ```bash
-pip install transformers safetensors psutil
+# Installs torch, transformers, safetensors, psutil and the package itself.
+pip install -e .
+
+# For AMD/Windows GPUs, additionally:
+pip install -e ".[dml]"
 ```
 
 ```bash
-# AMD GPU (DirectML)
+# AMD GPU (DirectML) - the configuration the reference run used
 python train.py
 
-# NVIDIA GPU (CUDA)
+# NVIDIA GPU (CUDA) - unbenchmarked on this machine
 USE_CUDA=1 USE_AMP=1 python train.py
 
-# Multi-GPU
-USE_CUDA=1 USE_MULTI_GPU=1 MICROBATCH=4 python train.py
+# Multi-GPU (CUDA)
+USE_CUDA=1 USE_MULTI_GPU=1 python train.py
 ```
 
-No config files. Everything via environment variables.
+No config files. Everything via environment variables — see the reference
+table below for the full list and the real defaults.
 
 ## Performance
 
 | Hardware | Backend | tok/s | 180 steps |
 |---|---|---|---|
-| RX 6750 XT 12GB | DirectML | 9 | 7.8h |
-| T4 16GB | CUDA | ~30 | ~2h |
-| 2× T4 16GB | CUDA | ~50 | ~1.2h |
-| RTX 4090 24GB | CUDA | ~80 | ~45min |
+| RX 6750 XT 12GB | DirectML | 8.5 | 7.64h |
+| NVIDIA (any) | CUDA | not measured | not measured |
 
-*CUDA numbers are estimates pending real hardware benchmarks.*
+The RX 6750 XT row is the reference run, logged in `logs/qwen3_12h_final.jsonl`.
+No CUDA run has been performed on this machine, so no CUDA throughput is
+quoted — the code path exists but is unbenchmarked. The 117s/step median is
+dominated by the 6 RigL reselections (1140-1220s each, ~1h of the 7.64h total);
+ordinary steps run at 107-122s.
 
 ## Supported Models
 
-Auto-detection works for any MoE model from HuggingFace — `config.json` is all it needs. Tested on Qwen3-30B-A3B.
+The expert layout is detected automatically. From transformers 4.53 onward every
+supported family exposes the same fused expert container, so the naming
+convention is no longer hardcoded:
 
-| Model Family | Tested |
+| Model Family | Status |
 |---|---|
-| Qwen3-MoE | Yes (30B-A3B) |
-| Mixtral | No |
-| DeepSeek-MoE | No |
-| OLMoE | No |
+| Qwen3-MoE | Full run on Qwen3-30B-A3B (RX 6750 XT) |
+| Mixtral | Verified end-to-end on a small synthetic Mixtral |
+| OLMoE | Verified by the test suite on a synthetic 16-layer OLMoE |
+| DeepSeek-MoE | Same fused layout; not run on real weights |
+
+"Verified end-to-end" means the full pipeline — importance selection, sparse
+gradients, optimizer step, router update — runs and selects a nonzero active
+set. It does not mean the reference numbers below were reproduced on that
+family; only Qwen3-30B-A3B was run at real scale.
 
 ## Models I Want to Test
 
@@ -117,11 +148,15 @@ These are the models USAF was designed for. I just don't have the GPUs.
 
 | Model | Parameters | Active | Verified | Why |
 |---|---|---|---|---|
-| **DeepSeek-V4 Pro** | 1.6T | 49B | Yes | Latest DeepSeek, MIT license, Apr 2026 |
-| **Kimi K2.5** (Moonshot) | 1T | 32B | Yes | Native multimodal (vision+text), Feb 2026 |
-| **Mistral Large 3** | 675B | 41B | Yes | Apache 2.0, Dec 2025 |
-| **Qwen3-235B-A22B** | 235B | 22B | Yes | Same architecture as tested, 8× larger |
-| **Mixtral-8x22B** | 141B | 39B | Yes | Non-fused expert projections |
+| **DeepSeek-V4 Pro** | 1.6T | 49B | No | Latest DeepSeek |
+| **Kimi K2.5** (Moonshot) | 1T | 32B | No | Native multimodal (vision+text) |
+| **Mistral Large 3** | 675B | 41B | No | Apache 2.0 |
+| **Qwen3-235B-A22B** | 235B | 22B | No | Same architecture as tested, 8x larger |
+| **Mixtral-8x22B** | 141B | 39B | No | Larger Mixtral |
+
+**None of these have been run.** They are targets, not results. None has been
+trained, benchmarked, or even downloaded, and the "Verified" column is
+uniformly No by design so this table cannot be misread as a benchmark.
 
 Hardware needed: 4-8× A100 80GB or equivalent per model. If you have access and want to see USAF results on these, reach out via [GitHub Discussions](https://github.com/tsuyu122/usaf/discussions). I'll write the training code — you bring the GPUs.
 
@@ -141,10 +176,11 @@ python -m usaf.train --model mistralai/Mixtral-8x7B --dataset data.jsonl
 | Router co-training | Production |
 | 4-bit quantized weights | Production |
 | Resident expert caching | Production |
-| CUDA + AMP | Production |
-| Multi-GPU (DataParallel) | Production |
-| DirectML (AMD) | Production |
-| Vulkan acceleration | Broken |
+| CUDA | Code complete, unbenchmarked (no NVIDIA hardware on the reference machine) |
+| Multi-GPU (DataParallel) | Code complete, unbenchmarked |
+| DirectML (AMD) | Production - the configuration behind every number on this page |
+| fp16 + manual loss scaling | Production (used on both the DirectML and CUDA paths) |
+| Vulkan kernels (dequant, GEMM, RMSNorm, RoPE, attention) | Built and numerically tested |
 | Held-out evaluation | Production |
 
 ## Hardware
@@ -181,7 +217,14 @@ for i in range(0, len(tokens) - 512, 512):
 
 ### Step 2: Quantize the expert weights
 
-USAF needs the expert weights in 4-bit HQQ format. Currently supports Qwen3-MoE out of the box. For other models, you need to generate the `experts_q4.pt` file:
+USAF needs the expert weights in its own 4-bit format: asymmetric per-group
+min/max quantization with the scales and zero-points stored in fp16, and the
+4-bit values packed two-per-byte. This is implemented in
+`usaf/quantization.py` and is not HQQ or any other off-the-shelf scheme, so
+the packing cannot be consumed by another library. Reconstruction error on
+random fp16 tensors is ~1% relative MSE at a 3.9x compression ratio.
+
+You need to generate the `experts_q4.pt` file for your model:
 
 ```python
 from usaf.quantization import quantize_4bit
@@ -191,7 +234,8 @@ import torch
 q_dict = {}
 for layer_idx in range(num_layers):
     for param_name in ["gate_up_proj", "down_proj"]:
-        # Load the fused expert tensor [num_experts, intermediate, hidden]
+        # gate_up_proj is fused as [num_experts, 2*intermediate, hidden]
+        # down_proj  is [num_experts, hidden, intermediate]
         weights = load_expert_weights(model_path, layer_idx, param_name)
         q4_entry = quantize_4bit(weights, group_size=128)
         q_dict[f"model.layers.{layer_idx}.mlp.experts.{param_name}"] = q4_entry
@@ -202,12 +246,15 @@ torch.save(q_dict, "my-model-q4/experts_q4.pt")
 ### Step 3: Configure and run
 
 ```bash
-# Set these environment variables for your model
-QUANT_PATH="my-model-q4/experts_q4.pt"   # Path to quantized weights
-TRAIN_FROM=36                            # First trainable layer (keep top layers)
-STEPS=360                                # 2 epochs for ~190K tokens
-FRAC=0.005                               # 0.5% sparsity
-MICROBATCH=2                             # Batch size (increase if VRAM allows)
+# 'export' is required: without it these are shell-local variables and
+# train.py will not see them.
+export QUANT_PATH="checkpoints/my-model-q4"   # directory holding experts_q4.pt
+export DATASET_PATH="data/train_dataset_12h.jsonl"
+export HELDOUT_PATH="data/eval_heldout_12h.jsonl"
+export TRAIN_FROM=36                 # first trainable layer (top layers train)
+export STEPS=360                     # 2 epochs for ~190K tokens
+export FRAC=0.005                    # 0.5% of expert weights active
+export MICROBATCH=2                  # sequences per micro-batch
 
 python train.py
 ```
@@ -216,18 +263,27 @@ python train.py
 
 | Variable | Default | Description |
 |---|---|---|
+| `SRC_MODEL` | `Qwen3-30B-A3B` | Base model directory or HF id |
+| `QUANT_PATH` | `checkpoints/<SRC>_q4` | **Directory** containing `experts_q4.pt` |
 | `DATASET_PATH` | `data/train_dataset_12h.jsonl` | JSONL file with training samples |
-| `QUANT_PATH` | auto-detected | Path to `experts_q4.pt` |
-| `TRAIN_FROM` | 40 | First trainable layer (0-39 are frozen) |
-| `FRAC` | 0.005 | Fraction of weights to train (0.5%) |
+| `HELDOUT_PATH` | `data/eval_heldout_12h.jsonl` | JSONL file with held-out samples |
+| `TRAIN_FROM` | 40 | First trainable layer (0-39 are frozen). Clamped to the model's real depth. |
+| `FRAC` | 0.005 | Fraction of expert weights active (0.5%) |
 | `STEPS` | 180 | Training steps |
-| `MICROBATCH` | 2 | Sequences per micro-batch |
+| `EPOCHS` | 0 | If > 0, recompute `STEPS` from the dataset size |
+| `MICROBATCH` | 4 | Sequences per micro-batch |
+| `ACCUM` | 1 | Gradient accumulation; effective batch = `MICROBATCH` x `ACCUM` |
 | `LR_PEAK` | 2e-4 | Peak learning rate (cosine decay) |
-| `RESELECT_EVERY` | 50 | RigL reselection frequency |
+| `RESELECT_EVERY` | 50 | RigL reselection frequency (in steps) |
+| `RESELECT_DROP` | 0.1 | Fraction of active elements eligible to be swapped |
+| `EVAL_EVERY` | 15 | Evaluate every N steps |
+| `SKIP_FINAL_EVAL` | 0 | Set to 1 to skip the final eval; results are then written as `null`, never as a number |
 | `USE_CUDA` | 0 | Set to `1` for NVIDIA GPUs |
-| `USE_AMP` | 1 | Mixed precision (CUDA only) |
+| `USE_AMP` | 1 | cuDNN benchmark + TF32 (CUDA only) |
 | `USE_MULTI_GPU` | 1 | DataParallel (CUDA only) |
-| `FROZEN_CACHE_N` | 0 | Number of samples to cache (0=all) |
+| `USE_VK` | 0 | Vulkan attention path |
+| `USE_VK_DEQUANT` | 0 | Vulkan GPU dequant (off by default: slower than CPU here) |
+| `FROZEN_CACHE_N` | 0 | Number of samples to cache (0 = all) |
 
 ### Supported GPU Configurations
 
@@ -235,7 +291,7 @@ python train.py
 |---|---|
 | AMD GPU (RX 6000/7000) | `python train.py` |
 | NVIDIA single GPU | `USE_CUDA=1 python train.py` |
-| NVIDIA dual GPU | `USE_CUDA=1 USE_MULTI_GPU=1 MICROBATCH=4 python train.py` |
+| NVIDIA dual GPU | `USE_CUDA=1 USE_MULTI_GPU=1 python train.py` |
 | CPU fallback | `python train.py` (automatic) |
 
 ### Troubleshooting
