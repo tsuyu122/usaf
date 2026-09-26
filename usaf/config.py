@@ -1,6 +1,17 @@
+"""Declarative configuration for USAF runs.
+
+Status: this dataclass is a public convenience surface (it is re-exported from
+``usaf`` and exercised by the test suite), but it is NOT what the training
+entrypoints read. ``usaf/train.py`` is driven by its own ``TrainConfig`` and
+the root ``train.py`` by module-level environment variables. The fields here
+cover the full experimental surface (data curation, early stopping, activation
+cache placement) that the shipped entrypoints do not yet expose.
+
+Use ``usaf.train.TrainConfig`` or the documented environment variables when you
+actually want to run a training; treat this as a schema for wiring one up.
+"""
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
 
 
 @dataclass
@@ -17,7 +28,7 @@ class USAFConfig:
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
 
-    cpp_extensions: Tuple[str, ...] = (".h", ".hpp", ".cpp", ".c", ".cc", ".cxx", ".hxx")
+    cpp_extensions: tuple[str, ...] = (".h", ".hpp", ".cpp", ".c", ".cc", ".cxx", ".hxx")
     max_file_size_mb: int = 1
     deduplicate_lines: bool = True
     train_split: float = 0.95
@@ -26,13 +37,13 @@ class USAFConfig:
     shuffle_repos: bool = True
 
     initial_active_k: int = 400_000
-    active_percentile: Optional[float] = None
+    active_percentile: float | None = None
     reselect_every_n_steps: int = 500
     initial_selection_epochs: int = 1
 
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
-    betas: Tuple[float, float] = (0.9, 0.999)
+    betas: tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
 
     batch_size: int = 1
@@ -51,7 +62,7 @@ class USAFConfig:
     save_every_n_steps: int = 500
     seed: int = 42
 
-    def resolve_paths(self, base_dir: Optional[Path] = None) -> "USAFConfig":
+    def resolve_paths(self, base_dir: Path | None = None) -> "USAFConfig":
         if base_dir is None:
             base_dir = Path.cwd()
         base = Path(base_dir)

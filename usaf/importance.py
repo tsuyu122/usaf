@@ -1,11 +1,11 @@
+
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM
-from typing import Dict, Tuple, Optional
 
 
 class ImportanceScorer:
-    DEFAULT_SKIP: Tuple[str, ...] = ("embed_tokens", "lm_head")
+    DEFAULT_SKIP: tuple[str, ...] = ("embed_tokens", "lm_head")
 
     def __init__(
         self,
@@ -13,21 +13,24 @@ class ImportanceScorer:
         device: torch.device,
         dtype: torch.dtype,
         context_length: int = 2048,
-        skip_patterns: Optional[Tuple[str, ...]] = None,
+        skip_patterns: tuple[str, ...] | None = None,
     ):
         self.model = model
         self.device = device
         self.dtype = dtype
         self.context_length = context_length
         self.skip_patterns = skip_patterns or self.DEFAULT_SKIP
+        # Parameters that received no gradient in the last compute_scores()
+        # call, and were therefore left out of the returned scores.
+        self.unobserved: list[str] = []
 
     def compute_scores(
         self,
         dataloader: DataLoader,
         max_batches: int = 0,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         self.model.eval()
-        grad_accum: Dict[str, torch.Tensor] = {}
+        grad_accum: dict[str, torch.Tensor] = {}
 
         param_name_map = {}
         for name, param in self.model.named_parameters():
@@ -101,19 +104,34 @@ class ImportanceScorer:
         for name, param in param_name_map.items():
             param.requires_grad = False
 
-        scores: Dict[str, torch.Tensor] = {}
-        for name, param in self.model.named_parameters():
-            if name in grad_accum:
-                scores[name] = grad_accum[name]
-            else:
-                scores[name] = torch.zeros(param.shape, dtype=torch.float32, device="cpu")
+        # A parameter that never received a gradient has no evidence of
+        # importance, which is not the same as evidence of no importance.
+        # The previous code filled those with zeros, and the selectors rank on
+        # 'score >= threshold', so a zero-filled tensor is indistinguishable
+        # from a genuinely unimportant one and gets selected whenever the
+        # threshold lands at or below zero. Unobserved parameters are now
+        # omitted from the returned scores and listed on self.unobserved.
+        scores: dict[str, torch.Tensor] = dict(grad_accum)
+        self.unobserved: list[str] = [
+            name for name in param_name_map if name not in grad_accum
+        ]
+        if self.unobserved:
+            print(f"  importance: {len(self.unobserved)} of "
+                  f"{len(param_name_map)} parameters received no gradient and "
+                  f"are excluded from the score ranking", flush=True)
+        if not scores:
+            raise RuntimeError(
+                "no parameter accumulated a gradient; the importance pass "
+                "scored nothing (every batch OOMed or the model has no "
+                "trainable parameters)"
+            )
 
         return scores
 
-    def save_scores(self, scores: Dict[str, torch.Tensor], path: str) -> None:
+    def save_scores(self, scores: dict[str, torch.Tensor], path: str) -> None:
         scores_fp16 = {k: v.half() for k, v in scores.items()}
         torch.save(scores_fp16, path)
 
     @staticmethod
-    def load_scores(path: str) -> Dict[str, torch.Tensor]:
+    def load_scores(path: str) -> dict[str, torch.Tensor]:
         return torch.load(path, map_location="cpu", weights_only=True)

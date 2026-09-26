@@ -1,8 +1,7 @@
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
 
-SYNTHETIC_TEXTS: List[str] = [
+SYNTHETIC_TEXTS: list[str] = [
     "int main() { int x = 0; return x; }",
     "void foo(int a, int b) { return a + b; }",
     "template<typename T> T max(T a, T b) { return a > b ? a : b; }",
@@ -27,14 +26,14 @@ MAX_SNIPPET_CHARS = 4096
 
 def get_eval_texts(
     dataset: str = "synthetic-cpp",
-    path: Optional[str] = None,
+    path: str | None = None,
     max_samples: int = 64,
-) -> List[str]:
+) -> list[str]:
     if dataset == "synthetic-cpp":
         return SYNTHETIC_TEXTS[:max_samples]
     if dataset in ("jsonl", "text") and path and Path(path).exists():
-        texts: List[str] = []
-        with open(path, "r", encoding="utf-8") as f:
+        texts: list[str] = []
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 if len(texts) >= max_samples:
                     break

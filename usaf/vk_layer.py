@@ -6,8 +6,11 @@ Two modes:
                    Returns post-norm hidden. DML handles only MLP.
 """
 from __future__ import annotations
+
+import os
+import sys
+
 import numpy as np
-import os, sys
 
 HAS_VK = False
 try:
@@ -21,7 +24,6 @@ try:
     usaf_vk.init()
     HAS_VK = True
 except Exception as e:
-    import traceback
     print(f"  [VK] import failed: {e}", flush=True)
 
 
@@ -108,7 +110,7 @@ class VKLayer:
 
     def forward_full(self, hidden_np: np.ndarray, cos_np: np.ndarray, sin_np: np.ndarray):
         """Full VK attention block. Returns (post_attn_hidden, post_norm_hidden) [B,S,H] fp16.
-        
+
         post_attn_hidden: hidden + attention output (for MLP residual)
         post_norm_hidden: post_attention_layernorm(post_attn_hidden) (for MLP input)
         """
@@ -120,18 +122,18 @@ class VKLayer:
         n_rep = nH // nKV
         self._alloc_temp(B, S)
         scale = 1.0 / np.sqrt(float(hd))
-        
+
         def alloc(shape):
             return usaf_vk.create_buf(int(np.prod(shape)) * 2, True)
 
         # Upload hidden input (one-time per layer)
         hx = alloc((B * S, H))
         usaf_vk.upload(hx, hidden_np.reshape(B * S, H).astype(np.float16))
-        
+
         # ── 1. Input RMSNorm ──
         hrms = alloc((B * S, H))
         usaf_vk.rmsnorm_pipe(hx, self.bufs["input_layernorm.weight"], hrms, B * S, H, 1e-6)
-        
+
         # ── 2. Q/K/V projections ──
         hq = alloc((B * S, nH * hd))
         hk = alloc((B * S, nKV * hd))
@@ -151,31 +153,31 @@ class VKLayer:
             hq_rope_in = hq_normed; hk_rope_in = hk_normed
         else:
             hq_rope_in = hq; hk_rope_in = hk
-        
+
         hcos = alloc(cos_np.shape); hsin = alloc(sin_np.shape)
         usaf_vk.upload(hcos, cos_np.astype(np.float16)); usaf_vk.upload(hsin, sin_np.astype(np.float16))
         hq_rope = alloc((B * S, nH * hd))
         hk_rope = alloc((B * S, nKV * hd))
         usaf_vk.rope_pipe(hq_rope_in, hk_rope_in, hcos, hsin, hq_rope, hk_rope, B, nH, nKV, S, hd)
-        
+
         # Attention: Q@K^T via VK GEMM, softmax+V-proj via vectorized numpy.
         # VK attn_softmax kernel has context corruption bug — works in isolation
         # but produces wrong results after multiple dispatches. CPU path used for correctness.
         hq_np = usaf_vk.download(hq_rope, [B * S, nH * hd]).view(np.float16)
         hk_np = usaf_vk.download(hk_rope, [B * S, nKV * hd]).view(np.float16)
         hv_np = usaf_vk.download(hv_buf, [B * S, nKV * hd]).view(np.float16)
-        
+
         q_heads = hq_np.reshape(B, S, nH, hd).transpose(0, 2, 1, 3).reshape(nH, S, hd)
         k_heads = hk_np.reshape(B, S, nKV, hd).transpose(0, 2, 1, 3).reshape(nKV, S, hd)
         v_heads = hv_np.reshape(B, S, nKV, hd).transpose(0, 2, 1, 3).reshape(nKV, S, hd)
-        
+
         # ── 4. Q@K^T per KV head via VK GEMM ──
         all_scores = []
         for kv_h in range(nKV):
             q_slice = q_heads[kv_h * n_rep:(kv_h + 1) * n_rep].reshape(n_rep * S, hd).astype(np.float16)
             k_slice = k_heads[kv_h].astype(np.float16)
             kT = np.ascontiguousarray(k_slice.T)
-            
+
             h_qs = alloc(q_slice.shape); h_ks = alloc(kT.shape)
             h_scr = alloc((n_rep * S, S))
             usaf_vk.upload(h_qs, q_slice); usaf_vk.upload(h_ks, kT)
@@ -184,9 +186,9 @@ class VKLayer:
             scores_kv = (scores_kv.astype(np.float32) * scale).astype(np.float16)
             all_scores.append(scores_kv.reshape(n_rep, S, S))
             usaf_vk.destroy_buf(h_qs); usaf_vk.destroy_buf(h_ks); usaf_vk.destroy_buf(h_scr)
-        
+
         scores_np = np.concatenate(all_scores, axis=0)  # [nH, S, S]
-        
+
         # CPU softmax (correct, 16MB, <1ms with numpy) + VK gemm for @V
         s_soft = np.zeros((nH, S, S), dtype=np.float16)
         for kv_h in range(nKV):
@@ -199,7 +201,7 @@ class VKLayer:
             s_exp = np.exp(s_masked - s_max)
             s_sum = s_exp.sum(axis=-1, keepdims=True)
             s_soft[q_start:q_end] = (s_exp / np.maximum(s_sum, 1e-10)).astype(np.float16)
-        
+
         # VK gemm: softmax_scores @ V for @V computation
         # softmax: [nH, S, S], V: [nKV, S, hd]
         # For each KV head: attn[q_start:q_end] = softmax[q_start:q_end] @ V[kv_h]
@@ -209,7 +211,7 @@ class VKLayer:
             q_start, q_end = kv_h * n_rep, (kv_h + 1) * n_rep
             sm_block = s_soft[q_start:q_end].reshape(n_rep * S, S).astype(np.float16)  # [4096, 512]
             v_block = v_heads[kv_h].astype(np.float16)  # [512, 128]
-            
+
             h_sm = alloc(sm_block.shape); h_vb = alloc(v_block.shape)
             h_out = alloc((n_rep * S, hd))
             usaf_vk.upload(h_sm, sm_block); usaf_vk.upload(h_vb, v_block)
@@ -217,26 +219,26 @@ class VKLayer:
             attn_block = usaf_vk.download(h_out, [n_rep * S, hd]).view(np.float16)
             attn_np[q_start:q_end] = attn_block.reshape(n_rep, S, hd)
             usaf_vk.destroy_buf(h_sm); usaf_vk.destroy_buf(h_vb); usaf_vk.destroy_buf(h_out)
-        
+
         attn_flat = attn_np.transpose(1, 0, 2).reshape(B * S, nH * hd)
-        
+
         h_attn_flat = alloc((B * S, nH * hd))
         usaf_vk.upload(h_attn_flat, attn_flat.astype(np.float16))
         ho = alloc((B * S, H))
         usaf_vk.gemm_pipe(h_attn_flat, self.bufs["self_attn.o_proj.weight"], ho, B * S, nH * hd, H)
-        
+
         # ── 7. Residual: hidden + O-proj output via VK ──
         h_residual = alloc((B * S, H))
         usaf_vk.residual_add_pipe(hx, ho, h_residual, B * S * H)
-        
+
         # Download post-attention hidden (needed for MLP residual in training loop)
         post_attn = usaf_vk.download(h_residual, [B * S, H]).view(np.float16).reshape(B, S, H)
-        
+
         # ── 8. Post-attention norm via VK RMSNorm ──
         h_post_norm = alloc((B * S, H))
         usaf_vk.rmsnorm_pipe(h_residual, self.bufs["post_attention_layernorm.weight"], h_post_norm, B * S, H, 1e-6)
         post_norm = usaf_vk.download(h_post_norm, [B * S, H]).view(np.float16).reshape(B, S, H)
-        
+
         # Cleanup
         all_bufs = [hx, hrms, hq, hk, hv_buf, hcos, hsin, hq_rope, hk_rope, h_attn_flat, ho, h_residual, h_post_norm]
         if "self_attn.q_norm.weight" in self.bufs:
@@ -251,18 +253,20 @@ class VKLayer:
         if cos_np is not None and sin_np is not None:
             return self.forward_full(hidden_np, cos_np, sin_np)
         return self.forward_qkv(hidden_np)
-    
+
     def forward_hybrid(self, hidden_np: np.ndarray):
         """Monkey-patch: VK QKV + native DML attention. Loss verified at 1.80."""
         return self.forward_qkv(hidden_np)
 
     def cleanup(self):
+        # except Exception (not a bare except) so cleanup still honours
+        # KeyboardInterrupt / SystemExit instead of swallowing them.
         for h in self.bufs.values():
             try: usaf_vk.destroy_buf(h)
-            except: pass
+            except Exception: pass
         for h in self._temp_bufs:
             try: usaf_vk.destroy_buf(h)
-            except: pass
+            except Exception: pass
         self.bufs.clear()
         self._temp_bufs.clear()
         self._uploaded = False
@@ -279,7 +283,6 @@ def create_vk_layers(train_layers, model_config, weights_by_layer, rotary_emb) -
     if not HAS_VK:
         return layers
     for li in train_layers:
-        prefix = f"model.layers.{li}."
         w = weights_by_layer.get(li)
         if w is None:
             continue

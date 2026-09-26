@@ -5,8 +5,12 @@ Training resumes from layer DETACH_AT+1. Decoupled from the model: build receive
 a callback ``compute_hidden(sample) -> [SEQ, H]``.
 """
 from __future__ import annotations
-import hashlib, json, os
-from typing import Callable, Optional
+
+import hashlib
+import json
+import os
+from collections.abc import Callable
+
 import numpy as np
 import torch
 
@@ -23,7 +27,7 @@ def dataset_fingerprint(samples, detach_at: int, src: str) -> str:
 
 
 def load_frozen_cache(samples, seq: int, hidden: int, detach_at: int,
-                      src: str, path: str) -> Optional[np.ndarray]:
+                      src: str, path: str) -> np.ndarray | None:
     """Return read-only memmap if fingerprint matches, else None."""
     meta_path = path + ".json"
     if not (os.path.exists(path) and os.path.exists(meta_path)):
@@ -68,7 +72,23 @@ def build_frozen_cache(samples, seq: int, hidden: int, detach_at: int, src: str,
 
 
 def get_hidden(cache: np.ndarray, idx: int, device, dtype=torch.float16) -> torch.Tensor:
-    """Return hidden@DETACH_AT as [1, SEQ, H] on the target device."""
+    """Return hidden@DETACH_AT as [1, SEQ, H] on the target device.
+
+    Raises IndexError when ``idx`` is outside the cache. Callers relied on that
+    to fall back to a full forward pass, but the fallback was silent: a sample
+    whose index was not in the cache simply stopped being evaluated, and an
+    evaluation over no samples at all returned inf rather than failing.
+    """
+    n = len(cache)
+    if not isinstance(idx, (int,)) or isinstance(idx, bool):
+        idx = int(idx)
+    if idx < 0:
+        idx += n
+    if idx < 0 or idx >= n:
+        raise IndexError(
+            f"frozen cache index {idx} is out of range for a cache holding "
+            f"{n} samples; this sample was never cached"
+        )
     arr = np.array(cache[idx], copy=True)
     t = torch.from_numpy(np.ascontiguousarray(arr)).to(device=device, dtype=dtype)
     return t.unsqueeze(0)

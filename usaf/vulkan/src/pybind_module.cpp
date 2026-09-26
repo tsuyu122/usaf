@@ -103,7 +103,17 @@ static void upload_to_buf(int h, py::array data) {
 static py::array_t<uint16_t> download_from_buf(int h, const std::vector<py::ssize_t>& shape) {
     auto& buf = get_buf(h);
     auto result = py::array_t<uint16_t>(shape);
-    download_buffer(ctx(), buf, result.request().ptr, buf.size);
+    // Download exactly as many bytes as the destination array can hold.
+    // Passing buf.size here overran the allocation whenever a shared output
+    // buffer (sized for the largest parameter) was downloaded with a smaller
+    // per-parameter shape - a heap buffer overflow.
+    const size_t dst_nbytes = static_cast<size_t>(result.request().size) * sizeof(uint16_t);
+    if (dst_nbytes > buf.size) {
+        throw std::runtime_error("Download shape exceeds buffer size: need " +
+                                 std::to_string(dst_nbytes) + " bytes, buffer has " +
+                                 std::to_string(buf.size));
+    }
+    download_buffer(ctx(), buf, result.request().ptr, dst_nbytes);
     return result;
 }
 
@@ -211,9 +221,12 @@ static void attn_softmax_pipelined(int scores_h, int v_h, int out_h,
     };
     struct { uint32_t nH, nKV, S, hd, causal; } pc = {(uint32_t)nH, (uint32_t)nKV, (uint32_t)S, (uint32_t)hd, (uint32_t)causal};
 
-    auto* cp = get_or_create_pipeline("attn_softmax", bnd, sizeof(pc));
+    auto* cp = get_or_create_pipeline("attention", bnd, sizeof(pc));
     if (!cp->pipeline.pipeline) {
-        auto shader = load_shader(ctx(), g_spirv_dir.empty() ? "spirv/attn_softmax.spv" : (g_spirv_dir + "/attn_softmax.spv").c_str(), "main");
+        // The kernel source is attention.comp, so the compiled artefact is
+        // attention.spv. The previous "attn_softmax.spv" name matched no
+        // build output and made this path fail at pipeline creation.
+        auto shader = load_shader(ctx(), g_spirv_dir.empty() ? "spirv/attention.spv" : (g_spirv_dir + "/attention.spv").c_str(), "main");
         std::vector<vk::PushConstantRange> push = {{vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc)}};
         cp->pipeline = create_compute_pipeline(ctx(), shader, bnd, push);
     }
@@ -227,7 +240,10 @@ static void attn_softmax_pipelined(int scores_h, int v_h, int out_h,
             .setDescriptorType(vk::DescriptorType::eStorageBuffer).setBufferInfo(dbis[i]);
     update_descriptor_set(ctx(), cp->pipeline, writes);
 
-    dispatch(ctx(), cp->pipeline, nH, 1, 1, &pc, sizeof(pc));
+    // attention.comp assigns one workgroup per output row and the row index
+    // spans nH*S, so the grid must be nH*S wide. Dispatching only nH launched
+    // 1/S of the rows and left the rest of the output buffer uninitialised.
+    dispatch(ctx(), cp->pipeline, (uint32_t)nH * (uint32_t)S, 1, 1, &pc, sizeof(pc));
 }
 
 static void residual_add_pipelined(int a_h, int b_h, int out_h, int N) {

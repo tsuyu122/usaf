@@ -14,7 +14,8 @@ proc=psutil.Process(os.getpid())
 def ram(): return proc.memory_info().rss/1024**3
 
 # ── 12h Config ──
-SRC="Qwen3-30B-A3B"; Q4="Qwen3-30B-A3B-q4"
+SRC=os.environ.get("SRC_MODEL","Qwen3-30B-A3B")
+Q4=os.environ.get("QUANT_PATH",f"checkpoints/{SRC}_q4")
 SEQ=512
 FRAC=float(os.environ.get("FRAC","5e-3"))         # fraction of active elements per tensor
 STEPS=int(os.environ.get("STEPS","180"))
@@ -35,7 +36,8 @@ _TAG="_smoke" if _SMOKE_N else os.environ.get("RUN_TAG","")
 CKPT_PATH=f"checkpoints/qwen3_12h_ckpt{_TAG}.pt"
 CKPT_EVERY_SEC=900
 LOG_PATH=f"logs/qwen3_12h{_TAG}.jsonl"
-DATASET_PATH="data/train_dataset_12h.jsonl"
+DATASET_PATH=os.environ.get("DATASET_PATH","data/train_dataset_12h.jsonl")
+HELDOUT_PATH=os.environ.get("HELDOUT_PATH","data/eval_heldout_12h.jsonl")
 USE_FROZEN_CACHE=os.environ.get("USE_FROZEN_CACHE","1")=="1"
 FROZEN_CACHE_N=int(os.environ.get("FROZEN_CACHE_N","0"))  # 0=all, N=cache first N samples
 USE_VK=os.environ.get("USE_VK","0")=="1"                      # Vulkan attention forward
@@ -45,6 +47,7 @@ USE_AMP=os.environ.get("USE_AMP","1")=="1"                    # Automatic Mixed 
 USE_MULTI_GPU=os.environ.get("USE_MULTI_GPU","1")=="1"        # DataParallel multi-GPU
 FROZEN_CACHE_PATH=f"checkpoints/frozen_cache_12h{_TAG}_d{min(TRAIN_LAYERS)-1}.npy"
 FROZEN_CACHE=None                        # set after importance selection
+_frozen_fallback_reported=[False]       # one-shot warning when a batch misses the cache
 VK_LAYERS={}                             # layer_idx -> VKLayer
 DETACH_AT=min(TRAIN_LAYERS)-1
 assert TRAIN_LAYERS==set(range(min(TRAIN_LAYERS),max(TRAIN_LAYERS)+1)),"TRAIN_LAYERS must be contiguous"
@@ -72,7 +75,7 @@ _sidx=0
 for _i,_s in enumerate(train_samples): _s["_fidx"]=_sidx; _sidx+=1
 for _i,_s in enumerate(eval_samples): _s["_fidx"]=_sidx; _sidx+=1
 # held-out eval: repositories outside training (flecs/sfml/entt/box2d)
-heldout_samples=load_jsonl("data/eval_heldout_12h.jsonl")
+heldout_samples=load_jsonl(HELDOUT_PATH)
 random.shuffle(heldout_samples)
 if _SMOKE_N: heldout_samples=heldout_samples[:2]
 for _i,_s in enumerate(heldout_samples): _s["_fidx"]=_sidx; _sidx+=1
@@ -106,11 +109,17 @@ if USE_CUDA:
         p = torch.cuda.get_device_properties(i)
         print(f"    GPU {i}: {p.name} ({p.total_memory/1e9:.1f}GB)")
     if USE_AMP:
-        _amp_scaler = torch.cuda.amp.GradScaler()
+        # No torch.cuda.amp.GradScaler: the sparse gradients are captured into a
+        # custom store via module hooks, not into param.grad, so
+        # GradScaler.unscale_/step/update would never run and its 65536 scale
+        # factor would leak into the captured gradients. The loop scales the
+        # loss by loss_scale before backward and divides by loss_scale*ACCUM in
+        # the step, which is exactly what the working DirectML path does.
+        _amp_scaler = None
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        print(f"  AMP + cuDNN benchmark + TF32 enabled")
+        print(f"  AMP (manual loss scaling) + cuDNN benchmark + TF32 enabled")
     else:
         _amp_scaler = None
 else:
@@ -233,6 +242,15 @@ print(f"  RAM: {ram():.1f}GB")
 # ── 3. Forward/backward manual ──
 loss_scale=LOSS_SCALE_INIT
 N_LAYERS=len(model.model.layers)
+# TRAIN_LAYERS was computed at import time against a hardcoded 48-layer model.
+# If the actual model is shallower, those layers simply do not exist and the
+# run silently trains nothing. Clamp to the real depth, keeping it contiguous.
+_L0c=min(_L0,N_LAYERS-1)
+TRAIN_LAYERS=set(range(_L0c,N_LAYERS))
+DETACH_AT=min(TRAIN_LAYERS)-1
+FROZEN_CACHE_PATH=f"checkpoints/frozen_cache_12h{_TAG}_d{DETACH_AT}.npy"
+assert TRAIN_LAYERS, "no trainable layers: train-from is past the end of the model"
+print(f"  Trainable layers: {min(TRAIN_LAYERS)}..{max(TRAIN_LAYERS)} of {N_LAYERS}")
 
 def _prelude(input_ids):
     """Full prelude: embedding + RoPE + causal mask."""
@@ -308,7 +326,14 @@ def fwd_bwd(batch,zero_store=True):
             from usaf.frozen_cache import get_hidden
             try:
                 fh=torch.cat([get_hidden(FROZEN_CACHE,s["_fidx"],device) for s in batch],dim=0)
-            except (IndexError, ValueError):
+            except (IndexError, ValueError) as e:
+                # A batch whose samples were never cached falls back to a full
+                # forward pass. Reported once so a partially cached run is
+                # visible instead of merely being slower.
+                if not _frozen_fallback_reported:
+                    print(f"    [cache] {e}; falling back to a full forward "
+                          f"pass for uncached batches (set FROZEN_EVAL=1 to cache them)")
+                _frozen_fallback_reported[0]=True
                 fh=None
         if fh is not None:
             hidden=fh
@@ -347,10 +372,7 @@ def fwd_bwd(batch,zero_store=True):
 
     h_last=hidden.detach().requires_grad_(True)
     loss=_head_loss(h_last,labels)
-    if _amp_scaler is not None:
-        _amp_scaler.scale(loss*loss_scale).backward()
-    else:
-        (loss*loss_scale).backward()
+    (loss*loss_scale).backward()
     g=h_last.grad
 
     for j in range(len(xs)-1,-1,-1):
@@ -369,18 +391,38 @@ def fwd_bwd(batch,zero_store=True):
 
 @torch.no_grad()
 def eval_ppl(slist,n=8):
-    tl=tt=0.0
+    """Token-weighted loss and perplexity over the first ``n`` samples.
+
+    A sample whose frozen-cache index is missing falls back to a full forward
+    pass, but that used to be an indistinguishable 'continue': a run with
+    FROZEN_EVAL=0 caches only training samples, so every evaluation sample
+    was skipped, and when all of them were skipped the function returned
+    (inf, inf) - a number that reads like a real result in the log and in
+    results/*.json. The fallback is now counted and printed, and returning
+    inf without having scored at least one sample is an error.
+    """
+    tl=tt=0.0; scored=0; fell_back=0
     for s in slist[:n]:
         ids=torch.tensor(s["input_ids"],dtype=torch.long).unsqueeze(0).to(device)
         lbl=torch.tensor(s["labels"],dtype=torch.long).unsqueeze(0).to(device)
+        cidx=s.get("_fidx")
+        if cidx is not None and FROZEN_CACHE is not None:
+            if cidx < 0 or cidx >= len(FROZEN_CACHE):
+                cidx=None; fell_back+=1
         try:
-            cidx=s.get("_fidx")
             loss=model_fwd(ids,lbl,cache_idx=cidx)
-            nt=(lbl!=-100).sum().item(); tl+=loss.item()*nt; tt+=nt
-        except (IndexError, RuntimeError): continue
-        except Exception:
-            pass
-    return (tl/max(tt,1),math.exp(tl/max(tt,1))) if tt>0 else (float("inf"),float("inf"))
+            nt=(lbl!=-100).sum().item(); tl+=loss.item()*nt; tt+=nt; scored+=1
+        except (IndexError, RuntimeError) as e:
+            raise RuntimeError(f"evaluation failed for a sample: {e}") from e
+    if fell_back:
+        print(f"    [eval] {fell_back} sample(s) not in the frozen cache "
+              f"(FROZEN_EVAL=0?); scored with a full forward pass instead")
+    if tt<=0:
+        raise RuntimeError(
+            f"evaluation scored 0 tokens over {min(n,len(slist))} samples; "
+            f"refusing to report an infinite perplexity as a result"
+        )
+    return tl/tt, math.exp(tl/tt)
 
 def log_jsonl(rec):
     Path("logs").mkdir(exist_ok=True)
@@ -593,7 +635,9 @@ def do_reselect():
             _new_vals[_grow_pos] = t.reshape(-1)[_grow_indices].float()
             del t
         _new_masters[fname] = torch.nn.Parameter(_new_vals, requires_grad=False)
-        _n_kept += len(kept); _n_dropped += len(dropped); _n_grown += len(grown)
+        # Counts were already accumulated from the final set (kept / dropped /
+        # grown) above; do not add the pre-merge len() a second time or every
+        # reselect report double-counts turnover.
     active_idx = _new_active
     masters = _new_masters
     sparse_store = SparseGradStore(active_idx, _shapes)
@@ -703,21 +747,41 @@ ihp=evals[0][4] if evals else fhp
 sm=sum(losses[-10:])/min(len(losses),10) if losses else 0
 
 print(f"\n4/4  Results")
-print(f"  Train: {losses[0]:.4f} -> {sm:.4f} | Eval ppl: {ipp:.2f} -> {fpp:.2f} | skipped {n_skipped}")
-print(f"  HELD-OUT ppl (generalização): {ihp:.2f} -> {fhp:.2f}")
+if SKIP_FINAL_EVAL:
+    print("  Train: {:.4f} -> {:.4f} | skipped {}".format(losses[0], sm, n_skipped))
+    print("  Eval/HELD-OUT ppl: SKIPPED (SKIP_FINAL_EVAL=1) - not measured")
+else:
+    print(f"  Train: {losses[0]:.4f} -> {sm:.4f} | Eval ppl: {ipp:.2f} -> {fpp:.2f} | skipped {n_skipped}")
+    print(f"  HELD-OUT ppl (generalização): {ihp:.2f} -> {fhp:.2f}")
 print(f"  Active: {ta:,}/{te:,} ({100*ta/max(te,1):.4f}%) | Time: {t_total/3600:.1f}h | RAM peak: {pr_peak:.1f}GB")
 
 Path("results").mkdir(exist_ok=True)
+# When the final eval is skipped the loop still needs numbers to print and log.
+# The old code used the sentinel 0,1, which silently wrote a plausible-looking
+# "eval_final_ppl": 1.0 into results/qwen3_12h.json - a fabricated result. Emit
+# null instead and flag the omission, so a skipped eval can never be mistaken
+# for a perfect score.
+def _r(v):
+    return None if (SKIP_FINAL_EVAL or v is None) else round(float(v), 2)
+def _r4(v):
+    return None if (SKIP_FINAL_EVAL or v is None) else round(float(v), 4)
+
+# Repo labels are metadata of the held-out set, not a constant. Take them from
+# the samples when present, and mark the field unknown otherwise.
+_hrepos=sorted({s.get("repo") for s in heldout_samples if isinstance(s,dict) and s.get("repo")})
+
 json.dump({
-    "model":"Qwen3-30B-A3B-q4","phase":"3c_12h","steps":STEPS,"seq":SEQ,"accum":ACCUM,
+    "model":f"{SRC}-q4","phase":"3c_12h","steps":STEPS,"seq":SEQ,"accum":ACCUM,
     "train_layers":sorted(TRAIN_LAYERS),"active":ta,"skipped":n_skipped,
     "lr_peak":LR_PEAK,"frac":FRAC,"wd":WD,
-    "train_init":round(losses[0],4),"train_final":round(sm,4),
-    "eval_init_ppl":round(ipp,2),"eval_final_ppl":round(fpp,2),
-    "eval_init_loss":round(iel,4),"eval_final_loss":round(fel,4),
-    "heldout_init_ppl":round(ihp,2),"heldout_final_ppl":round(fhp,2),
-    "heldout_repos":["flecs","sfml","entt","box2d"],
+    "final_eval_skipped":SKIP_FINAL_EVAL,
+    "train_init":_r4(losses[0] if losses else None),"train_final":_r4(sm),
+    "eval_init_ppl":_r(ipp),"eval_final_ppl":_r(fpp),
+    "eval_init_loss":_r4(iel),"eval_final_loss":_r4(fel),
+    "heldout_init_ppl":_r(ihp),"heldout_final_ppl":_r(fhp),
+    "heldout_repos":_hrepos if _hrepos else None,
     "tokens_trained":ttp,"time_hours":round(t_total/3600,2),"peak_ram":round(pr_peak,1),
-    "dataset":"bugfix(46%)+vulkan_code(37%)+general(9%)",
+    "dataset_path":DATASET_PATH,
+    "heldout_path":HELDOUT_PATH,
 },open("results/qwen3_12h.json","w"),indent=2)
 print("Saved: results/qwen3_12h.json")

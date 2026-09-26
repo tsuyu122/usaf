@@ -1,13 +1,44 @@
 import os
 import random
 from pathlib import Path
-from typing import Iterator, Optional
 
 import torch
-from datasets import Dataset, DatasetDict, concatenate_datasets
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
-from tqdm import tqdm
+
+try:
+    from datasets import Dataset, DatasetDict, concatenate_datasets
+except ImportError:  # pragma: no cover - depends on the install extras
+    Dataset = None  # type: ignore[assignment]
+    DatasetDict = None  # type: ignore[assignment]
+    concatenate_datasets = None  # type: ignore[assignment]
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - progress bar is cosmetic
+    def tqdm(iterable=None, *args, **kwargs):
+        """No-op stand-in used when tqdm is not installed."""
+        if iterable is None:
+            class _Nop:
+                def update(self, *a, **k):
+                    pass
+
+                def close(self):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            return _Nop()
+        return iterable
+
+_DATASETS_HINT = (
+    'preprocess_dataset() and CppDataset need the HuggingFace datasets package. '
+    'Install it with: pip install "usaf[data]" (or: pip install datasets tqdm)'
+)
 
 
 def collect_source_files(root_dir: str, extensions: tuple, max_size_mb: int = 1) -> list[str]:
@@ -31,7 +62,7 @@ def read_file_content(filepath: str, deduplicate_lines: bool = True) -> str:
     content = None
     for enc in encodings:
         try:
-            with open(filepath, "r", encoding=enc) as f:
+            with open(filepath, encoding=enc) as f:
                 content = f.read()
             break
         except (UnicodeDecodeError, UnicodeError):
@@ -92,8 +123,10 @@ def preprocess_dataset(
     shuffle_repos: bool = True,
     seed: int = 42,
 ) -> DatasetDict:
-    import tempfile
+    if Dataset is None:
+        raise ImportError(_DATASETS_HINT)
     import shutil
+    import tempfile
 
     random.seed(seed)
     files = collect_source_files(cloned_projects_dir, cpp_extensions, max_file_size_mb)
@@ -156,7 +189,9 @@ def preprocess_dataset(
 
 
 class CppDataset(torch.utils.data.Dataset):
-    def __init__(self, hf_dataset: Dataset):
+    def __init__(self, hf_dataset):
+        if Dataset is None:
+            raise ImportError(_DATASETS_HINT)
         self.dataset = hf_dataset
 
     def __len__(self) -> int:

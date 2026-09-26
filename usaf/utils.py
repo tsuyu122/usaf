@@ -1,5 +1,6 @@
+from typing import Any
+
 import torch
-from typing import Dict, Any
 
 try:
     import torch_directml
@@ -41,5 +42,5 @@ def estimate_optimizer_memory(num_active_params: int, dtype: torch.dtype = torch
     return num_active_params * bytes_per_param * 2
 
 
-def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}

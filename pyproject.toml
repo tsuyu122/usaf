@@ -1,13 +1,13 @@
 [build-system]
 requires = ["setuptools>=64.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "usaf"
 version = "1.0.0-alpha.1"
 description = "Ultra Sparse Adaptive Fine-Tuning for MoE models"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
     { name = "USAF Team" },
@@ -15,13 +15,13 @@ authors = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
     "torch>=2.4.0",
-    "transformers>=4.46.0",
+    "transformers>=4.53.0",
     "safetensors>=0.4.0",
     "numpy>=1.26.0",
     "psutil>=5.9.0",
@@ -47,6 +47,10 @@ train = [
 ]
 vk = [
     "pybind11>=2.11.0",
+]
+data = [
+    "datasets>=2.21.0",
+    "tqdm>=4.66.0",
 ]
 
 [project.urls]
@@ -78,6 +82,29 @@ select = ["E", "F", "W", "I", "N", "UP"]
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
+# The training entrypoints are written in a deliberately compact, script-like
+# style: constants keep their SCREAMING_CASE names inside functions (SEQ,
+# N_LAYERS, ACCUM) because they read as the run configuration, and short
+# multi-statement lines are used for throwaway locals. Renaming them all would
+# obscure the code rather than clarify it.
+"train.py" = ["N806", "N803", "E701", "E702"]
+"usaf/train.py" = ["N806", "N803", "E701", "E702", "E741"]
+# N806/N803: M, K, N, B, S, H, nH, nKV name matrix and tensor dimensions.
+# They read as math, not as sloppy casing, in these numeric kernels.
+# N812: `import torch.nn.functional as F` is the alias every PyTorch codebase
+# uses; flagging it is noise.
+"usaf/qwen3_layer_vk.py" = ["N806", "N812", "N803"]
+"usaf/vk_layer.py" = ["N806", "N803", "E701", "E702"]
+"usaf/frozen_cache.py" = ["N806"]
+"usaf/importance.py" = ["N806"]
+"usaf/*_dml.py" = ["N812"]
+"usaf/moe_loader.py" = ["E701"]
+# The Vulkan test helpers mirror the argument names of the native extension
+# (nH, nKV, S) so each call reads like the C++ signature it drives.
+"tests/test_vulkan_kernels.py" = ["N803", "N806"]
+# E402: usaf/__init__.py builds __all__ conditionally, then imports the public
+# API it just registered.
+"usaf/__init__.py" = ["E402"]
 "tests/*" = ["E402"]
 
 [tool.mypy]
