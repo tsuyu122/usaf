@@ -92,12 +92,37 @@ def load_qwen3_streaming(src: str, q4_dir: str, max_cached: int = 1):
 
 
 def apply_checkpoint_overlays(cache, ckpt_path: str) -> int:
-    """Aplica os masters compactos de um checkpoint de treino como overlays."""
+    """Aplica os masters compactos de um checkpoint de treino como overlays.
+
+    The two halves of a checkpoint have to agree on length, and nothing
+    checked it. A master shorter than its index list is a scatter that either
+    throws from deep inside a forward or, worse, writes the wrong weights over
+    the right positions - and the symptom of that is a model that has quietly
+    been trained on someone else's parameters. The export path already refuses
+    this; loading a checkpoint has to refuse it too.
+    """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    n = 0
+    # Everything is checked before anything is installed. Installing as it goes
+    # leaves a half-applied checkpoint behind when a later tensor fails, and a
+    # caller that catches the error and carries on then runs a model built from
+    # a mix of trained and original weights - which is the same quiet wrongness
+    # the length check exists to prevent, one tensor later.
+    staged: dict[str, tuple[torch.Tensor, torch.nn.Parameter]] = {}
     for fname, aidx in ckpt["active_idx"].items():
+        if fname not in ckpt["masters"]:
+            raise KeyError(
+                f"{fname}: the checkpoint lists active indices for it but "
+                f"carries no master, so the trained values would be missing "
+                f"entirely and the original weights used instead"
+            )
         aidx = aidx.reshape(-1).to(torch.long)
-        vals = torch.nn.Parameter(ckpt["masters"][fname].float(), requires_grad=False)
-        cache.overlays[fname] = (aidx, vals)
-        n += 1
-    return n
+        master = ckpt["masters"][fname].reshape(-1)
+        if master.numel() != aidx.numel():
+            raise ValueError(
+                f"{fname}: active_idx has {aidx.numel()} entries but the "
+                f"trained master has {master.numel()}"
+            )
+        staged[fname] = (aidx, torch.nn.Parameter(master.float(),
+                                                 requires_grad=False))
+    cache.overlays.update(staged)
+    return len(staged)
