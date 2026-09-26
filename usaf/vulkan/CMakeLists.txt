@@ -9,8 +9,17 @@ find_package(Vulkan REQUIRED)
 # build works on any machine instead of only the author's hardcoded path.
 # Use the interpreter that CMake was pointed at, so a stray python.exe on PATH
 # (e.g. a pythoncore shim without pybind11) does not get picked up instead.
+# Prefer an explicit -DPython3_EXECUTABLE over anything already in the cache.
+# find_package(Python3) honours the cache entry, and on a machine with several
+# interpreters (a pythoncore shim, the Store build of a newer Python) the newest
+# one wins even when the build was pointed at another. That interpreter has no
+# pybind11, so the configure step failed with a bare
+# "Could not find a package configuration file provided by pybind11".
 if(NOT DEFINED Python3_EXECUTABLE AND DEFINED PYTHON_EXECUTABLE)
-    set(Python3_EXECUTABLE "${PYTHON_EXECUTABLE}")
+    set(Python3_EXECUTABLE "${PYTHON_EXECUTABLE}" CACHE FILEPATH "" FORCE)
+endif()
+if(Python3_EXECUTABLE)
+    message(STATUS "usaf_vulkan: building against ${Python3_EXECUTABLE}")
 endif()
 # Interpreter + Development.Module are both required: pybind11's
 # pybind11_add_module delegates to python3_add_library, which is undefined
@@ -95,9 +104,16 @@ add_dependencies(test_kernels ${SPIRV_DEPS})
 
 # Stage the SPIR-V artefacts next to the python module so the runtime
 # loader (spirv/<kernel>.spv, relative to the extension module) finds them.
+#
+# The destination is the module's own output directory, not CMAKE_BINARY_DIR.
+# Those only coincide for single-config generators; with a multi-config one
+# (Visual Studio, the default on Windows) the module lands in
+# CMAKE_BINARY_DIR/<CONFIG>/ while the shaders stayed one level up, so every
+# kernel failed at load with "Cannot open SPIR-V: spirv/rmsnorm_fp16.spv".
 add_custom_target(copy_spirv ALL
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/spirv
-    COMMAND ${CMAKE_COMMAND} -E copy_directory ${SPIRV_DIR} ${CMAKE_BINARY_DIR}/spirv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SPIRV_DIR}
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${SPIRV_DIR}
+            $<TARGET_FILE_DIR:usaf_vk>/spirv
     DEPENDS ${SPIRV_DEPS}
 )
 add_dependencies(test_vulkan copy_spirv)

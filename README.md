@@ -180,7 +180,7 @@ python -m usaf.train --model mistralai/Mixtral-8x7B --dataset data.jsonl
 | Multi-GPU (DataParallel) | Code complete, unbenchmarked |
 | DirectML (AMD) | Production - the configuration behind every number on this page |
 | fp16 + manual loss scaling | Production (used on both the DirectML and CUDA paths) |
-| Vulkan kernels (dequant, GEMM, RMSNorm, RoPE, attention) | Built and numerically tested |
+| Vulkan kernels (dequant, GEMM, RMSNorm, RoPE, attention) | Built and numerically tested against PyTorch |
 | Held-out evaluation | Production |
 
 ## Hardware
@@ -189,6 +189,31 @@ python -m usaf.train --model mistralai/Mixtral-8x7B --dataset data.jsonl
 - AMD: DirectML (Windows, built-in)
 - NVIDIA: CUDA 11.8+
 - Python 3.10+, PyTorch 2.0+
+
+### Optional: building the Vulkan kernels
+
+`USE_VK=1` needs the `usaf_vk` extension. It is not required; without it the
+run uses the PyTorch path. To build it you need the Vulkan SDK (for `glslc`)
+and CMake 3.20+:
+
+```bash
+pip install pybind11
+cmake -S usaf/vulkan -B build -DCMAKE_BUILD_TYPE=Release \
+      -DPython3_EXECUTABLE=$(which python)
+cmake --build build --config Release
+PYTHONPATH=build/Release python -m pytest tests/test_vulkan_kernels.py -q
+```
+
+Pass `-DPython3_EXECUTABLE` explicitly. If you do not, CMake picks whatever
+interpreter is newest on the machine, which on a typical Windows box is the
+Store build of a newer Python that has no `pybind11`, and the configure step
+fails. The build stages the compiled shaders in `spirv/` next to the extension
+module, and the loader resolves them relative to that module rather than to the
+current directory, so the tests pass from any working directory.
+
+All five kernels are checked against PyTorch by the test suite: attention,
+RMSNorm, GEMM, RoPE and the 4-bit dequantizer. They are skipped automatically
+when the extension has not been built, so a CPU-only checkout still passes.
 
 ## Using Your Own Model
 

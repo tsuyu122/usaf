@@ -7,7 +7,14 @@
 #include <mutex>
 #include <atomic>
 #include <vector>
+#include <string>
 #include <cstring>
+// windows.h defines min/max as macros, which turns every std::min and std::max
+// in this file into a syntax error. NOMINMAX keeps the standard templates.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 
 namespace py = pybind11;
 using namespace usaf::vkcore;
@@ -16,6 +23,38 @@ using namespace usaf::vkcore;
 static ComputeContext* g_ctx = nullptr;
 static std::string g_spirv_dir;
 static std::once_flag g_init_flag;
+
+// Resolve a shader file. An explicit set_spirv_path() wins; otherwise the
+// path is taken relative to this extension module, not to the current working
+// directory. Resolving against the CWD meant the shaders only loaded when the
+// process happened to be started from the build tree, and every other caller
+// got "Cannot open SPIR-V: spirv/<kernel>.spv".
+static std::string resolve_spirv(const std::string& kernel) {
+    if (!g_spirv_dir.empty()) {
+        return g_spirv_dir + "/" + kernel + ".spv";
+    }
+    // GetModuleHandleW(nullptr) would report the host executable (python.exe),
+    // not this extension, so the shaders were looked up beside the interpreter.
+    // Address-of-self is what identifies the loaded module.
+    HMODULE self = nullptr;
+    if (GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&resolve_spirv), &self) && self) {
+        wchar_t buf[MAX_PATH];
+        DWORD n = GetModuleFileNameW(self, buf, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            std::wstring wpath(buf, n);
+            size_t slash = wpath.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) {
+                std::wstring dir = wpath.substr(0, slash);
+                std::string base(dir.begin(), dir.end());
+                return base + "/spirv/" + kernel + ".spv";
+            }
+        }
+    }
+    return std::string("spirv/") + kernel + ".spv";
+}
 
 static void ensure_init() {
     std::call_once(g_init_flag, []() {
@@ -146,7 +185,7 @@ static void rmsnorm_pipelined(int x_h, int w_h, int out_h, int rows, int cols, f
          {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}},
         sizeof(uint32_t)*2 + sizeof(float));
     if (!cp->pipeline.pipeline) {
-        auto shader = load_shader(ctx(), g_spirv_dir.empty() ? "spirv/rmsnorm_fp16.spv" : (g_spirv_dir + "/rmsnorm_fp16.spv").c_str(), "main");
+        auto shader = load_shader(ctx(), resolve_spirv("rmsnorm_fp16").c_str(), "main");
         std::vector<vk::PushConstantRange> push = {{vk::ShaderStageFlagBits::eCompute, 0, (uint32_t)(sizeof(uint32_t)*2 + sizeof(float))}};
         cp->pipeline = create_compute_pipeline(ctx(), shader, {cp->layout_bindings[0], cp->layout_bindings[1], cp->layout_bindings[2]}, push);
     }
@@ -168,7 +207,7 @@ static void gemm_pipelined(int a_h, int b_h, int c_h, int M, int K, int N) {
          {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}},
         sizeof(uint32_t)*3);
     if (!cp->pipeline.pipeline) {
-        auto shader = load_shader(ctx(), g_spirv_dir.empty() ? "spirv/gemm_fp16.spv" : (g_spirv_dir + "/gemm_fp16.spv").c_str(), "main");
+        auto shader = load_shader(ctx(), resolve_spirv("gemm_fp16").c_str(), "main");
         std::vector<vk::PushConstantRange> push = {{vk::ShaderStageFlagBits::eCompute, 0, sizeof(uint32_t)*3}};
         cp->pipeline = create_compute_pipeline(ctx(), shader, {cp->layout_bindings[0], cp->layout_bindings[1], cp->layout_bindings[2]}, push);
     }
@@ -194,7 +233,7 @@ static void dequant_pipelined(int q_h, int s_h, int z_h, int out_h,
          {3, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}},
         sizeof(uint32_t)*4);
     if (!cp->pipeline.pipeline) {
-        auto shader = load_shader(ctx(), g_spirv_dir.empty() ? "spirv/dequant_q4.spv" : (g_spirv_dir + "/dequant_q4.spv").c_str(), "main");
+        auto shader = load_shader(ctx(), resolve_spirv("dequant_q4").c_str(), "main");
         std::vector<vk::PushConstantRange> push = {{vk::ShaderStageFlagBits::eCompute, 0, sizeof(uint32_t)*4}};
         cp->pipeline = create_compute_pipeline(ctx(), shader, {cp->layout_bindings[0], cp->layout_bindings[1], cp->layout_bindings[2], cp->layout_bindings[3]}, push);
     }
@@ -226,7 +265,7 @@ static void attn_softmax_pipelined(int scores_h, int v_h, int out_h,
         // The kernel source is attention.comp, so the compiled artefact is
         // attention.spv. The previous "attn_softmax.spv" name matched no
         // build output and made this path fail at pipeline creation.
-        auto shader = load_shader(ctx(), g_spirv_dir.empty() ? "spirv/attention.spv" : (g_spirv_dir + "/attention.spv").c_str(), "main");
+        auto shader = load_shader(ctx(), resolve_spirv("attention").c_str(), "main");
         std::vector<vk::PushConstantRange> push = {{vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc)}};
         cp->pipeline = create_compute_pipeline(ctx(), shader, bnd, push);
     }
@@ -256,7 +295,7 @@ static void residual_add_pipelined(int a_h, int b_h, int out_h, int N) {
          {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}},
         sizeof(uint32_t));
     if (!cp->pipeline.pipeline) {
-        auto shader = load_shader(ctx(), g_spirv_dir.empty() ? "spirv/residual_add.spv" : (g_spirv_dir + "/residual_add.spv").c_str(), "main");
+        auto shader = load_shader(ctx(), resolve_spirv("residual_add").c_str(), "main");
         std::vector<vk::PushConstantRange> push = {{vk::ShaderStageFlagBits::eCompute, 0, sizeof(uint32_t)}};
         cp->pipeline = create_compute_pipeline(ctx(), shader, {cp->layout_bindings[0], cp->layout_bindings[1], cp->layout_bindings[2]}, push);
     }
@@ -291,7 +330,7 @@ static py::tuple rope_pipelined(int q_h, int k_h, int cos_h, int sin_h,
 
     auto* cp = get_or_create_pipeline("rope_fp16", bnd, sizeof(pc));
     if (!cp->pipeline.pipeline) {
-        auto shader = load_shader(ctx(), g_spirv_dir.empty() ? "spirv/rope_fp16.spv" : (g_spirv_dir + "/rope_fp16.spv").c_str(), "main");
+        auto shader = load_shader(ctx(), resolve_spirv("rope_fp16").c_str(), "main");
         std::vector<vk::PushConstantRange> push = {{vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc)}};
         cp->pipeline = create_compute_pipeline(ctx(), shader, bnd, push);
     }
@@ -351,12 +390,7 @@ static py::array_t<uint16_t> run_kernel(
     // Create pipeline if not yet created (needs the actual shader module)
     if (!cp->owned || !cp->pipeline.pipeline) {
     // Load shader (SPIR-V path derived from pipeline name)
-    std::string spirv = g_spirv_dir + "/" + pipeline_name + ".spv";
-    if (!g_spirv_dir.empty()) {
-        spirv = g_spirv_dir + "/" + pipeline_name + ".spv";
-    } else {
-        spirv = std::string("spirv/") + pipeline_name + ".spv";
-    }
+    std::string spirv = resolve_spirv(pipeline_name);
     auto shader = load_shader(ctx(), spirv, "main");
         std::vector<vk::DescriptorSetLayoutBinding> bnd;
         for (uint32_t i = 0; i < cp->num_bindings; i++) bnd.push_back(cp->layout_bindings[i]);
@@ -471,7 +505,7 @@ py::tuple run_rope(
 
     // Create pipeline if needed
     if (!cp->owned || !cp->pipeline.pipeline) {
-        auto shader = load_shader(ctx(), g_spirv_dir.empty() ? "spirv/rope_fp16.spv" : (g_spirv_dir + "/rope_fp16.spv").c_str(), "main");
+        auto shader = load_shader(ctx(), resolve_spirv("rope_fp16").c_str(), "main");
         std::vector<vk::PushConstantRange> push = {{vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc)}};
         auto pip = create_compute_pipeline(ctx(), shader, bnd, push);
         if (cp->pipeline.pipeline) destroy_pipeline(ctx(), cp->pipeline);
