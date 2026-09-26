@@ -162,7 +162,7 @@ def test_the_layer_budget_follows_the_card_not_the_host(zaya_dir):
         vram = c.estimated_vram_gb
         budget = c.max_trainable_layers * c.estimated_per_layer_gb
         assert budget <= vram, (
-            "the layers alone need %.1f GB in a %.1f GB card" % (budget, vram)
+            f"the layers alone need {budget:.1f} GB in a {vram:.1f} GB card"
         )
 
 

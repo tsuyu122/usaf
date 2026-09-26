@@ -59,7 +59,7 @@ def test_reselect_fires_on_schedule_and_keeps_the_budget(tmp_path):
 
     fired = re.findall(r"\[reselect step (\d+)\]", out)
     assert fired, "no reselection happened"
-    assert fired == ["2", "4", "6"], "wrong schedule: %r" % (fired,)
+    assert fired == ["2", "4", "6"], f"wrong schedule: {fired!r}"
 
     reports = re.findall(
         r"\[reselect\] kept=([\d,]+) dropped=([\d,]+) grown=([\d,]+) ", out
@@ -92,5 +92,5 @@ def test_the_optimizer_step_counter_survives_a_reselection(tmp_path):
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
     opt_step = state["optimizer"]["step"]
     assert opt_step == state["step"], (
-        "run ended on step %d, optimizer recorded %d" % (state["step"], opt_step)
+        f"run ended on step {state['step']}, optimizer recorded {opt_step}"
     )

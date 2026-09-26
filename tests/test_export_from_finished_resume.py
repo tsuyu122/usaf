@@ -113,5 +113,5 @@ def test_the_export_carries_the_trained_weights_not_the_base(tmp_path):
     assert drift > 0.0, "the export is byte-identical to the base model"
     assert err_export < err_base / 3.0, (
         "the export is no closer to the trained weights than the base is: "
-        "%g vs %g" % (err_export, err_base)
+        f"{err_export:g} vs {err_base:g}"
     )

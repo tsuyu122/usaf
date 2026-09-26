@@ -786,7 +786,22 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
         from transformers import AutoModelForCausalLM
         try:
             model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
-        except Exception:
+        except Exception as e:
+            # The bare except used to substitute a Qwen3-MoE for whatever failed
+            # to build, which turns "this transformers cannot load that model"
+            # into "train a different model" - quietly, and with a loss curve
+            # that looks like progress. The substitution is only meaningful when
+            # the config really is a Qwen3-MoE, and then it is a name-resolution
+            # convenience rather than a rescue. Anything else stops.
+            mt = str(getattr(cfg, "model_type", "") or "").lower()
+            if "qwen3_moe" not in mt:
+                raise SystemExit(
+                    f"transformers {__import__('transformers').__version__} "
+                    f"cannot build "
+                    f"{getattr(cfg, 'model_type', type(cfg).__name__)} from "
+                    f"{config.model_path}, and it is not a Qwen3-MoE so there is "
+                    f"nothing to fall back to: {type(e).__name__}: {e}"
+                ) from e
             from transformers.models.qwen3_moe import Qwen3MoeForCausalLM
             model = Qwen3MoeForCausalLM(cfg)
 
@@ -1081,17 +1096,28 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         if not config.export_path:
             return
         print(f"\nExporting merged weights to {config.export_path}...")
+        # A failed export used to print a line and let the run finish, so the
+        # exit code was 0 and the report said Complete. The export is the entire
+        # reason for the second command in "train on one machine, export on
+        # another" - a run that trains for hours and then quietly produces no
+        # model is worse than one that stops, because nothing tells you to go
+        # looking. config.export_path being set means the user asked for it, so a
+        # failure here is fatal.
+        from usaf.checkpoint import export_merged_weights
+
         try:
-            from usaf.checkpoint import export_merged_weights
             export_path = export_merged_weights(
                 config.quant_path,
                 {k: v.detach().cpu() for k, v in masters.items()},
                 {k: v.cpu() for k, v in active_idx.items()},
                 config.export_path,
             )
-            print(f"  Exported: {export_path}")
         except Exception as e:
-            print(f"  Export failed: {e}")
+            raise SystemExit(
+                f"--export was requested but the merge failed: "
+                f"{type(e).__name__}: {e}"
+            ) from e
+        print(f"  Exported: {export_path}")
     if resume_ckpt is None:
         imp_store = TopKImportanceStore(_shapes, frac=FRAC)
         for mname, mod in _expert_modules_by_name(
