@@ -1123,7 +1123,13 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             _ck = os.path.join(config.checkpoint_dir or "checkpoints",
                                f"frozen_cache_d{DETACH_AT}.npy")
             FROZEN_CACHE = build_frozen_cache(
-                _fc_train, SEQ, model.config.hidden_size, DETACH_AT,
+                # model.config does not survive nn.DataParallel: the wrapper is
+                # a different object and forwards module calls, not attributes,
+                # so a multi-GPU run died here asking the wrapper for a config.
+                # The config is already in hand - _load_model read it from the
+                # same place the weights came from - and it does not change
+                # when the model gets wrapped.
+                _fc_train, SEQ, model_cfg.hidden_size, DETACH_AT,
                 config.model_path, _compute_hidden, _ck,
             )
             print(f"  Frozen cache: layers 0..{DETACH_AT} for {len(_fc_train)} samples")
