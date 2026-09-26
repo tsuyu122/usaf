@@ -986,48 +986,48 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             return None
         return math.exp(total_loss / total_tok)
 
+    def fwd_bwd_imp(sample):
+        """Forward+backward used only by the importance phase.
+
+        The expert weights are injected into the modules by forward
+        pre-hooks, so the sparse-gradient hooks registered on them only
+        fire if the backward pass actually walks back through the decoder
+        layers. Detaching the final hidden state (h_last) severs the graph
+        produced by the forward loop, so a plain loss.backward() would only
+        ever reach h_last itself and the experts would receive no gradient
+        at all.
+
+        We therefore keep the per-layer inputs, and after computing the
+        head loss we re-run each captured layer in reverse, threading the
+        incoming gradient through it manually. This mirrors what
+        fwd_bwd() below does during real training.
+        """
+        ids = torch.tensor([sample["input_ids"]], dtype=torch.long).to(device)
+        lbl = torch.tensor([sample["labels"]], dtype=torch.long).to(device)
+        hidden, pos_ids, pe, mask = _prelude(ids)
+        xs_imp = []
+        for i in range(N_LAYERS):
+            xs_imp.append(hidden)
+            hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+        cache.evict_all()
+        h_last = hidden.detach().requires_grad_(True)
+        loss = _head_loss(h_last, lbl)
+        loss.backward()
+        g_imp = h_last.grad
+        for j in range(len(xs_imp) - 1, -1, -1):
+            x2 = xs_imp[j].detach().requires_grad_(True)
+            out = layers[j](x2, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+            out.backward(g_imp)
+            g_imp = x2.grad
+            cache.evict_all()
+        return loss.item()
+
     if resume_ckpt is None:
         imp_store = TopKImportanceStore(_shapes, frac=FRAC)
         for mname, mod in model.named_modules():
             if mname not in _expert_modules:
                 continue
             mod._grad_capture = (imp_store, mname)
-
-        def fwd_bwd_imp(sample):
-            """Forward+backward used only by the importance phase.
-
-            The expert weights are injected into the modules by forward
-            pre-hooks, so the sparse-gradient hooks registered on them only
-            fire if the backward pass actually walks back through the decoder
-            layers. Detaching the final hidden state (h_last) severs the graph
-            produced by the forward loop, so a plain loss.backward() would only
-            ever reach h_last itself and the experts would receive no gradient
-            at all.
-
-            We therefore keep the per-layer inputs, and after computing the
-            head loss we re-run each captured layer in reverse, threading the
-            incoming gradient through it manually. This mirrors what
-            fwd_bwd() below does during real training.
-            """
-            ids = torch.tensor([sample["input_ids"]], dtype=torch.long).to(device)
-            lbl = torch.tensor([sample["labels"]], dtype=torch.long).to(device)
-            hidden, pos_ids, pe, mask = _prelude(ids)
-            xs_imp = []
-            for i in range(N_LAYERS):
-                xs_imp.append(hidden)
-                hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
-            cache.evict_all()
-            h_last = hidden.detach().requires_grad_(True)
-            loss = _head_loss(h_last, lbl)
-            loss.backward()
-            g_imp = h_last.grad
-            for j in range(len(xs_imp) - 1, -1, -1):
-                x2 = xs_imp[j].detach().requires_grad_(True)
-                out = layers[j](x2, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
-                out.backward(g_imp)
-                g_imp = x2.grad
-                cache.evict_all()
-            return loss.item()
 
         print("Importance phase...")
         t0 = time.time()
@@ -1154,6 +1154,106 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     loss_scale = 4096.0
 
     print(f"\n=== Training ({STEPS} steps) ===\n")
+    def do_reselect(_step):
+        """RigL: one dense importance pass, then merge top-k into the active set.
+
+        The universal CLI kept --reselect-every, printed "RigL: every N steps"
+        and wrote the number into the checkpoint, but never reselected: the
+        variable was read once and used once more, to record itself. Only the
+        standalone root train.py had this. A name on a flag is not behaviour.
+        """
+        nonlocal active_idx, masters, sparse_store, opt
+        t0 = time.time()
+        print(f"  [reselect step {_step}] dense importance pass...", flush=True)
+
+        _imp = TopKImportanceStore(_shapes, frac=FRAC)
+        for _m, _mod in model.named_modules():
+            if _m in _expert_modules:
+                _mod._grad_capture = (_imp, _m)
+
+        fwd_bwd_imp(train_samples[0])
+        new_idx = _imp.select(FRAC)
+        del _imp
+
+        _new_active = {}
+        _new_masters = {}
+        _kept_n = _dropped_n = _grown_n = 0
+
+        for fname, old in active_idx.items():
+            old_set = set(old.reshape(-1).tolist())
+            nw = new_idx.get(fname)
+            if nw is None or nw.numel() == 0:
+                _new_active[fname] = old.clone()
+                _new_masters[fname] = masters[fname]
+                continue
+            nw_set = set(nw.reshape(-1).tolist())
+            kept = sorted(old_set & nw_set)
+            candidates = sorted(nw_set - old_set)
+            fill = max(0, len(old_set) - len(kept))
+            final = torch.tensor(kept + candidates[:fill], dtype=torch.long)
+            _new_active[fname] = final
+
+            _old_vals = masters[fname].data.float()
+            _old_flat = old.reshape(-1).to(torch.long)
+            _keep_mask = torch.isin(final, _old_flat)
+            _kept_n += int(_keep_mask.sum().item())
+            _dropped_n += _old_flat.numel() - int(
+                torch.isin(_old_flat, final).sum().item())
+            _grown_n += int((~_keep_mask).sum().item())
+
+            _new_vals = torch.zeros(final.numel(), dtype=torch.float32)
+            _kept_pos = _keep_mask.nonzero(as_tuple=False).reshape(-1)
+            if _kept_pos.numel() > 0:
+                _all_idx = torch.zeros(
+                    int(_old_flat.max().item()) + 1, dtype=torch.long)
+                _all_idx[_old_flat] = torch.arange(
+                    _old_flat.numel(), dtype=torch.long)
+                _new_vals[_kept_pos] = _old_vals[_all_idx[final[_kept_pos]]]
+
+            _grow_pos = (~_keep_mask).nonzero(as_tuple=False).reshape(-1)
+            if _grow_pos.numel() > 0:
+                entry = q_dict[fname]
+                if isinstance(entry, dict) and 'q' in entry:
+                    t = dequantize_4bit(
+                        entry['q'], entry['s'], entry['z'], entry['shape'],
+                        group_size=128)
+                else:
+                    t = dequantize_4bit(
+                        entry[0], entry[1], entry[2], entry[3], group_size=128)
+                _new_vals[_grow_pos] = t.reshape(-1)[final[_grow_pos]].float()
+                del t
+            _new_masters[fname] = torch.nn.Parameter(
+                _new_vals, requires_grad=False)
+
+        active_idx = _new_active
+        masters = _new_masters
+        sparse_store = SparseGradStore(active_idx, _shapes)
+        for _m, _mod in model.named_modules():
+            if _m in _expert_modules:
+                _mod._grad_capture = (sparse_store, _m)
+
+        cache.overlays.clear()
+        for fname, aidx in active_idx.items():
+            cache.overlays[fname] = (
+                aidx.reshape(-1).to(torch.long), masters[fname])
+        if USE_RESIDENT:
+            cache.apply_resident_overlays(active_idx, masters)
+        # Carry the Adam moments across the reselection. Building a fresh
+        # SparseAdam here threw m and v away every reselect_every steps
+        # and rewound the step counter, and the checkpoint then recorded
+        # that rewound number: resuming a run that had reselected came
+        # back saying step 1 when the run was at step 3. reselect() maps
+        # each surviving element back to its old moment and leaves newly
+        # activated ones clean.
+        _lr_keep = opt.lr
+        opt.reselect(masters, active_idx)
+        opt.lr = _lr_keep
+        _ta = sum(i.numel() for i in active_idx.values())
+        _te = sum(math.prod(_shapes[fn]) for fn in active_idx if fn in _shapes)
+        print(f"  [reselect] kept={_kept_n:,} dropped={_dropped_n:,} "
+              f"grown={_grown_n:,} active={_ta:,} "
+              f"({100*_ta/max(_te,1):.4f}%) in {time.time()-t0:.0f}s",
+              flush=True)
     for step in range(start_step, STEPS + 1):
         t_step = time.time()
 
@@ -1163,6 +1263,10 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             progress = (step - max(1, int(STEPS * 0.05))) / max(1, STEPS - max(1, int(STEPS * 0.05)))
             lr = LR_PEAK * 0.1 + LR_PEAK * 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
         opt.lr = lr
+
+        if RESELECT_EVERY > 0 and step > 1 and step % RESELECT_EVERY == 0:
+            do_reselect(step)
+            opt.lr = lr
 
         sparse_store.zero_()
         if router_params:
