@@ -240,11 +240,25 @@ class VKLayer:
         usaf_vk.rmsnorm_pipe(h_residual, self.bufs["post_attention_layernorm.weight"], h_post_norm, B * S, H, 1e-6)
         post_norm = usaf_vk.download(h_post_norm, [B * S, H]).view(np.float16).reshape(B, S, H)
 
-        # Cleanup
+        # Cleanup.
+        #
+        # Deduped by identity, and it has to be. hq_rope_in is an alias of
+        # hq_normed (and hk_rope_in of hk_normed) whenever the model has q_norm
+        # and k_norm, which is every Qwen3 - the family train.py drives. Listing
+        # both names therefore called destroy_buf twice on the same handle, and
+        # destroying a Vulkan buffer twice is undefined: the driver may just
+        # complain, or the handle may have been handed back out to something
+        # else by then, in which case this frees a buffer that is in use. The
+        # buffers here are created and destroyed per forward rather than drawn
+        # from a pool, so nothing catches the mismatch before the damage.
         all_bufs = [hx, hrms, hq, hk, hv_buf, hcos, hsin, hq_rope, hk_rope, h_attn_flat, ho, h_residual, h_post_norm]
         if "self_attn.q_norm.weight" in self.bufs:
             all_bufs.extend([hq_normed, hk_normed, hq_rope_in, hk_rope_in])
+        freed = set()
         for h in all_bufs:
+            if id(h) in freed:
+                continue
+            freed.add(id(h))
             usaf_vk.destroy_buf(h)
 
         return post_attn, post_norm
