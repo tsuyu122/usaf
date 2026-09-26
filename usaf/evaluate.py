@@ -47,7 +47,13 @@ class Evaluator:
             del input_ids, labels, outputs
 
         avg_loss = total_loss / max(total_tokens, 1)
-        perplexity = math.exp(avg_loss)
+        # math.exp raises OverflowError past about 709, so a run that diverged
+        # - which is exactly when a person most wants to see the number -
+        # takes the whole evaluation down instead of printing a large one.
+        try:
+            perplexity = math.exp(avg_loss)
+        except OverflowError:
+            perplexity = float("inf")
 
         return {
             "loss": avg_loss,
@@ -62,15 +68,25 @@ class Evaluator:
         max_new_tokens: int = 128,
         temperature: float = 0.8,
     ) -> str:
+        """Return the text the model produced *after* the prompt.
+
+        It used to return the whole decoded sequence, prompt included, so a
+        caller that printed the prompt and then the result showed the sentence
+        twice and made it look like the model had echoed it.
+        """
         if self.tokenizer is None:
             raise ValueError("tokenizer is required for generation")
         self.model.eval()
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=True,
-            pad_token_id=self.tokenizer.pad_token_id,
+        prompt_len = int(inputs["input_ids"].shape[-1])
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": temperature > 0,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+        if temperature > 0:
+            gen_kwargs["temperature"] = temperature
+        outputs = self.model.generate(**inputs, **gen_kwargs)
+        return self.tokenizer.decode(
+            outputs[0][prompt_len:], skip_special_tokens=True
         )
-        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
