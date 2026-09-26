@@ -198,6 +198,16 @@ what the numbers rest on.
   matches. This is the claim the whole method rests on.
 - All five Vulkan kernels (attention, RMSNorm, GEMM, RoPE, 4-bit dequant)
   against PyTorch, on a real AMD Radeon RX 6750 XT.
+- The composed Vulkan Q/K/V projection (`VKLayer.forward_qkv`), which is the
+  path the root `train.py` actually runs, against the PyTorch projections it
+  replaces, including the flattened `[B*S, out]` layout its caller reshapes.
+  Getting a transpose or a buffer size wrong there would only have shown up
+  as a model that trained badly.
+
+  One thing this does *not* cover: `usaf/qwen3_layer_vk.py` composes those
+  kernels into a whole decoder layer, and no entry point calls it. It is a
+  library, exercised by its own tests, not part of a training run. The Vulkan
+  path that a run takes is the Q/K/V projection in `usaf/vk_layer.py`.
 - The 4-bit quantizer round-trips across five tensor shapes, packs exactly two
   values per byte, and reaches 3.76x compression.
 - RoPE must be a rotation: the test asserts the per-head norm is preserved, not
