@@ -62,6 +62,19 @@ def build_frozen_cache(samples, seq: int, hidden: int, detach_at: int, src: str,
             print(f"  frozen cache: reusando {path} ({existing.shape})")
         return existing
 
+    # A build writes the array first and the metadata second, and the w+
+    # open_memmap below truncates the array on the way in. A crash between the
+    # two leaves the previous run's metadata describing an array that is no
+    # longer there. The fingerprint still matches - same data, same layer, same
+    # model - and the shape check passes, because the header was written, so the
+    # cache loads with the tail of every row past the crash holding whatever was
+    # in the file. Training then reads those rows as activations. Both files go
+    # first, so a partial build is never mistaken for a complete one.
+    for _stale in (path, path + ".json"):
+        try:
+            os.remove(_stale)
+        except (FileNotFoundError, PermissionError, OSError):
+            pass
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     N = len(samples)
     arr = np.lib.format.open_memmap(path, mode="w+", dtype=np.float16, shape=(N, seq, hidden))
