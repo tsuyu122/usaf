@@ -421,7 +421,48 @@ def main(args=None):
                   router_params=router_params,
                   resume_ckpt=resume_ckpt)
 
+    # --eval-report only ever did anything together with --eval-only, so a
+    # training run accepted it, stored it, and wrote no report - the run that
+    # actually produced the weights was the one that could not report on them.
+    # Right after training is the only moment the report is worth writing.
+    if config.eval_report:
+        _write_eval_report(config, model, device)
+
     return model
+
+
+def _write_eval_report(config, model, device):
+    """Benchmark the model the way --eval-only does and save the report."""
+    from usaf.eval.benchmark import BenchmarkConfig, run_benchmark
+    from usaf.eval.report import save_report
+
+    ds_list = [d.strip() for d in config.eval_datasets.split(",") if d.strip()]
+    if not ds_list:
+        raise SystemExit(
+            "--eval-report was given but --eval-datasets is empty; there is "
+            "nothing to report on"
+        )
+
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(config.model_path)
+    except Exception as e:
+        raise SystemExit(
+            f"--eval-report needs the tokenizer for {config.model_path}: {e}"
+        )
+
+    results = run_benchmark(
+        model, tokenizer, device,
+        BenchmarkConfig(
+            datasets=ds_list,
+            max_samples=config.eval_samples,
+            seq_len=config.seq_len,
+        ),
+        model_name=config.model_path,
+    )
+    results.print()
+    # save_report prints the path itself.
+    save_report(results, config.eval_report)
 
 
 def _check_resume_path(resume_path: str) -> str:

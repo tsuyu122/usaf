@@ -208,10 +208,12 @@ Mixtral and a 4-layer Qwen3 with head_dim 8):
 
 - Training, and the loss going down.
 - All 31 arguments of the universal CLI, individually and in combination.
-  Three of them were accepted and then ignored, and now do what they say:
-  `--frozen-cache`, `--eval-every` (periodic perplexity on the evaluation split)
-  and `--log-dir` (one JSON object per step, appended, so a long run can be
-  inspected while it is still going).
+  Four of them were accepted and then ignored, and now do what they say:
+  `--frozen-cache`, `--eval-every` (periodic perplexity on the evaluation split),
+  `--log-dir` (one JSON object per step, appended, so a long run can be
+  inspected while it is still going), and `--eval-report`, which previously only
+  worked together with `--eval-only` and so could not report on the weights a
+  training run had just produced.
 - `--resume`, `--export`, `--eval-only`, `--eval-report`, `--save-every`,
   `--checkpoint-dir`, reselection and accumulation.
 - The frozen cache: the cached hidden state is compared against a fresh forward
