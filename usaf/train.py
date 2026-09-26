@@ -91,6 +91,17 @@ def build_parser():
     p.add_argument("--generate-after", type=str, default="",
                    help="Generate from this prompt after training ("" to skip); use || to separate several")
     p.add_argument("--generate-tokens", type=int, default=48)
+    p.add_argument("--prompt-prefix", type=str, default="")
+    p.add_argument(
+        "--prompt-suffix",
+        type=str,
+        default="",
+        help=(
+            "Wrap each --generate-after prompt as prefix+prompt+suffix, so the "
+            "generation prompt has the shape the dataset gave it. Empty means "
+            "the prompt is used verbatim."
+        ),
+    )
 
     p.add_argument("--no-frozen-cache", action="store_true")
     p.add_argument("--no-resident", action="store_true")
@@ -147,6 +158,11 @@ class TrainConfig:
     reselect_every: int = 50
     generate_after: str = ""
     generate_tokens: int = 48
+    # Wrap generation prompts the way the dataset wraps its user lines. None
+    # means "use the prompt verbatim", which is the old behaviour and is right
+    # for a model trained on bare text.
+    prompt_prefix: str | None = None
+    prompt_suffix: str = ""
     use_frozen_cache: bool = True
     frozen_cache_n: int = 0
     use_resident: bool = True
@@ -186,6 +202,8 @@ def parse_args(args=None) -> TrainConfig:
         seq_len=ns.seq_len,
         microbatch=ns.microbatch,
         accum=ns.accum,
+        prompt_prefix=ns.prompt_prefix or None,
+        prompt_suffix=ns.prompt_suffix,
         frac=ns.frac,
         lr_peak=ns.lr,
         weight_decay=ns.wd,
@@ -1957,7 +1975,18 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                     _prompt = _prompt.strip()
                     if not _prompt:
                         continue
-                    _inputs = tokenizer(_prompt, return_tensors="pt").to(device)
+                    # A prompt whose shape is never seen in training gets a
+                    # different distribution whatever the weights say, and the
+                    # difference reads as "it did not learn the habit". Wrapping
+                    # the prompt the way the dataset wraps it removes that as a
+                    # reason, and the model is judged on whether it produces the
+                    # habit rather than on whether it can guess a template.
+                    _text = (
+                        config.prompt_prefix + _prompt + config.prompt_suffix
+                        if config.prompt_prefix is not None
+                        else _prompt
+                    )
+                    _inputs = tokenizer(_text, return_tensors="pt").to(device)
                     with torch.no_grad():
                         _out = _gen_model.generate(
                             **_inputs,
