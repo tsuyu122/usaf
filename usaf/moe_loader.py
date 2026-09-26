@@ -258,8 +258,17 @@ class QuantizedExpertCache:
         if expert_module_name in self._cache:
             self._cache.move_to_end(expert_module_name)
             cached = self._cache[expert_module_name]
+            # requires_grad=True, not t.requires_grad. What the cache holds is
+            # the plain tensor _to_device produced, so t.requires_grad is False
+            # and the hit answered differently from both of the misses: the
+            # same expert, the same weights, asked for gradients the first time
+            # and refused them the second. Nothing raises. It just decides
+            # whether the post-accumulate hook that feeds the sparse gradient
+            # store fires, so a run captures gradients from whichever experts
+            # happened to miss and silently skips the rest, and the loss still
+            # falls because the layers that did get gradients are real layers.
             return {
-                pname: torch.nn.Parameter(t, requires_grad=t.requires_grad)
+                pname: torch.nn.Parameter(t, requires_grad=True)
                 for pname, t in cached.items()
             }
 
@@ -914,8 +923,11 @@ def setup_quantized_streaming(
     )
     if expert_pattern is None:
         expert_pattern = cache._expert_prefix.format(i="*")
-
-    torch.device("cpu")
+    # Was a bare torch.device("cpu") on its own line: it built a device and
+    # dropped it on the floor. It read like the quantized payload was being
+    # pinned to host memory, which is not what the code does - _dequant_cpu
+    # keeps it on CPU and _to_device copies it across, and that is the whole
+    # design. Left in, it reads as a step that someone depends on.
 
     n_gpu = n_cpu = 0
     bytes_gpu = bytes_cpu = 0
