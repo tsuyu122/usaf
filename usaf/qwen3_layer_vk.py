@@ -36,8 +36,8 @@ except ImportError:
     print("[WARN] usaf_vk not available, falling back to PyTorch for all ops")
 
 if HAS_VK:
-    _spirv_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "vulkan", "build", "spirv"))
-    usaf_vk.set_spirv_path(_spirv_path)
+    from usaf.vulkan_spirv import configure_spirv
+    configure_spirv(usaf_vk)
     usaf_vk.init()
 
 

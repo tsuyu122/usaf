@@ -350,7 +350,9 @@ class QuantizedExpertCache:
             sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vulkan', 'build', 'Release'))
             os.add_dll_directory(os.environ.get('VULKAN_SDK', 'C:/VulkanSDK/1.4.341.1') + '/Bin')
             import usaf_vk
-            usaf_vk.set_spirv_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vulkan', 'build', 'spirv'))
+
+            from usaf.vulkan_spirv import configure_spirv
+            configure_spirv(usaf_vk)
         except Exception as e:
             print(f"  [VK dequant] import failed: {e}", flush=True)
             return
@@ -406,7 +408,9 @@ class QuantizedExpertCache:
             sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vulkan', 'build', 'Release'))
             os.add_dll_directory(os.environ.get('VULKAN_SDK', 'C:/VulkanSDK/1.4.341.1') + '/Bin')
             import usaf_vk
-            usaf_vk.set_spirv_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vulkan', 'build', 'spirv'))
+
+            from usaf.vulkan_spirv import configure_spirv
+            configure_spirv(usaf_vk)
         except Exception:
             return
 

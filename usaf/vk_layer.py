@@ -19,8 +19,9 @@ try:
     sys.path.insert(0, _vk_path)
     os.add_dll_directory(os.path.join(_vk_sdk, 'Bin'))
     import usaf_vk
-    _spv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vulkan', 'build', 'spirv')
-    usaf_vk.set_spirv_path(_spv_path)
+
+    from usaf.vulkan_spirv import configure_spirv
+    configure_spirv(usaf_vk)
     usaf_vk.init()
     HAS_VK = True
 except Exception as e:
