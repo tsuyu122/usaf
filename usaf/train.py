@@ -1022,6 +1022,29 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             cache.evict_all()
         return loss.item()
 
+    def _do_export():
+        #"""Write the merged model."""
+        #
+        # This has to be callable from the resume path as well. A run resumed
+        # at or past its final step returns early, because there is nothing to
+        # train, and that return used to sit above this block - so "train on one
+        # machine, come back, export the merged model" produced no file and no
+        # error. Training a checkpoint and exporting it is the whole point of
+        # the second command.
+        if not config.export_path:
+            return
+        print(f"\nExporting merged weights to {config.export_path}...")
+        try:
+            from usaf.checkpoint import export_merged_weights
+            export_path = export_merged_weights(
+                config.quant_path,
+                {k: v.detach().cpu() for k, v in masters.items()},
+                {k: v.cpu() for k, v in active_idx.items()},
+                config.export_path,
+            )
+            print(f"  Exported: {export_path}")
+        except Exception as e:
+            print(f"  Export failed: {e}")
     if resume_ckpt is None:
         imp_store = TopKImportanceStore(_shapes, frac=FRAC)
         for mname, mod in model.named_modules():
@@ -1071,6 +1094,9 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         start_step = resume_ckpt.get("step", 0) + 1
         if start_step > STEPS:
             print(f"Checkpoint step {start_step-1} >= total steps {STEPS}, nothing to train")
+            # still export: coming back to a finished run to produce the
+            # merged model is the ordinary reason to resume it at all.
+            _do_export()
             return losses
 
     sparse_store = SparseGradStore(active_idx, _shapes)
@@ -1375,19 +1401,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     print(f"Skipped: {skipped}/{STEPS} steps")
     print(f"Peak RAM: {ram():.1f}GB")
 
-    if config.export_path:
-        print(f"\nExporting merged weights to {config.export_path}...")
-        try:
-            from usaf.checkpoint import export_merged_weights
-            export_path = export_merged_weights(
-                config.quant_path,
-                {k: v.detach().cpu() for k, v in masters.items()},
-                {k: v.cpu() for k, v in active_idx.items()},
-                config.export_path,
-            )
-            print(f"  Exported: {export_path}")
-        except Exception as e:
-            print(f"  Export failed: {e}")
+    _do_export()
 
     return losses
 
