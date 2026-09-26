@@ -391,6 +391,72 @@ class QuantizedExpertCache:
             self._prefetched.pop(expert_name, None)
         gc.collect()
 
+    @staticmethod
+    def _available_host_bytes() -> int:
+        """Host RAM that can be spent, leaving room for what is already held.
+
+        The quantized payload, the checkpoint and the frozen activation cache
+        are all in memory before this is called, so the number that matters is
+        what is left, not what the machine has.
+        """
+        try:
+            import os
+
+            free = None
+            if hasattr(os, "sysconf") and "SC_AVPHYS_PAGES" in os.sysconf_names:
+                free = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+            if free is None and os.name == "nt":
+                import ctypes
+
+                class _ME(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+
+                me = _ME()
+                me.dwLength = ctypes.sizeof(_ME)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(me)):
+                    free = int(me.ullAvailPhys)
+            if free is None:
+                free = 8 * 1024 ** 3
+            return int(free)
+        except Exception:
+            return 8 * 1024 ** 3
+
+    def _resident_bytes(self, train_layers, only_params=None) -> int:
+        """Bytes the dense resident set would need, without building it."""
+        total = 0
+        for li in train_layers:
+            expert_name = self._expert_prefix.format(i=li)
+            for full_name, local_name in self._expert_to_params.get(
+                    expert_name, []):
+                if only_params is not None and local_name not in only_params:
+                    continue
+                entry = self._q_dict.get(full_name)
+                if entry is None:
+                    continue
+                if isinstance(entry, dict) and "shape" in entry:
+                    shape = entry["shape"]
+                elif isinstance(entry, (tuple, list)) and len(entry) == 4:
+                    shape = entry[3]
+                elif isinstance(entry, torch.Tensor):
+                    shape = entry.shape
+                else:
+                    continue
+                n = 1
+                for s in shape:
+                    n *= int(s)
+                total += n * 2  # fp16
+        return total
+
     def make_resident(self, train_layers, dequant_batch: int = 8, only_params=None) -> None:
         """Dequantize trainable-layer experts once to fp16 CPU RAM.
 
@@ -399,7 +465,28 @@ class QuantizedExpertCache:
                          Others are streamed on-the-fly to save RAM.
         """
         self._resident_active = False
-        for li in sorted(train_layers):
+        # The resident set is the whole point: the trainable layers dequantized
+        # once into host RAM instead of being streamed on every access. On a
+        # model whose trainable layers are a large share of the experts that is
+        # several gigabytes, held for the whole run, next to the checkpoint and
+        # the quantized payload. Building it without asking whether it fits is
+        # how a run dies on the host rather than on the card, after the card had
+        # nothing to do with it. When it does not fit it is not built: the
+        # streaming path is slower and correct, and the run continues.
+        _wanted = sorted(train_layers)
+        _need = self._resident_bytes(_wanted, only_params)
+        _have = self._available_host_bytes()
+        if _need > _have:
+            short_gb = (_have - _need) / 1e9
+            msg = (
+                f"  resident set skipped: {_need / 1e9:.2f} GB of dense "
+                f"experts for {len(_wanted)} layers, {short_gb:.2f} GB of "
+                f"host RAM short. Experts stream from the quantized payload "
+                f"instead, which is slower and fits."
+            )
+            print(msg, flush=True)
+            return
+        for li in _wanted:
             expert_name = self._expert_prefix.format(i=li)
             entries = self._expert_to_params.get(expert_name)
             if not entries:
