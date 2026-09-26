@@ -220,8 +220,17 @@ Mixtral and a 4-layer Qwen3 with head_dim 8):
   of the same prefix and is bit-identical, a run with the cache and a run
   without it reach the same loss, and the cache is reused across processes
   rather than rebuilt.
-- The quantized export carries the trained values and leaves every position
-  outside the active set bit-identical to the original.
+- The quantized export carries the trained values, and leaves every position
+  outside the active set bit-identical **except in the quantization group that
+  holds it**. A group is 128 weights sharing one scale and zero point, so a
+  group containing a trained value has to re-derive that scale, and the other
+  ~127 weights in it move with it. That is inherent to per-group 4-bit
+  quantization, not something the exporter can work around. What is guaranteed:
+  the 4-bit codes and the scale/zero of every group with no trained weight in it
+  are restored byte-for-byte, so an untouched group is bit-identical to the
+  original. Measured on the 4-layer fixture, 0 of 4256 untouched groups changed
+  (this was 46777 drifted weights before the exporter learned to leave them
+  alone).
 - Every user-facing error path, each of which previously failed somewhere
   unrelated to the actual mistake. `--cuda` on a machine without an NVIDIA
   GPU now exits 1 with what torch saw and what to do instead, and does so

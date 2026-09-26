@@ -64,6 +64,9 @@ def export_merged_weights(
     q_dict: dict[str, Any] = torch.load(quant_path, map_location="cpu", weights_only=True)
 
     merged_fp16: dict[str, torch.Tensor] = {}
+    # fname -> boolean mask over quantization groups, True where a trained
+    # weight lives. Collected here and used after requantization.
+    touched_groups: dict[str, torch.Tensor] = {}
     unsupported: list[str] = []
     for fname, entry in q_dict.items():
         if isinstance(entry, dict) and "q" in entry:
@@ -105,6 +108,19 @@ def export_merged_weights(
             t_flat.scatter_(0, aidx, trained.to(t_flat.dtype))
             t = t_flat.reshape(t.shape)
 
+            _gs = group_size
+            if isinstance(entry, dict) and "group_size" in entry:
+                _gs = int(entry["group_size"])
+            elif isinstance(entry, (tuple, list)) and len(entry) == 4:
+                _gs = group_size
+            _n_groups = (t_flat.numel() + _gs - 1) // _gs
+            _m = torch.zeros(t_flat.numel(), dtype=torch.bool)
+            _m[aidx] = True
+            _pad = _n_groups * _gs - t_flat.numel()
+            if _pad:
+                _m = torch.cat([_m, torch.zeros(_pad, dtype=torch.bool)])
+            touched_groups[fname] = _m.view(_n_groups, _gs).any(dim=1)
+
         merged_fp16[fname] = t
 
     if unsupported:
@@ -120,11 +136,88 @@ def export_merged_weights(
         )
 
     merged_q4 = quantize_state_dict(merged_fp16, group_size=group_size)
+
+    # Requantizing a whole tensor recomputes every group's scale and zero, so
+    # groups the training never touched came back with slightly different
+    # dequantized values - the dequantize/requantize round trip is not exact.
+    # On the fixture that moved 8464 of 128451 untouched weights, by up to
+    # 4.3e-04, which contradicts the promise that an export leaves everything
+    # outside the active set bit-identical.
+    #
+    # A group that contains no trained weight cannot have changed, so its
+    # original q, s and z are restored verbatim. Only groups that actually
+    # hold a trained value are re-derived, because those have to be, or the
+    # training would be clamped away by the old scale.
+    merged_q4 = _restore_untouched_groups(
+        merged_q4, q_dict, merged_fp16, touched_groups, group_size
+    )
+
     parent = os.path.dirname(str(output_path))
     if parent:
         os.makedirs(parent, exist_ok=True)
     torch.save(merged_q4, output_path)
     return output_path
+
+
+def _restore_untouched_groups(
+    merged_q4: dict[str, Any],
+    original: dict[str, Any],
+    _unused: dict[str, torch.Tensor],
+    touched: dict[str, torch.Tensor],
+    default_group_size: int,
+) -> dict[str, Any]:
+    """Put back the original q/s/z for every group the training never touched.
+
+    The dequantize-then-requantize round trip is not exact, so re-deriving a
+    group nobody trained on still moves its weights. Restoring the original
+    bytes for those groups is both cheaper and more faithful.
+    """
+    for fname, mask in touched.items():
+        new_entry = merged_q4.get(fname)
+        old_entry = original.get(fname)
+
+        # The freshly quantized side is always a dict, but the file on disk
+        # may hold either shape: {"q","s","z"} or the positional (q, s, z,
+        # shape) tuple. Normalise the old side, or a checkpoint written in the
+        # tuple form silently skips the whole restoration.
+        if isinstance(old_entry, (tuple, list)) and len(old_entry) == 4:
+            old_entry = {
+                "q": old_entry[0], "s": old_entry[1],
+                "z": old_entry[2], "shape": old_entry[3],
+            }
+        if not isinstance(new_entry, dict) or not isinstance(old_entry, dict):
+            continue
+        if not ({"q", "s", "z"} <= set(new_entry) and {"q", "s", "z"} <= set(old_entry)):
+            continue
+        if mask.numel() != new_entry["s"].numel():
+            # Different group layout; leave it alone rather than guess.
+            continue
+
+        keep = (~mask.to(torch.bool))
+        if not bool(keep.any()):
+            continue
+
+        for k in ("s", "z"):
+            merged_k = new_entry[k].reshape(-1).clone()
+            merged_k[keep] = old_entry[k].reshape(-1)[keep].to(merged_k.dtype)
+            new_entry[k] = merged_k.reshape(new_entry[k].shape)
+
+        # q packs two values per byte, so a whole group is recoverable only if
+        # the group holds an even number of values. Every group_size in use is
+        # even, and when it is not we leave q alone rather than write bytes
+        # that straddle two groups.
+        gs = int(new_entry.get("group_size") or default_group_size)
+        if gs % 2 == 0:
+            bytes_per_group = gs // 2
+            nq = new_entry["q"].numel()
+            if nq == int(keep.numel()) * bytes_per_group:
+                n_groups = int(keep.numel())
+                q_new = new_entry["q"].reshape(n_groups, bytes_per_group).clone()
+                q_old = old_entry["q"].reshape(n_groups, bytes_per_group)
+                q_new[keep] = q_old[keep].to(q_new.dtype)
+                new_entry["q"] = q_new.reshape(new_entry["q"].shape)
+
+    return merged_q4
 
 
 def get_checkpoint_metadata(path: str) -> dict[str, Any]:
