@@ -737,6 +737,16 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     # Filled in once _prelude exists, just below.
     FROZEN_CACHE = None
 
+    # --log-dir was accepted and ignored. Resolve it to a concrete file once,
+    # here, and only open it per step so nothing is created for a run that is
+    # going to be interrupted before its first step finishes.
+    LOG_PATH = None
+    if config.log_dir:
+        os.makedirs(config.log_dir, exist_ok=True)
+        _tag = config.tag or "run"
+        LOG_PATH = os.path.join(config.log_dir, f"train_{_tag}.jsonl")
+        print(f"  Log: {LOG_PATH}")
+
     def _prelude(input_ids):
         hidden = embed(input_ids)
         s_len = hidden.shape[1]
@@ -788,6 +798,36 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         shift_labels = labels[:, 1:].contiguous()
         return nn.functional.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+    evals = []
+
+    @torch.no_grad()
+    def _eval_ppl(samples, max_n=6):
+        """Token-weighted perplexity over the first ``max_n`` held-out samples.
+
+        Runs a full forward rather than the training path: evaluation samples
+        are not in the frozen cache, and correctness of the reported number
+        matters more than the speed of printing it.
+        """
+        if not samples:
+            return None
+        total_loss = 0.0
+        total_tok = 0
+        for s in samples[:max_n]:
+            ids = torch.tensor(s["input_ids"], dtype=torch.long).unsqueeze(0).to(device)
+            lbl = torch.tensor(s["labels"], dtype=torch.long).unsqueeze(0).to(device)
+            h, pos, pe, mask = _prelude(ids)
+            for i in range(N_LAYERS):
+                h = layers[i](h, attention_mask=mask, position_ids=pos,
+                             position_embeddings=pe)
+            n_tok = int((lbl[:, 1:] != -100).sum().item())
+            if n_tok:
+                total_loss += _head_loss(h, lbl).item() * n_tok
+                total_tok += n_tok
+            cache.evict_all()
+        if total_tok <= 0:
+            return None
+        return math.exp(total_loss / total_tok)
 
     if resume_ckpt is None:
         imp_store = TopKImportanceStore(_shapes, frac=FRAC)
@@ -1027,6 +1067,34 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         if resume_ckpt is not None:
             log_msg += " | resumed"
         print(log_msg, flush=True)
+
+        # --eval-every was accepted and then ignored, so a run reported nothing
+        # about its own progress until the very end. On a long job that is the
+        # difference between seeing the loss go sideways at step 40 and finding
+        # out at step 400. The evaluation runs after the step has been applied,
+        # so it reflects the current weights.
+        if config.eval_every > 0 and step % config.eval_every == 0 and eval_samples:
+            print(f"  [eval {step}] running...", flush=True)
+            _pp = _eval_ppl(eval_samples)
+            if _pp is not None:
+                evals.append((step, _pp))
+                print(f"  [eval {step}] ppl={_pp:.2f}", flush=True)
+                if LOG_PATH:
+                    with open(LOG_PATH, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"step": step, "eval_ppl": round(_pp, 4)}) + "\n")
+
+        # --log-dir used to be accepted and then ignored, so a run left no
+        # machine-readable trace of what it did. One JSON object per step,
+        # appended as the run goes, so a long job can be inspected while it is
+        # still going instead of only from the final summary.
+        if LOG_PATH:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "step": step, "loss": step_loss, "lr": lr,
+                    "scale": loss_scale, "finite": finite,
+                    "sec": round(dt, 2), "ram": round(ram(), 2),
+                    "tok_s": round(tok_s, 1),
+                }) + "\n")
 
         if config.save_every > 0 and step % config.save_every == 0:
             ckpt_path = os.path.join(config.checkpoint_dir, f"sparse_step-{step}.pt")
