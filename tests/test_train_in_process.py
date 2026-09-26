@@ -48,9 +48,16 @@ def run(tmp_path_factory):
         "--log-dir", str(out / "logs"),
         "--tag", "ip",
     ]
-    # capsys is function-scoped and this fixture is module-scoped, so the run
-    # happens exactly once and the assertions read what it printed. redirect
-    # catches the prints, which is all that matters here.
+    # setup_device installs process-wide forward replacements for the Qwen3,
+    # OLMoE and Mixtral expert modules. Running the trainer in-process leaves
+    # them in place, and every test after this one then quietly runs the
+    # dense-masked forward instead of the stock one - which showed up as a
+    # dtype error in a streaming test that passes perfectly well on its own.
+    # They are taken back off again here, so this test measures the trainer
+    # and not its effect on the rest of the session.
+    from usaf.mixtral_dml import unpatch_mixtral_for_dml
+    from usaf.olmoe_dml import unpatch_olmoe_for_dml
+    from usaf.qwen3moe_dml import unpatch_qwen3moe_for_dml
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         try:
@@ -58,6 +65,10 @@ def run(tmp_path_factory):
         except SystemExit as e:
             if e.code not in (0, None):
                 raise
+        finally:
+            unpatch_qwen3moe_for_dml()
+            unpatch_olmoe_for_dml()
+            unpatch_mixtral_for_dml()
     return buf.getvalue(), out
 
 

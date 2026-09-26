@@ -111,9 +111,27 @@ def dml_mixtral_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Te
     return final.view(batch_size, sequence_length, hidden_dim)
 
 
-def patch_mixtral_for_dml():
-    """Applies DML-safe forwards (affects all model instances)."""
+def unpatch_mixtral_for_dml():
+    """Put the original Mixtral forwards back; see patch_qwen3moe_for_dml."""
     from transformers.models.mixtral import modeling_mixtral
+    for cls in (modeling_mixtral.MixtralExperts,
+                modeling_mixtral.MixtralSparseMoeBlock):
+        if getattr(cls, "_usaf_original", None):
+            cls.forward = cls._usaf_original
+            del cls._usaf_original
+    return modeling_mixtral
+
+
+def patch_mixtral_for_dml():
+    """Applies DML-safe forwards (affects all model instances).
+
+    The originals are kept so unpatch_mixtral_for_dml() can restore them.
+    """
+    from transformers.models.mixtral import modeling_mixtral
+    for cls in (modeling_mixtral.MixtralExperts,
+                modeling_mixtral.MixtralSparseMoeBlock):
+        if not hasattr(cls, "_usaf_original"):
+            cls._usaf_original = cls.forward
     modeling_mixtral.MixtralExperts.forward = dml_mixtral_experts_forward
     modeling_mixtral.MixtralSparseMoeBlock.forward = dml_mixtral_moe_block_forward
     return modeling_mixtral

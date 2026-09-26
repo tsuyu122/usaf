@@ -102,9 +102,39 @@ def dml_qwen3_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tens
     return final.view(batch_size, sequence_length, hidden_dim)
 
 
-def patch_qwen3moe_for_dml():
-    """Applies DML-safe forwards (affects all model instances)."""
+def unpatch_qwen3moe_for_dml():
+    """Put the original Qwen3-MoE forwards back.
+
+    The patch is a process-wide assignment, and until now there was no way to
+    take it back. That is not only untidy: a test suite that runs the trainer
+    in-process leaves every later test running the dense-masked forward, which
+    silently changes what those tests are testing. A replacement you cannot
+    reverse is a replacement you cannot scope.
+    """
     from transformers.models.qwen3_moe import modeling_qwen3_moe
+    if getattr(modeling_qwen3_moe.Qwen3MoeExperts, "_usaf_original", None):
+        modeling_qwen3_moe.Qwen3MoeExperts.forward = (
+            modeling_qwen3_moe.Qwen3MoeExperts._usaf_original)
+        del modeling_qwen3_moe.Qwen3MoeExperts._usaf_original
+    if getattr(modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "_usaf_original",
+               None):
+        modeling_qwen3_moe.Qwen3MoeSparseMoeBlock.forward = (
+            modeling_qwen3_moe.Qwen3MoeSparseMoeBlock._usaf_original)
+        del modeling_qwen3_moe.Qwen3MoeSparseMoeBlock._usaf_original
+    return modeling_qwen3_moe
+
+
+def patch_qwen3moe_for_dml():
+    """Applies DML-safe forwards (affects all model instances).
+
+    The originals are kept so unpatch_qwen3moe_for_dml() can restore them.
+    Patching twice keeps the first original rather than this function.
+    """
+    from transformers.models.qwen3_moe import modeling_qwen3_moe
+    for cls in (modeling_qwen3_moe.Qwen3MoeExperts,
+                modeling_qwen3_moe.Qwen3MoeSparseMoeBlock):
+        if not hasattr(cls, "_usaf_original"):
+            cls._usaf_original = cls.forward
     modeling_qwen3_moe.Qwen3MoeExperts.forward = dml_qwen3_experts_forward
     modeling_qwen3_moe.Qwen3MoeSparseMoeBlock.forward = dml_qwen3_moe_block_forward
     return modeling_qwen3_moe

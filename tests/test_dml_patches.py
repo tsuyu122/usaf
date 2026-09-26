@@ -18,6 +18,21 @@ import types
 import pytest
 import torch
 
+
+@pytest.fixture(autouse=True)
+def _leave_the_patches_off():
+    """These tests swap a class attribute and put it back themselves, which is
+    enough until a test fails partway: the process is then left with the DML
+    forward installed and every later test runs it unknowingly. Cleaned up
+    here rather than in the test body, so it holds when the body raises."""
+    from usaf.mixtral_dml import unpatch_mixtral_for_dml
+    from usaf.olmoe_dml import unpatch_olmoe_for_dml
+    from usaf.qwen3moe_dml import unpatch_qwen3moe_for_dml
+    yield
+    unpatch_qwen3moe_for_dml()
+    unpatch_olmoe_for_dml()
+    unpatch_mixtral_for_dml()
+
 FAMILIES = [
     ("qwen3moe_dml", "dml_qwen3_experts_forward",
      "transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeExperts"),
@@ -56,15 +71,33 @@ def _routing(n_tokens, n_experts, top_k, seed=0):
 
 
 @pytest.mark.parametrize("module,fn,realmod,cls", FAMILIES)
-def test_dml_patch_signature_matches_the_real_forward(module, fn, realmod, cls):
+def test_dml_patch_accepts_everything_the_real_forward_is_called_with(
+        module, fn, realmod, cls):
+    """The caller passes three positional arguments; the patch must take them.
+
+    This used to compare the patch against whatever cls.forward happened to be
+    at the time, which - because the trainer runs in-process and installs the
+    patch globally - was the patch itself. The check was comparing the function
+    with itself and could not fail.
+
+    Equality is also the wrong bar. The Qwen3 patch accepts an extra
+    keyword-only dense_weights that stock does not have, which is harmless:
+    the block calls self.experts(hidden, selected_experts, routing_weights) and
+    never passes it. What has to hold is that the parameters the caller
+    actually uses are all accepted, in the same positions.
+    """
     import importlib
     import inspect
 
     patch = getattr(importlib.import_module("usaf." + module), fn)
     real = getattr(importlib.import_module(realmod), cls)
-    assert list(inspect.signature(patch).parameters) == list(
-        inspect.signature(real.forward).parameters
-    )
+    stock = getattr(real, "_usaf_original", None) or real.forward
+    assert stock is not patch, (
+        "the comparison is against the patch itself - the test is vacuous")
+    want = list(inspect.signature(stock).parameters)
+    got = list(inspect.signature(patch).parameters)
+    assert got[:len(want)] == want, (
+        f"stock is called with {want}, the patch offers {got}")
 
 
 @pytest.mark.parametrize("module,fn,realmod,cls", FAMILIES)

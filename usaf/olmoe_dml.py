@@ -72,9 +72,27 @@ def dml_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     return final.view(batch_size, sequence_length, hidden_dim)
 
 
-def patch_olmoe_for_dml():
-    """Applies DML-safe forwards (affects all model instances)."""
+def unpatch_olmoe_for_dml():
+    """Put the original OLMoE forwards back; see patch_qwen3moe_for_dml."""
     from transformers.models.olmoe import modeling_olmoe
+    for cls in (modeling_olmoe.OlmoeExperts,
+                modeling_olmoe.OlmoeSparseMoeBlock):
+        if getattr(cls, "_usaf_original", None):
+            cls.forward = cls._usaf_original
+            del cls._usaf_original
+    return modeling_olmoe
+
+
+def patch_olmoe_for_dml():
+    """Applies DML-safe forwards (affects all model instances).
+
+    The originals are kept so unpatch_olmoe_for_dml() can restore them.
+    """
+    from transformers.models.olmoe import modeling_olmoe
+    for cls in (modeling_olmoe.OlmoeExperts,
+                modeling_olmoe.OlmoeSparseMoeBlock):
+        if not hasattr(cls, "_usaf_original"):
+            cls._usaf_original = cls.forward
     modeling_olmoe.OlmoeExperts.forward = dml_experts_forward
     modeling_olmoe.OlmoeSparseMoeBlock.forward = dml_moe_block_forward
     return modeling_olmoe
