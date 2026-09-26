@@ -1872,8 +1872,15 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                             do_sample=False,
                             temperature=None,
                             top_p=None,
-                            pad_token_id=tokenizer.pad_token_id
-                            or tokenizer.eos_token_id,
+                            # pad_token_id 0 is a real id, not a missing one.
+                            # `or` treated it as absent and filled with eos
+                            # instead, which for a tokenizer that uses 0 is
+                            # the one value the model has certainly seen.
+                            pad_token_id=(
+                                tokenizer.pad_token_id
+                                if tokenizer.pad_token_id is not None
+                                else tokenizer.eos_token_id
+                            ),
                         )
                     _new = _out[0][_inputs["input_ids"].shape[1]:]
                     print()

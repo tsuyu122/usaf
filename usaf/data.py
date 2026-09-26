@@ -85,6 +85,20 @@ def read_file_content(filepath: str, deduplicate_lines: bool = True) -> str:
     return content
 
 
+def _pad_id(tokenizer) -> int:
+    """The id to pad input_ids with, 0 when the tokenizer has none.
+
+    Written out rather than as `tokenizer.pad_token_id or 0`. That expression
+    happens to give the right answer here - 0 or 0 is 0, and None or 0 is 0 -
+    but the same pattern in train.py's generate call was a real bug: with
+    pad_token_id 0 the `or` fell through to eos_token_id, and 0 is a perfectly
+    ordinary pad id. Padding the inputs with the wrong id is the kind of thing
+    that only shows up in a run big enough to have real padding.
+    """
+    pid = getattr(tokenizer, "pad_token_id", None)
+    return 0 if pid is None else pid
+
+
 def tokenize_text(
     text: str,
     tokenizer: AutoTokenizer,
@@ -124,7 +138,7 @@ def tokenize_text(
         # padding, and the reported loss was diluted by positions that carry no
         # information. In a C++ corpus most files are under 2048 tokens, so this
         # was the common case rather than the edge one.
-        chunk = chunk + [tokenizer.pad_token_id or 0] * pad_len
+        chunk = chunk + [_pad_id(tokenizer)] * pad_len
         labels = input_ids[:context_length] + [-100] * pad_len
         yield {"input_ids": chunk, "labels": labels}
 
