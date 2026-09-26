@@ -95,10 +95,18 @@ def main():
                     f"parameter ({p.numel()} elements) - the checkpoint does "
                     f"not belong to this model"
                 )
-            original_shape = p.shape
             with torch.no_grad():
-                p.data.copy_(p.data.reshape(-1).scatter(0, aidx, trained))
-            p.data = p.data.reshape(original_shape)
+                # reshape(-1) is only a view when the parameter is contiguous.
+                # On a non-contiguous one it silently copies, and the
+                # in-place scatter would be written to that throwaway copy
+                # and lost. The previous copy_(reshape(-1).scatter(...))
+                # instead raised a shape mismatch on every expert tensor.
+                flat = p.data.reshape(-1)
+                if flat.data_ptr() != p.data.data_ptr():
+                    updated = flat.scatter(0, aidx, trained).reshape(p.shape)
+                    p.data = updated
+                else:
+                    flat.scatter_(0, aidx, trained)
             applied += 1
         if missing:
             raise KeyError(

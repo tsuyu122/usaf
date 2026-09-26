@@ -71,3 +71,55 @@ def test_compute_perplexity_raises_instead_of_reporting_perfect_ppl():
     with pytest.raises(RuntimeError, match="no tokens were scored"):
         compute_perplexity(_Silent(), _Tok(), ["a", "b"], torch.device("cpu"),
                            verbose=False)
+
+def _merge_like_eval_cli(param, aidx, trained):
+    """Mirror the merge in usaf/eval_cli.py::main exactly.
+
+    Used to pin the two failure modes seen there: copy_() of a 1-D scatter
+    result into a multi-dimensional parameter, and an in-place scatter into a
+    reshape that silently copied because the parameter was not contiguous.
+    """
+    with torch.no_grad():
+        flat = param.data.reshape(-1)
+        if flat.data_ptr() != param.data.data_ptr():
+            param.data = flat.scatter(0, aidx, trained).reshape(param.shape)
+        else:
+            flat.scatter_(0, aidx, trained)
+
+
+def test_eval_cli_merge_writes_into_a_multidimensional_parameter():
+    p = torch.nn.Parameter(torch.zeros(4, 8, 16))
+    aidx = torch.tensor([0, 100, 511])
+    trained = torch.tensor([5.0, 6.0, 7.0])
+    _merge_like_eval_cli(p, aidx, trained)
+    flat = p.data.reshape(-1)
+    assert float(flat[0]) == 5.0
+    assert float(flat[100]) == 6.0
+    assert float(flat[511]) == 7.0
+    assert p.shape == (4, 8, 16), "the parameter must keep its original shape"
+
+
+def test_eval_cli_merge_survives_a_non_contiguous_parameter():
+    """A transposed parameter makes reshape(-1) return a copy, so an in-place
+    scatter would be written to a throwaway tensor and silently lost.
+    """
+    base = torch.zeros(8, 4)
+    p = torch.nn.Parameter(base.t())  # non-contiguous view
+    assert not p.data.is_contiguous()
+    aidx = torch.tensor([1, 20])
+
+    _merge_like_eval_cli(p, aidx, torch.tensor([3.0, 4.0]))
+    flat = p.data.reshape(-1)
+    assert float(flat[1]) == 3.0
+    assert float(flat[20]) == 4.0
+
+
+def test_eval_cli_merge_leaves_untouched_positions_alone():
+    p = torch.nn.Parameter(torch.arange(32, dtype=torch.float32))
+    before = p.data.clone()
+    _merge_like_eval_cli(p, torch.tensor([5, 9]), torch.tensor([100.0, 200.0]))
+    # The positions already held 5 and 9, so the deltas are 100-5 and 200-9.
+    assert float(p.data[5]) == 100.0
+    assert float(p.data[9]) == 200.0
+    diff = (p.data - before).abs()
+    assert int((diff > 0).sum()) == 2, "only the active positions may change"
