@@ -32,6 +32,19 @@ def build_parser():
                    help="Path to save JSON report")
     p.add_argument("--compare", type=str, default="",
                    help="Previous report JSON to compare against")
+
+    # Perplexity says how well a model predicts text it was never shown; it
+    # cannot show whether a fine-tune changed what the model says. That is the
+    # only question a person asking whether a fine-tune did anything actually
+    # has, and the answer has to be readable without a number. generate_sample
+    # existed in the evaluator and nothing in the CLI reached it.
+    p.add_argument("--prompt", type=str, default="",
+                   help="Generate from this prompt and print the result")
+    p.add_argument("--max-new-tokens", type=int, default=64)
+    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--seed", type=int, default=0,
+                   help="Seed the generator so two runs are comparable")
+    return p
     return p
 
 
@@ -125,6 +138,33 @@ def main():
         print("ERROR: --model is required with --checkpoint")
         return
 
+    # Generation first, and on its own terms: a fine-tune that changes what the
+    # model says is demonstrated by what it says, and a perplexity number read
+    # afterwards buries it. Two runs with the same --seed and the same --prompt
+    # are directly comparable, which is the point.
+    if ns.prompt:
+        if model is None:
+            print("ERROR: --prompt needs --model so there is a model to sample")
+            return
+        if tokenizer is None:
+            print("ERROR: --prompt needs a tokenizer; the model has none")
+            return
+        import random
+        random.seed(ns.seed)
+        torch.manual_seed(ns.seed)
+        from .evaluate import Evaluator
+        ev = Evaluator(model=model, tokenizer=tokenizer, device=device)
+        print()
+        print("=" * 60)
+        print(f"PROMPT: {ns.prompt}")
+        print("-" * 60)
+        text = ev.generate_sample(
+            ns.prompt, max_new_tokens=ns.max_new_tokens,
+            temperature=ns.temperature,
+        )
+        print(text)
+        print("=" * 60)
+        print()
     ds_list = [d.strip() for d in ns.datasets.split(",") if d.strip()]
     cfg = BenchmarkConfig(
         datasets=ds_list,
