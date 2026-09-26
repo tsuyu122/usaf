@@ -337,10 +337,11 @@ def main(args=None):
     lm_head = base.lm_head
 
     resume_ckpt = None
-    if config.resume_path and os.path.exists(config.resume_path):
-        print(f"Resuming from checkpoint: {config.resume_path}")
+    resume_path = _check_resume_path(config.resume_path)
+    if resume_path:
+        print(f"Resuming from checkpoint: {resume_path}")
         from usaf.checkpoint import load_sparse_checkpoint
-        resume_ckpt = load_sparse_checkpoint(config.resume_path)
+        resume_ckpt = load_sparse_checkpoint(resume_path)
         print(f"  Resumed at step {resume_ckpt.get('step', 0)}, "
               f"{len(resume_ckpt.get('losses', []))} logged losses")
 
@@ -408,6 +409,29 @@ def main(args=None):
                   resume_ckpt=resume_ckpt)
 
     return model
+
+
+def _check_resume_path(resume_path: str) -> str:
+    """Validate an explicit --resume path, or return None when unused.
+
+    The path used to be guarded by os.path.exists, so a typo silently started a
+    fresh run from step zero and exited 0. On a long run that is hours of GPU
+    time discarded, and the log still read "Starting training..." as if
+    nothing were wrong.
+    """
+    if not resume_path:
+        return None
+    if os.path.isdir(resume_path):
+        raise SystemExit(
+            f"--resume takes a checkpoint file, not a directory: {resume_path}"
+        )
+    if not os.path.exists(resume_path):
+        raise SystemExit(
+            f"checkpoint not found: {resume_path}\n"
+            f"  Checkpoints are written to --checkpoint-dir as "
+            f"sparse_step-N.pt. Refusing to start from scratch."
+        )
+    return resume_path
 
 
 def _resolve_quant_path(quant_path: str, model_name: str) -> str:

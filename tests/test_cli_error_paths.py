@@ -104,6 +104,31 @@ def test_train_from_zero_trains_everything():
     assert get_trainable_layers(_cfg(4), 0) == {0, 1, 2, 3}
 
 
+def test_resume_from_a_missing_checkpoint_is_refused(tmp_path):
+    # A typo in --resume used to start a fresh run from step zero and exit 0,
+    # which on a long run is hours of GPU time thrown away.
+    from usaf.train import _check_resume_path
+
+    with pytest.raises(SystemExit, match="checkpoint not found"):
+        _check_resume_path(str(tmp_path / "sparse_step-99.pt"))
+
+
+def test_resume_from_a_directory_is_refused(tmp_path):
+    from usaf.train import _check_resume_path
+
+    with pytest.raises(SystemExit, match="not a directory"):
+        _check_resume_path(str(tmp_path))
+
+
+def test_resume_accepts_an_existing_file_and_no_path(tmp_path):
+    from usaf.train import _check_resume_path
+
+    assert _check_resume_path("") is None
+    p = tmp_path / "sparse_step-2.pt"
+    p.write_bytes(b"")
+    assert _check_resume_path(str(p)) == str(p)
+
+
 def test_missing_quantized_weights_says_so(tmp_path):
     with pytest.raises(SystemExit, match="quantized weights not found"):
         _resolve_quant_path(str(tmp_path / "no.pt"), "m")
