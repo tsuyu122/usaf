@@ -308,8 +308,26 @@ def main(args=None):
     # setup_device first, then announce. Announcing first meant a run that died
     # a line later still left "Backend: CUDA" as the last thing on screen,
     # claiming a backend it never got to use.
+    #
+    # And the label is read off the device that came back, not off the flag
+    # that was asked for. Deriving it from config.use_cuda claimed DirectML on
+    # every non-CUDA run, including the ones where importing DirectML failed
+    # and the device was the CPU - the same overclaim, one level down, and the
+    # reason a run on the wrong backend is not obvious from the log. When
+    # DirectML was asked for and is not there, that is said outright rather than
+    # blended into a slash-separated label nobody can read as either thing.
     device, n_gpus, scaler = setup_device(config)
-    print(f"\nBackend: {'CUDA' if config.use_cuda else 'DirectML/CPU'}")
+    _t = device.type
+    if _t == "cuda":
+        _backend = "CUDA"
+    elif _t == "privateuseone":
+        _backend = "DirectML"
+    else:
+        _backend = _t.upper()
+    if not config.use_cuda and _backend == "CPU":
+        print("\nBackend: CPU (DirectML was tried and is not available here)")
+    else:
+        print(f"\nBackend: {_backend}")
 
     if config.use_multi_gpu and n_gpus > 1 and config.use_cuda:
         # Do not claim a split that cannot happen. The forward loop below walks
