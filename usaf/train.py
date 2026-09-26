@@ -319,8 +319,16 @@ def main(args=None):
     print(f"Steps: {config.steps}, Batch: {config.microbatch}Ã—{config.accum}={eff_batch}")
     print(f"Tokens: {config.steps * eff_batch * config.seq_len:,}")
 
+    # The whole model path, not its last segment.
+    #
+    # split on forward slash strips a directory on Linux and does nothing at
+    # all on Windows, where the separator is a backslash. So the full path
+    # reached the resolver here, the bare name reached it on Kaggle, and the
+    # difference only ever showed up on the platform nobody develops on.
+    # Resolving beside the model directory is the contract, and handing the
+    # function a basename throws away exactly what it needs to do that.
     config.quant_path = _resolve_quant_path(
-        config.quant_path, config.model_path.split("/")[-1]
+        config.quant_path, config.model_path
     )
     print(f"Q4 weights: {config.quant_path}")
 

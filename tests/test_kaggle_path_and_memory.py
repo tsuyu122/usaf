@@ -47,13 +47,23 @@ def test_the_quantizer_and_the_trainer_agree_about_where_q4_lives(tmp_path):
     produced = sub / "m-q4" / "experts_q4.pt"
     assert produced.exists(), log[-400:]
 
+    # A forward-slash path, on purpose.
+    #
+    # The call site used to strip the directory with split("/")[-1]. That is a
+    # no-op on Windows, where the separator is a backslash, and strips the
+    # directory on Linux - so a backslash path could not tell the broken code
+    # from the fixed code, and this test passed against the broken one. A
+    # forward-slash path fails here exactly the way it fails on Kaggle.
+    rel = os.path.relpath(model, E2E).replace(os.sep, "/")
+    assert "/" in rel, rel
+
     t = subprocess.run(
         [
             sys.executable,
             "-m",
             "usaf.train",
             "--model",
-            str(model),
+            rel,
             "--dataset",
             "data.jsonl",
             "--seq-len",
