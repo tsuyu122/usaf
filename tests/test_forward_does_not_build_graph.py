@@ -1,7 +1,6 @@
 import ast
 from pathlib import Path
 
-
 TRAIN = Path(__file__).resolve().parents[1] / "usaf" / "train.py"
 
 

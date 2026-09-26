@@ -1,7 +1,7 @@
 import torch
 
+import usaf.moe_loader as ml_loader  # noqa: N812
 from usaf.moe_loader import QuantizedExpertCache
-import usaf.moe_loader as ML
 
 
 def _cache(max_cached=2):
@@ -22,7 +22,7 @@ def test_the_pinned_host_cache_is_bounded_across_a_whole_model_walk():
 def test_mutation_unbounded_pinned_cache_is_caught(monkeypatch):
     # The same walk against a cache whose bound was removed. If this passes,
     # the assertion above is not pinning anything.
-    monkeypatch.setattr(ML.QuantizedExpertCache, "_max_pinned", 10**9,
+    monkeypatch.setattr(ml_loader.QuantizedExpertCache, "_max_pinned", 10**9,
                         raising=False)
     c = _cache(max_cached=2)
     c._max_pinned = 10**9

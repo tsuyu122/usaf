@@ -8,7 +8,6 @@ would simply accumulate nothing, select nothing, and the run would train on an
 empty set of weights and report a plausible loss the whole way. So this runs
 the trainer and checks the selection is non-empty and the right size.
 """
-import json
 import os
 import re
 import subprocess
@@ -63,7 +62,7 @@ def test_the_importance_pass_selects_a_non_empty_set(run):
     assert active > 0, "importance selected nothing: " + m.group(0)
     assert total > 0
     frac = active / total
-    assert 0.03 < frac < 0.07, "expected about 5%%, got %.4f" % frac
+    assert 0.03 < frac < 0.07, f"expected about 5%, got {frac:.4f}"
 
 
 def test_the_importance_pass_reports_a_finite_loss(run):
@@ -71,5 +70,5 @@ def test_the_importance_pass_reports_a_finite_loss(run):
     assert losses, "the importance pass printed no loss:\n" + run[-2500:]
     for v in losses:
         f = float(v)
-        assert f == f and f < 1e4, "importance loss is not finite: %s" % v
+        assert f == f and f < 1e4, f"importance loss is not finite: {v}"
 

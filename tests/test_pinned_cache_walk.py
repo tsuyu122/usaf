@@ -36,8 +36,7 @@ def test_walking_every_expert_does_not_pin_all_of_them(q_dict):
     for mod in _modules(q_dict):
         cache.get_expert_weights(mod)
         cache.evict_all()
-    msg = "%d pinned entries for a bound of %d" % (
-        len(cache._pinned), cache._max_pinned)
+    msg = f"{len(cache._pinned)} pinned entries for a bound of {cache._max_pinned}"
     assert len(cache._pinned) <= cache._max_pinned, msg
 
 
