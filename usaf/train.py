@@ -1529,6 +1529,14 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             print(f"  imp {imp_i+1}/{N_IMP} | loss {loss_imp:.4f} | {time.time()-t0:.0f}s")
 
         active_idx = imp_store.select(FRAC)
+        # Release the candidates now that they have been ranked. The store keeps
+        # cand_mult times the budget for every expert slice of every tensor, and
+        # for ZAYA that is 805M values in float32 plus the same number of int64
+        # indices: 9.66 GB, held for the rest of the run by a local that nothing
+        # else refers to. The first ZAYA run with a real active set was killed
+        # by the OOM killer at the step-50 reselect with 20.1 GB already used and
+        # this 9.66 GB sitting unused beside it.
+        imp_store.zero_()
         # A run that selects nothing is a run that trains no experts, and every
         # other signal in it says otherwise: the architecture prints, the
         # quantiser writes the tensors, the loss falls, the kernel reports
@@ -1685,6 +1693,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
 
         fwd_bwd_imp(train_samples[0])
         new_idx = _imp.select(FRAC)
+        _imp.zero_()
         del _imp
 
         _new_active = {}
@@ -1692,17 +1701,23 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         _kept_n = _dropped_n = _grown_n = 0
 
         for fname, old in active_idx.items():
-            old_set = set(old.reshape(-1).tolist())
             nw = new_idx.get(fname)
             if nw is None or nw.numel() == 0:
                 _new_active[fname] = old.clone()
                 _new_masters[fname] = masters[fname]
                 continue
-            nw_set = set(nw.reshape(-1).tolist())
-            kept = sorted(old_set & nw_set)
-            candidates = sorted(nw_set - old_set)
-            fill = max(0, len(old_set) - len(kept))
-            final = torch.tensor(kept + candidates[:fill], dtype=torch.long)
+            # Set arithmetic in Python over a 110M-parameter active set. Each
+            # tensor holds millions of indices, and a set of Python ints costs
+            # tens of bytes apiece, so the intersection and both sorted lists
+            # were hundreds of megabytes per tensor and minutes of wall clock.
+            # The same three operations are one unique and two searchsorted.
+            _old_uniq = old.reshape(-1).to(torch.long).unique()
+            _nw_uniq = nw.reshape(-1).to(torch.long).unique()
+            _is_kept = torch.isin(_nw_uniq, _old_uniq)
+            kept_idx = _nw_uniq[_is_kept]
+            grown_idx = _nw_uniq[~_is_kept]
+            fill = max(0, _old_uniq.numel() - kept_idx.numel())
+            final = torch.cat([kept_idx, grown_idx[:fill]])
             _new_active[fname] = final
 
             _old_vals = masters[fname].data.float()
