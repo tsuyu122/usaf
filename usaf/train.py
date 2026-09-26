@@ -304,7 +304,24 @@ def main(args=None):
     print(f"\nBackend: {'CUDA' if config.use_cuda else 'DirectML/CPU'}")
 
     if config.use_multi_gpu and n_gpus > 1 and config.use_cuda:
-        print(f"Multi-GPU: DataParallel across {n_gpus} GPUs")
+        # Do not claim a split that cannot happen. The forward loop below walks
+        # layers[i](...) on submodules taken off model.module, never model(...),
+        # and DataParallel only scatters when its own forward is called. The
+        # wrapper is therefore never entered: every microbatch runs entirely on
+        # device 0 and the second card sits idle. Two GPUs reported as
+        # DataParallel and running on one is the worst kind of wrong here - it
+        # costs nothing to notice and it makes a 2x machine look like a 1x one
+        # in every timing.
+        #
+        # The sparse path also rules out a quick fix: experts are injected by
+        # per-layer pre-hooks and the backward is threaded one layer at a time,
+        # so there is no single call for DataParallel to scatter. Making this
+        # real means sharding layers across devices, which is a redesign rather
+        # than a flag.
+        print(f"GPUs visible: {n_gpus} - forward on device 0 only, "
+              f"the sparse path bypasses DataParallel")
+    else:
+        print("GPUs used: 1")
 
     print(f"\nDataset: {config.dataset_path}")
     train_samples, eval_samples, heldout_samples = _load_dataset(
@@ -996,15 +1013,64 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
                     # "The size of tensor a (8) must match tensor b (128)".
                     _inv = _rebuild_inv_freq(mod, cfg, _lt).to(device=device)
                     mod._buffers[bn] = _inv
-                    # These stacks also keep a per-type attention scaling next
-                    # to the buffer. Rebuilding only the frequencies left the
-                    # scaling at whatever the meta init had, so the rebuilt
-                    # module would still be missing the attribute forward reads
-                    # by name.
-                    if _lt and f"{_lt}_original_inv_freq" in mod._buffers:
-                        mod._buffers[f"{_lt}_original_inv_freq"] = _inv.clone()
 
+    # transformers keeps a clone of the frequencies next to the primary one,
+    # with or without a layer-type prefix, and dynamic/linear rope reads it. It
+    # is a copy, so it is filled from the primary rather than rebuilt. This runs
+    # over every module rather than inside the loop above, because the bare
+    # name is exactly the case where no primary was rebuilt to nest it in.
+    # Stripping the suffix off the bare name leaves nothing, so its primary is
+    # simply inv_freq; a per-type name keeps its type in front.
+    for _mn2, _mod2 in model.named_modules():
+        for _bn2, _b2 in list(_mod2._buffers.items()):
+            if _bn2 != "original_inv_freq" and not _bn2.endswith("_original_inv_freq"):
+                continue
+            if _b2 is None or _b2.device.type != "meta":
+                continue
+            _base = _bn2[: -len("_original_inv_freq")]
+            _prim = (_base + "_inv_freq") if _base else "inv_freq"
+            _src = _mod2._buffers.get(_prim)
+            if _src is not None and _src.device.type != "meta":
+                _mod2._buffers[_bn2] = _src.clone()
     print(f"  {n_loaded} non-expert params loaded")
+
+
+    # Anything still on meta at this point is a tensor the model was built with
+    # and nothing ever filled in: not in the checkpoint, not an expert, and not
+    # one of the RoPE buffers repaired above. The first forward then reaches it,
+    # does arithmetic against a real tensor, and dies hundreds of lines later
+    # with "Tensor on device meta is not on the expected device", which names
+    # neither the tensor nor the module. ZAYA1-8B did exactly that on a Kaggle
+    # T4, after a completely normal-looking load. Checking here costs one walk
+    # and turns an obscure crash into a list of names.
+    #
+    # Expert tensors are excluded on purpose. They are cleared from the modules
+    # below and refilled from the quantized cache by forward pre-hooks, so
+    # finding them on meta is the design, not a defect.
+    def _is_expert(_name):
+        return any(_name == _em or _name.startswith(_em + ".") for _em in _expert_modules)
+
+    still_meta = [
+        n for n, p in model.named_parameters()
+        if p is not None and p.device.type == "meta" and not _is_expert(n)
+    ]
+    for _n, _m in model.named_modules():
+        for _bn, _b in list(_m._buffers.items()):
+            if _b is not None and _b.device.type == "meta" and not _is_expert(_n):
+                still_meta.append(_n + "." + _bn)
+        for _pn, _p in list(_m._parameters.items()):
+            if _p is not None and _p.device.type == "meta" and not _is_expert(_n):
+                still_meta.append(_n + "." + _pn)
+    if still_meta:
+        uniq = sorted(set(still_meta))
+        raise SystemExit(
+            f"{len(uniq)} tensors are still on the meta device after loading, so the"
+            " first forward will fail:\n  " + "\n  ".join(uniq[:12])
+            + (f"\n  ... and {len(uniq) - 12} more" if len(uniq) > 12 else "")
+            + f"\n\nThey are not in {config.model_path} and are not expert weights,"
+            " so nothing in the load path can fill them. This architecture has"
+            " tensors USAF does not materialise."
+        )
 
     q_dict = torch.load(config.quant_path, map_location="cpu", weights_only=True)
     _validate_quant_weights(q_dict, _expert_shapes(model, _expert_modules), config.quant_path)
