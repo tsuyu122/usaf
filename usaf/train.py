@@ -1529,6 +1529,25 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             print(f"  imp {imp_i+1}/{N_IMP} | loss {loss_imp:.4f} | {time.time()-t0:.0f}s")
 
         active_idx = imp_store.select(FRAC)
+        # A run that selects nothing is a run that trains no experts, and every
+        # other signal in it says otherwise: the architecture prints, the
+        # quantiser writes the tensors, the loss falls, the kernel reports
+        # Complete. ZAYA was trained for an hour that way. The reason is always
+        # the same - the capture lives inside the patched expert forward, and a
+        # model whose expert container nothing patched runs the stock forward,
+        # which has no hook. Patching one family at a time cannot keep up with
+        # that; refusing to continue can.
+        if not active_idx:
+            _n_mods = len(_expert_modules_by_name(model, _expert_modules))
+            raise SystemExit(
+                f"the importance pass captured nothing, so no expert weight "
+                f"would be trained. {_n_mods} expert modules were found at "
+                f"{sorted(_expert_modules)[:2]}, and the sparse-gradient hooks "
+                f"that would have filled them run inside the replaced expert "
+                f"forward - so this model's expert container is not one USAF "
+                f"patches. The loss would still fall, on the non-expert "
+                f"parameters alone."
+            )
         ta = sum(i.numel() for i in active_idx.values())
         te = sum(math.prod(_shapes[fn]) for fn in active_idx if fn in _shapes)
         print(f"Active: {ta:,}/{te:,} ({100*ta/max(te,1):.4f}%)")
