@@ -91,6 +91,15 @@ def tokenize_text(
     context_length: int = 2048,
     overlap: int = 128,
 ):
+    # A stride of zero or less means the overlap is at least the whole window,
+    # and range() rejects a zero step with a message about the argument rather
+    # than about the overlap that caused it.
+    if overlap >= context_length:
+        raise ValueError(
+            f"overlap ({overlap}) has to be smaller than context_length "
+            f"({context_length}); otherwise consecutive chunks would start "
+            "at or before the previous one and none of them would advance"
+        )
     stride = context_length - overlap
     encoding = tokenizer(
         text,
@@ -103,12 +112,21 @@ def tokenize_text(
     for start in range(0, len(input_ids) - context_length + 1, stride):
         chunk = input_ids[start : start + context_length]
         chunks_yielded += 1
-        yield {"input_ids": chunk, "labels": chunk}
+        yield {"input_ids": chunk, "labels": list(chunk)}
     if len(input_ids) > 0 and chunks_yielded == 0:
         chunk = input_ids[:context_length]
         pad_len = context_length - len(chunk)
+        # -100 in the labels, not pad_token_id. The trainer counts
+        # labels != -100 to decide which positions count toward the loss and
+        # the evaluator does the same, so padding written into the labels as
+        # pad_token_id is not ignored - it is a target. Every source file
+        # shorter than the context window was training the model to predict
+        # padding, and the reported loss was diluted by positions that carry no
+        # information. In a C++ corpus most files are under 2048 tokens, so this
+        # was the common case rather than the edge one.
         chunk = chunk + [tokenizer.pad_token_id or 0] * pad_len
-        yield {"input_ids": chunk, "labels": chunk}
+        labels = input_ids[:context_length] + [-100] * pad_len
+        yield {"input_ids": chunk, "labels": labels}
 
 
 def preprocess_dataset(
