@@ -1,0 +1,2 @@
+[console_scripts]
+usaf = usaf.train:main
