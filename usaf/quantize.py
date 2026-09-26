@@ -25,41 +25,86 @@ from usaf.model_factory import detect_model, get_param_patterns
 from usaf.quantization import quantize_state_dict
 
 
-def collect_expert_tensors(model_path: str, names: list[str]) -> dict:
-    """Read exactly the named tensors out of the safetensors shards.
+def collect_expert_tensors(cfg) -> dict:
+    """Read the expert tensors, in whichever layout the checkpoint uses.
 
-    Only those are loaded. A 30B checkpoint is mostly experts, but the
-    embeddings and attention are big enough that reading everything would be
-    a multi-gigabyte allocation for tensors that are thrown away immediately.
+    Two layouts exist and they are not interchangeable.
+
+    A checkpoint written by save_pretrained stores one tensor per expert:
+    experts.0.gate_proj.weight, experts.0.up_proj.weight,
+    experts.0.down_proj.weight, and so on for every expert in every layer. The
+    same model, once from_pretrained has run, holds two stacked 3-D parameters
+    per layer instead: gate_up_proj of shape (E, 2*inter, hidden) and down_proj
+    of shape (E, hidden, inter). transformers fuses the pair on load and writes
+    the pair separately on save, so the file on disk and the live model
+    deliberately disagree.
+
+    USAF wants the stacked form, so reading the stacked keys alone finds
+    nothing in a checkpoint that transformers itself just wrote. The stacking
+    rule is not a guess: gate_up_proj is exactly stack(cat(gate_e, up_e)),
+    verified against from_pretrained at zero difference, and the reverse order
+    is off by 1.3e-1 - the two projections are genuinely different tensors, so
+    a zero difference here is evidence rather than coincidence.
     """
-    shards = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    names = [n for li in sorted(get_param_patterns(cfg))
+             for n in get_param_patterns(cfg)[li]]
+
+    shards = sorted(glob.glob(os.path.join(cfg.model_path, '*.safetensors')))
     if not shards:
         raise SystemExit(
-            f'no *.safetensors in {model_path}'
+            f'no *.safetensors in {cfg.model_path}'
             '  A from_config directory has none. Point --model at a model '
             '  that actually has weights.'
         )
 
-    want = set(names)
-    found = {}
-    for shard in shards:
-        from safetensors import safe_open
+    def read(keys):
+        out = {}
+        for shard in shards:
+            from safetensors import safe_open
 
-        with safe_open(shard, framework='pt') as sf:
-            for key in sf.keys():
-                if key in want and key not in found:
-                    found[key] = sf.get_tensor(key)
-        if len(found) == len(want):
-            break
+            with safe_open(shard, framework='pt') as sf:
+                for k in keys:
+                    if k not in out and k in sf.keys():
+                        out[k] = sf.get_tensor(k)
+            if len(out) == len(keys):
+                break
+        return out
 
-    missing = sorted(want - set(found))
-    if missing:
-        raise SystemExit(
-            f'the checkpoint is missing {len(missing)} of {len(want)} '
-            f'expert tensors. First few: {missing[:3]}'
-            '  The experts are not named the way the config reports them.'
+    found = read(names)
+    if len(found) == len(names):
+        return found
+
+    # Per-expert layout: rebuild the stacked tensors the trainer expects.
+    patterns = get_param_patterns(cfg)
+    n_experts = cfg.num_experts
+    parts = {}
+    for li, prefixes in patterns.items():
+        pre = cfg.expert_prefix.format(i=li)
+        gates = [f'{pre}.{e}.gate_proj.weight' for e in range(n_experts)]
+        ups = [f'{pre}.{e}.up_proj.weight' for e in range(n_experts)]
+        downs = [f'{pre}.{e}.down_proj.weight' for e in range(n_experts)]
+        g = read(gates)
+        u = read(ups)
+        d = read(downs)
+        if len(g) != n_experts or len(u) != n_experts:
+            raise SystemExit(
+                f'cannot find the expert weights of layer {li} in either the '
+                f'stacked or the per-expert layout. Tried '
+                f'{prefixes[0]} and {gates[0]}'
+            )
+        parts[f'{pre}.gate_up_proj'] = torch.stack(
+            [torch.cat([g[f'{pre}.{e}.gate_proj.weight'],
+                        u[f'{pre}.{e}.up_proj.weight']], dim=0)
+             for e in range(n_experts)]
         )
-    return found
+        parts[f'{pre}.down_proj'] = torch.stack(
+            [d[f'{pre}.{e}.down_proj.weight'] for e in range(n_experts)]
+        )
+
+    if not parts:
+        raise SystemExit('no expert weights found in ' + cfg.model_path)
+    return parts
+
 
 
 def main(argv=None) -> int:
@@ -108,7 +153,7 @@ def main(argv=None) -> int:
         f'(group_size {args.group_size})'
     )
 
-    tensors = collect_expert_tensors(model_path, names)
+    tensors = collect_expert_tensors(cfg)
     params = sum(t.numel() for t in tensors.values())
     print(f'  {params:,} elements, {params * 2 / 1e9:.2f} GB fp16', flush=True)
 
