@@ -25,7 +25,7 @@ from usaf.model_factory import detect_model, get_param_patterns
 from usaf.quantization import quantize_state_dict
 
 
-def collect_expert_tensors(cfg) -> dict:
+def collect_expert_tensors(cfg, patterns=None) -> dict:
     """Read the expert tensors, in whichever layout the checkpoint uses.
 
     Two layouts exist and they are not interchangeable.
@@ -46,8 +46,15 @@ def collect_expert_tensors(cfg) -> dict:
     is off by 1.3e-1 - the two projections are genuinely different tensors, so
     a zero difference here is evidence rather than coincidence.
     """
-    names = [n for li in sorted(get_param_patterns(cfg))
-             for n in get_param_patterns(cfg)[li]]
+    # patterns is the caller's layer selection. It used to be recomputed here
+    # from cfg every time, so --layers narrowed the list this function
+    # reported and then quantized every layer anyway: the tool printed
+    # "quantizing 2 expert tensors" and wrote eight. On a model large enough
+    # to need --layers, that is the difference between fitting and running the
+    # host out of memory, and the flag reported success while doing nothing.
+    if patterns is None:
+        patterns = get_param_patterns(cfg)
+    names = [n for li in sorted(patterns) for n in patterns[li]]
 
     shards = sorted(glob.glob(os.path.join(cfg.model_path, '*.safetensors')))
     if not shards:
@@ -75,7 +82,6 @@ def collect_expert_tensors(cfg) -> dict:
         return found
 
     # Per-expert layout: rebuild the stacked tensors the trainer expects.
-    patterns = get_param_patterns(cfg)
     n_experts = cfg.num_experts
     parts = {}
     for li, prefixes in patterns.items():
@@ -153,7 +159,7 @@ def main(argv=None) -> int:
         f'(group_size {args.group_size})'
     )
 
-    tensors = collect_expert_tensors(cfg)
+    tensors = collect_expert_tensors(cfg, patterns=patterns)
     params = sum(t.numel() for t in tensors.values())
     print(f'  {params:,} elements, {params * 2 / 1e9:.2f} GB fp16', flush=True)
 
