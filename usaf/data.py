@@ -215,11 +215,20 @@ def create_dataloader(
     dataset: Dataset,
     batch_size: int = 1,
     shuffle: bool = True,
+    drop_last: bool = True,
 ) -> DataLoader:
+    """Batches a dataset into collated tensors of one fixed shape.
+
+    ``drop_last`` defaults to True, which discards up to ``batch_size - 1``
+    samples at the end of every pass. On a dataset that is not an exact multiple
+    of the batch size that is silent data loss - 8 samples with batch_size 3
+    trains on 6 - and the caller had no way to turn it off. Pass False for a
+    short dataset; the short final batch is collated like any other.
+    """
     return DataLoader(
         CppDataset(dataset),
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn,
-        drop_last=True,
+        drop_last=drop_last,
     )
