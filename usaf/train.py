@@ -262,13 +262,26 @@ def setup_device(config: TrainConfig) -> tuple[torch.device, int, object]:
             torch.backends.cudnn.allow_tf32 = True
             print("  AMP (manual loss scaling) + cuDNN benchmark + TF32 enabled")
     else:
+        # DirectML is tried first on a machine with no CUDA, which is the
+        # intended fallback order. What is not acceptable is importing it
+        # unguarded: a torch/directml mismatch fails inside the Windows
+        # loader, and under faulthandler - which pytest turns on - that kills
+        # the interpreter with STATUS_ENTRYPOINT_NOT_FOUND and no Python
+        # exception, so `except ImportError` below never got to run and the
+        # whole suite died here. has_dml() imports through the guarded loader
+        # in usaf.utils, so an unusable install is known before anything native
+        # is touched. Exception rather than ImportError for the same reason:
+        # a backend that cannot start should degrade to CPU, not end the run.
+        device = torch.device("cpu")
         try:
-            import torch_directml_native
+            from usaf.utils import get_dml_device, has_dml
 
-            from usaf.utils import get_dml_device
-            torch_directml_native.disable_tiled_resources(True)
-            device = get_dml_device()
-        except ImportError:
+            if has_dml():
+                import torch_directml_native
+
+                torch_directml_native.disable_tiled_resources(True)
+                device = get_dml_device()
+        except Exception:  # noqa: BLE001 - never fatal, fall back to CPU
             device = torch.device("cpu")
         n_gpus = 1
         scaler = None

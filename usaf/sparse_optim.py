@@ -130,7 +130,17 @@ class SparseAdam:
                 param.data.add_(delta)
             else:
                 idx_dev = self._device_idx(name, param)
-                flat = param.data.reshape(-1)
+                # contiguous(), not reshape(-1): reshape copies when the
+                # tensor is not contiguous, and the scatter_ that follows then
+                # writes the Adam delta into a temporary. The parameter comes
+                # out bit-identical - no error, no warning - while the router
+                # params still move, so the loss still falls. contiguous()
+                # keeps the shape (an expert is [E, H, I], and flattening the
+                # adopted copy would feed a 1-D weight to the next forward) and
+                # makes the view() below a guaranteed view rather than a copy.
+                if not param.data.is_contiguous():
+                    param.data = param.data.contiguous()
+                flat = param.data.view(-1)
                 flat.scatter_(0, idx_dev, flat.gather(0, idx_dev) + delta)
 
     def refresh(self, model) -> None:

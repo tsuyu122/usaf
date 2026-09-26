@@ -2,18 +2,91 @@ from typing import Any
 
 import torch
 
-try:
-    import torch_directml
-    HAS_DML = True
-except ImportError:
-    HAS_DML = False
-    torch_directml = None
+# torch_directml is imported here no more. A torch/directml mismatch fails in
+# the Windows loader, not in Python: ImportError is raised from a DLL that
+# does not have the entry point, and when faulthandler is active - which it is
+# under pytest, and under python -X faulthandler - the process dies there with
+# a native STATUS_ENTRYPOINT_NOT_FOUND and no Python-level error at all. It
+# did that to the test suite on a machine where nothing was going to use
+# DirectML: importing usaf was enough. The import now happens only where a DML
+# device is actually asked for.
+_dml_module = None
+_dml_reason = ""
+_dml_checked = False
+
+
+def _declared_torch_requirement() -> str:
+    """The torch pin torch-directml declares, or "" when it declares none."""
+    try:
+        from importlib.metadata import PackageNotFoundError, requires
+
+        for req in requires("torch-directml") or []:
+            name, _, spec = req.partition("==")
+            if name.strip().lower() == "torch" and spec:
+                return spec.strip()
+    except (PackageNotFoundError, Exception):  # noqa: BLE001 - best effort
+        return ""
+    return ""
+
+
+def _dml():
+    """Import torch_directml on first use. Returns None when it cannot load.
+
+    The version pin is checked before the import, and that is the part that
+    matters. torch-directml is a compiled extension pinned to one exact torch
+    build; a mismatch fails inside the Windows loader, and the resulting
+    ImportError is raised while faulthandler is unwinding a native frame - so
+    it can take the whole interpreter down with STATUS_ENTRYPOINT_NOT_FOUND
+    and no Python traceback, and `except ImportError` never gets to run. Here
+    torch-directml 0.2.5.dev240914 wants torch==2.4.1 against an installed
+    2.13.0, which is knowable from the metadata alone, with no native load.
+    """
+    global _dml_module, _dml_reason, _dml_checked
+    if _dml_checked:
+        return _dml_module
+    _dml_checked = True
+
+    want = _declared_torch_requirement()
+    if want:
+        have = torch.__version__.split("+")[0]
+        # Compare the numeric prefix only: 2.4.1 vs 2.4.1+cu121 is a match.
+        have_num = ".".join(have.split(".")[: len(want.split("."))])
+        if have_num != want:
+            _dml_module = None
+            _dml_reason = (
+                f"torch-directml needs torch=={want}, installed {have}"
+            )
+            return None
+
+    try:
+        import torch_directml as _mod
+
+        _dml_module = _mod
+    except Exception as e:  # noqa: BLE001 - a broken install must not be fatal
+        _dml_module = None
+        _dml_reason = str(e) or type(e).__name__
+    return _dml_module
+
+
+def dml_unavailable_reason() -> str:
+    """Why DirectML cannot be used, or "" when it can."""
+    _dml()
+    return _dml_reason
+
+
+def has_dml() -> bool:
+    """Whether DirectML can be loaded, without raising."""
+    return _dml() is not None
 
 
 def get_dml_device(device_id: int = 0) -> torch.device:
-    if not HAS_DML:
-        raise RuntimeError("torch-directml not installed. Use CUDA or CPU instead.")
-    return torch_directml.device(device_id)
+    mod = _dml()
+    if mod is None:
+        why = dml_unavailable_reason() or "not installed"
+        raise RuntimeError(
+            f"DirectML is unavailable: {why}. Use CUDA or CPU instead."
+        )
+    return mod.device(device_id)
 
 
 def load_model_to_dml(model: torch.nn.Module, device: torch.device) -> torch.nn.Module:
