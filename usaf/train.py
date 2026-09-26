@@ -526,6 +526,34 @@ def _apply_resume_overlays(resume_ckpt: dict, cache) -> dict[str, torch.Tensor]:
         cache.overlays[fname] = (active_idx[fname].reshape(-1).to(torch.long), p)
     return active_idx
 
+def _expert_modules_by_name(model, expert_modules):
+    """Map expert module name to module, looking through a DataParallel wrapper.
+
+    nn.DataParallel keeps the model as .module and prefixes every name it
+    reports with "module.". Enumerating the wrapper therefore finds none of the
+    expert modules, and the sparse-gradient hooks that are installed by name
+    silently never get installed: the run trains nothing, the loss sits near
+    ln(vocab), and the run still reports Complete. The wrapper shares the module
+    objects, so unwrapping changes which names are looked up and nothing else -
+    the attributes land on the same modules the forward pass uses.
+
+    The count is checked because the failure mode is silence. A model whose
+    experts are named differently from what detect_model reports has the same
+    shape of problem, and a run that quietly learns nothing is worse than one
+    that stops.
+    """
+    root = model.module if isinstance(model, nn.DataParallel) else model
+    found = {n: m for n, m in root.named_modules() if n in expert_modules}
+    if len(found) != len(expert_modules):
+        missing = sorted(expert_modules - set(found))
+        raise SystemExit(
+            "no expert modules found: " + str(len(found)) + " of "
+            + str(len(expert_modules)) + " matched under "
+            + type(model).__name__ + ". First missing: " + str(missing[:3])
+        )
+    return found
+
+
 def _expert_shapes(model, expert_modules: set[str]) -> dict[str, tuple]:
     """The expert tensors the model actually has, before anything clears them.
 
@@ -1066,9 +1094,8 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             print(f"  Export failed: {e}")
     if resume_ckpt is None:
         imp_store = TopKImportanceStore(_shapes, frac=FRAC)
-        for mname, mod in model.named_modules():
-            if mname not in _expert_modules:
-                continue
+        for mname, mod in _expert_modules_by_name(
+                model, _expert_modules).items():
             mod._grad_capture = (imp_store, mname)
 
         print("Importance phase...")
@@ -1119,9 +1146,8 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             return losses
 
     sparse_store = SparseGradStore(active_idx, _shapes)
-    for mname, mod in model.named_modules():
-        if mname not in _expert_modules:
-            continue
+    for mname, mod in _expert_modules_by_name(
+            model, _expert_modules).items():
         mod._grad_capture = (sparse_store, mname)
 
     if USE_RESIDENT and resume_ckpt is None:
@@ -1212,9 +1238,9 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         print(f"  [reselect step {_step}] dense importance pass...", flush=True)
 
         _imp = TopKImportanceStore(_shapes, frac=FRAC)
-        for _m, _mod in model.named_modules():
-            if _m in _expert_modules:
-                _mod._grad_capture = (_imp, _m)
+        for _m, _mod in _expert_modules_by_name(
+                model, _expert_modules).items():
+            _mod._grad_capture = (_imp, _m)
 
         fwd_bwd_imp(train_samples[0])
         new_idx = _imp.select(FRAC)
@@ -1273,9 +1299,9 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         active_idx = _new_active
         masters = _new_masters
         sparse_store = SparseGradStore(active_idx, _shapes)
-        for _m, _mod in model.named_modules():
-            if _m in _expert_modules:
-                _mod._grad_capture = (sparse_store, _m)
+        for _m, _mod in _expert_modules_by_name(
+                model, _expert_modules).items():
+            _mod._grad_capture = (sparse_store, _m)
 
         cache.overlays.clear()
         for fname, aidx in active_idx.items():
