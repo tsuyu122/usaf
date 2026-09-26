@@ -6,8 +6,17 @@ DML "partially modified dimensions" errors by using dense masked computation.
 import torch
 import torch.nn.functional as F
 
+from usaf.utils import dense_router_weights
 
-def dml_experts_forward(self, hidden_states: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+
+def dml_experts_forward(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor | None = None,
+    top_k_weights: torch.Tensor | None = None,
+    *,
+    dense_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Dense-masked experts forward. weights: [N, E] (router weight, 0 outside top-k).
 
     CRITICAL (fp16 overflow): Each expert computes output for ALL tokens and
@@ -19,6 +28,13 @@ def dml_experts_forward(self, hidden_states: torch.Tensor, weights: torch.Tensor
     """
     hs32 = hidden_states.float()
     final = torch.zeros_like(hs32)
+    if dense_weights is not None:
+        weights = dense_weights
+    else:
+        weights = dense_router_weights(
+            top_k_index, top_k_weights, self.num_experts,
+            skip_index=getattr(self, "num_experts", None),
+        )
     weights_t = weights.t().contiguous()
 
     for expert_idx in range(self.num_experts):
@@ -52,7 +68,7 @@ def dml_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
     weights = weights.to(hidden_states.dtype)
 
-    final = self.experts(hs, weights)
+    final = self.experts(hs, dense_weights=weights)
     return final.view(batch_size, sequence_length, hidden_dim)
 
 

@@ -19,9 +19,17 @@ so the parameter names produced by quantize_4bit are identical.
 import torch
 import torch.nn.functional as F
 
+from usaf.utils import dense_router_weights
 
-def dml_mixtral_experts_forward(self, hidden_states: torch.Tensor,
-                                weights: torch.Tensor) -> torch.Tensor:
+
+def dml_mixtral_experts_forward(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor | None = None,
+    top_k_weights: torch.Tensor | None = None,
+    *,
+    dense_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Dense-masked expert loop over detached per-expert 2D slices.
 
     Runs the expert math in fp32: each expert computes an output for every
@@ -31,6 +39,13 @@ def dml_mixtral_experts_forward(self, hidden_states: torch.Tensor,
     """
     hs32 = hidden_states.float()
     final = torch.zeros_like(hs32)
+    if dense_weights is not None:
+        weights = dense_weights
+    else:
+        weights = dense_router_weights(
+            top_k_index, top_k_weights, self.num_experts,
+            skip_index=getattr(self, "num_experts", None),
+        )
     weights_t = weights.t().contiguous()
     gup, dwn = self.gate_up_proj, self.down_proj
 
@@ -92,7 +107,7 @@ def dml_mixtral_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Te
     weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
     weights = weights.to(hidden_states.dtype)
 
-    final = self.experts(hs, weights)
+    final = self.experts(hs, dense_weights=weights)
     return final.view(batch_size, sequence_length, hidden_dim)
 
 

@@ -98,3 +98,37 @@ def estimate_optimizer_memory(num_active_params: int, dtype: torch.dtype = torch
 
 def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+
+def dense_router_weights(
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    num_experts: int,
+    skip_index: int | None = None,
+) -> torch.Tensor:
+    """Expand a top-k routing decision into a dense [tokens, experts] mask.
+
+    transformers >= 4.53 hands the expert container two tensors -
+    ``top_k_index`` [N, k] and ``top_k_weights`` [N, k] - instead of the single
+    pre-combined weight matrix that the DirectML expert loops were written
+    against. They were therefore called with three positional arguments and
+    declared two, so every DirectML run died with a TypeError on the first
+    expert forward.
+
+    ``skip_index`` is the "no expert" slot some routers reserve as one past
+    the last expert. A token routed there contributes nothing rather than
+    indexing a nonexistent expert.
+    """
+    n_tokens = top_k_index.shape[0]
+    out = torch.zeros(
+        n_tokens,
+        num_experts,
+        dtype=top_k_weights.dtype,
+        device=top_k_weights.device,
+    )
+    if skip_index is not None:
+        top_k_weights = top_k_weights.masked_fill(
+            top_k_index == skip_index, 0.0
+        )
+    out.scatter_(1, top_k_index.clamp(max=num_experts - 1), top_k_weights)
+    return out
