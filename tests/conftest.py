@@ -24,7 +24,9 @@ def _no_dml_patch_survives_a_test():
     from usaf.mixtral_dml import unpatch_mixtral_for_dml
     from usaf.olmoe_dml import unpatch_olmoe_for_dml
     from usaf.qwen3moe_dml import unpatch_qwen3moe_for_dml
+    from usaf.zaya_dml import unpatch_zaya_for_dml
 
     unpatch_qwen3moe_for_dml()
     unpatch_olmoe_for_dml()
     unpatch_mixtral_for_dml()
+    unpatch_zaya_for_dml()

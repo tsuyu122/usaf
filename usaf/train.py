@@ -225,9 +225,16 @@ def setup_device(config: TrainConfig) -> tuple[torch.device, int, object]:
     from usaf.mixtral_dml import patch_mixtral_for_dml
     from usaf.olmoe_dml import patch_olmoe_for_dml
     from usaf.qwen3moe_dml import patch_qwen3moe_for_dml
+    from usaf.zaya_dml import patch_zaya_for_dml
+
     patch_qwen3moe_for_dml()
     patch_olmoe_for_dml()
     patch_mixtral_for_dml()
+    # ZAYA defines its own ZayaExperts, with no inheritance from Qwen3MoeExperts,
+    # so the three patches above do not reach it. Without this the sparse capture
+    # never fires, select() returns nothing, and the run trains only the
+    # non-expert parameters with the loss falling throughout.
+    patch_zaya_for_dml()
 
     if config.use_cuda:
         # An assert, not a check: python -O strips asserts entirely, so under -O
