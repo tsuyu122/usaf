@@ -1,4 +1,5 @@
 """Auto-detect MoE architecture from any HuggingFace model config."""
+import os
 from dataclasses import dataclass, field
 
 
@@ -41,7 +42,23 @@ def detect_model(model_path: str, vram_gb: float = 0, system_ram_gb: float = 0) 
     """
     from transformers import AutoConfig
 
-    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    # A path that does not exist used to surface as whatever HuggingFace raised
+    # for the string it was handed: "OSError: Repo id must use alphanumeric
+    # chars, '-', '_' or '.'" - which says nothing about the missing
+    # directory, and never mentions the path the user typed.
+    looks_local = os.path.sep in model_path or (os.path.altsep or "") in model_path
+    if looks_local and not os.path.isdir(model_path):
+        raise SystemExit(f"model directory not found: {model_path}")
+
+    try:
+        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    except Exception as e:
+        if looks_local and not os.path.exists(os.path.join(model_path, "config.json")):
+            raise SystemExit(
+                f"{model_path} has no config.json; that is not a model directory "
+                f"(original error: {type(e).__name__}: {e})"
+            ) from e
+        raise
 
     config = MoEConfig(
         model_path=model_path,
@@ -149,8 +166,22 @@ def _auto_configure_training(config: MoEConfig, vram_gb: float, system_ram_gb: f
 
 
 def get_trainable_layers(config: MoEConfig, custom_train_from: int | None = None) -> set[int]:
-    """Get the set of trainable layer indices."""
+    """Get the set of trainable layer indices.
+
+    An empty result used to reach the caller and blow up as "min() arg is an
+    empty sequence" while formatting a progress line. A train-from past the end
+    of the model trains nothing, which is always a mistake, so say so here.
+    """
     start = custom_train_from if custom_train_from is not None else config.train_from
+    if start < 0:
+        raise SystemExit(f"train-from must not be negative, got {start}")
+    if start >= config.num_layers:
+        raise SystemExit(
+            f"train-from={start} is past the last layer: the model has "
+            f"{config.num_layers} layers (0..{config.num_layers - 1}), so nothing "
+            f"would be trained. Lower it to at most "
+            f"{config.num_layers - 1}."
+        )
     return set(range(start, config.num_layers))
 
 

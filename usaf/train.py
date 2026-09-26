@@ -411,21 +411,59 @@ def main(args=None):
 
 
 def _load_dataset(path: str, seq_len: int):
-    """Load a JSONL dataset of tokenized sequences."""
+    """Load a JSONL dataset of tokenized sequences.
+
+    Every way this can go wrong used to surface somewhere else entirely: a
+    missing file was treated the same as an empty one, malformed lines were
+    dropped without a word, and rows whose input_ids was not a list raised
+    "TypeError: object of type str has no len()". An empty result then produced
+    "ZeroDivisionError: integer modulo by zero" from the progress bar several
+    hundred lines later. Each failure is now reported where it happens.
+    """
     import random as _random
+
+    if not os.path.exists(path):
+        raise SystemExit(f"dataset not found: {path}")
+
     samples = []
-    if os.path.exists(path):
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    s = json.loads(line)
-                    if "input_ids" in s and len(s["input_ids"]) == seq_len:
-                        samples.append(s)
-                except json.JSONDecodeError:
-                    continue
+    bad_json = 0
+    wrong_len = 0
+    malformed = 0
+    with open(path, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                s = json.loads(line)
+            except json.JSONDecodeError:
+                bad_json += 1
+                if bad_json <= 3:
+                    print(f"  {path}:{lineno}: not valid JSON, skipping")
+                continue
+            ids = s.get("input_ids") if isinstance(s, dict) else None
+            if not isinstance(ids, list):
+                malformed += 1
+                if malformed <= 3:
+                    print(f"  {path}:{lineno}: input_ids is not a list, skipping")
+                continue
+            if len(ids) != seq_len:
+                wrong_len += 1
+                continue
+            samples.append(s)
+
+    if bad_json > 3:
+        print(f"  {path}: {bad_json} unparseable lines in total")
+    if malformed > 3:
+        print(f"  {path}: {malformed} lines without a list of input_ids in total")
+
+    if not samples:
+        raise SystemExit(
+            f"no usable sample in {path}: {len(samples)} of the lines are exactly "
+            f"{seq_len} token ids. Fix --seq-len, or regenerate the dataset."
+        )
+    if wrong_len:
+        print(f"  {wrong_len} line(s) skipped: not exactly {seq_len} tokens")
 
     _random.seed(42)
     _random.shuffle(samples)
