@@ -23,6 +23,11 @@ class ImportanceScorer:
         # Parameters that received no gradient in the last compute_scores()
         # call, and were therefore left out of the returned scores.
         self.unobserved: list[str] = []
+        # How many batches the last compute_scores() actually scored, and how
+        # many it dropped. A pass that dropped any is not comparable with a full
+        # one, and the caller has to be able to see that.
+        self.batches_scored: int = 0
+        self.batches_skipped: int = 0
 
     def compute_scores(
         self,
@@ -41,6 +46,7 @@ class ImportanceScorer:
 
         import time as _time
         batches_processed = 0
+        skipped = 0
         consecutive_skips = 0
         MAX_CONSECUTIVE_SKIPS = 20
         total = max_batches if max_batches > 0 else len(dataloader)
@@ -88,6 +94,7 @@ class ImportanceScorer:
             except RuntimeError as e:
                 if "memory" in str(e).lower() or "allocate" in str(e).lower():
                     consecutive_skips += 1
+                    skipped += 1
                     print(f"\n[skip] OOM skipping batch: {str(e)[:60]}")
                     if consecutive_skips >= MAX_CONSECUTIVE_SKIPS:
                         print(f"  {MAX_CONSECUTIVE_SKIPS} consecutive OOMs, aborting scoring "
@@ -125,6 +132,22 @@ class ImportanceScorer:
                 "scored nothing (every batch OOMed or the model has no "
                 "trainable parameters)"
             )
+
+        # A pass that dropped batches still returns scores, and a caller ranking
+        # on them cannot tell those scores from a complete pass. The surviving
+        # batches are a biased subset - usually the early ones, which for a
+        # sequential loader is one dataset order and no shuffling - so the
+        # ranking it produces is a different ranking, and a RigL reselection
+        # driven by it quietly keeps a different set of experts. Twenty
+        # consecutive out-of-memory aborts and the message is still just a
+        # count. How many were used is recorded here so a caller can refuse it.
+        self.batches_scored = batches_processed
+        self.batches_skipped = skipped
+        if skipped:
+            print(f"  importance: scored on {batches_processed} of "
+                  f"{batches_processed + skipped} batches; {skipped} were "
+                  f"dropped and the ranking is not comparable with a full "
+                  f"pass", flush=True)
 
         return scores
 

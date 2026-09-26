@@ -119,7 +119,11 @@ class QuantizedExpertCache:
         self._expert_prefix = expert_prefix
 
         self._cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
-        self._pinned: dict[str, torch.Tensor] | None = None
+        # Pinned host copies, keyed by (expert module name, parameter name).
+        # Bounded: a whole model walk would otherwise pin every expert once and
+        # never release any of it.
+        self._pinned: dict[tuple[str, str], torch.Tensor] = {}
+        self._max_pinned: int = max(8, self._max_cached * 8)
 
         self.overlays: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -210,8 +214,6 @@ class QuantizedExpertCache:
         A host that refuses to pin falls back to a plain copy rather than
         failing the run - only the speed is lost.
         """
-        if self._pinned is None:
-            self._pinned = {}
         pinned = self._pinned
         dev = self._device
         out: dict[str, torch.Tensor] = {}
@@ -226,6 +228,16 @@ class QuantizedExpertCache:
                         pass
                 pinned[ckey] = t
                 src = t
+                # Pinned host memory was growing once per expert for the whole
+                # run and nothing ever released it. Pinned memory is unpageable
+                # and unevictable, so a whole model walk ends up holding a full
+                # second copy of the quantized weights that the host cannot
+                # reclaim, on a host that also has to hold the checkpoint and
+                # the model being trained. It is now bounded by the same LRU as
+                # the GPU cache, and the key is the module plus the parameter
+                # name, so evicting an expert releases both.
+                while len(pinned) > self._max_pinned:
+                    pinned.pop(next(iter(pinned)))
             out[k] = src.to(dev, non_blocking=True)
         return out
     def get_expert_weights(self, expert_module_name: str) -> dict[str, torch.nn.Parameter]:

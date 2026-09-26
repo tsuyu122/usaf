@@ -368,6 +368,31 @@ def main(args=None):
     #
     # A shrink that cannot save memory never will, so at one layer the loop stops
     # and reports rather than grinding.
+    def _memory_report(dev):
+        """What the device held when it ran out, in one line.
+
+        An out-of-memory retry only helps when the trainable layers were what
+        filled the card. When they are not, the retry shrinks the model, fails
+        again for exactly the same reason, and the run ends reporting that no
+        memory error explained it while every single attempt was one. These
+        numbers are the difference between those two cases being told apart.
+        """
+        try:
+            if dev.type == "cuda":
+                free_b, total_b = torch.cuda.mem_get_info(dev)
+                used = (total_b - free_b) / 1e9
+                peak = torch.cuda.max_memory_allocated(dev) / 1e9
+                held = torch.cuda.max_memory_reserved(dev) / 1e9
+                return (
+                    f"; card {used:.2f} GB of {total_b / 1e9:.2f} in use, "
+                    f"peak allocated {peak:.2f} GB, peak reserved {held:.2f} GB"
+                )
+            if dev.type == "cpu":
+                return "; host RAM in use"
+        except Exception:
+            return ""
+        return ""
+
     def _load_and_run(_layers):
         print(f"\nLoading model... (trainable: {len(_layers)} layers)")
         _model, _cache, _q_dict, _wf, _st, _router, _model_cfg = _load_model(
@@ -464,12 +489,25 @@ def main(args=None):
 
     _layers_now = list(train_layers)
     model = None
+    _attempt_sizes: list[int] = []
+    _why = ""
     for _attempt in range(1, 6):
+        _attempt_sizes.append(len(_layers_now))
         try:
             model = _load_and_run(_layers_now)
             break
         except torch.OutOfMemoryError as _oom:
             _why = str(_oom).splitlines()[0] if _oom.args else ""
+            # What the card actually held when it gave up. Retrying with fewer
+            # layers only helps if the trainable layers were what filled it, and
+            # on a model where they are not, four retries at a few milliseconds
+            # apart is a way of learning nothing: the run shrinks to a handful of
+            # layers, still fails for the same reason, and reports that no memory
+            # error explained it while every attempt was one. The numbers say
+            # which side failed.
+            _mem = _memory_report(device)
+            if _mem:
+                _why = _why + _mem
             # The model, the expert cache and the quantized dict are locals of
             # _load_and_run, so they go away with that frame and gc.collect()
             # has nothing to find. An earlier version tried to clear them out of
@@ -491,7 +529,16 @@ def main(args=None):
                   f"Retrying with the top {_keep}.", flush=True)
             _layers_now = _layers_now[-_keep:]
     if model is None:
-        raise SystemExit("Training did not complete and no memory error explained it.")
+        # Every attempt above raised OutOfMemoryError, so saying no memory error
+        # explained it denies the only thing that is known. The first attempt
+        # failed for whatever reason, and every later one failed with less model
+        # in it and no better outcome, which is the signature of a peak that the
+        # trainable layers are not responsible for.
+        raise SystemExit(
+            "Out of memory on every attempt, with the layer count going "
+            f"{_attempt_sizes} and ending at {len(_layers_now)}. "
+            f"Last error: {_why}"
+        )
 
     # --eval-report only ever did anything together with --eval-only, so a
     # training run accepted it, stored it, and wrote no report - the run that
