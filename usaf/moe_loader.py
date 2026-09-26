@@ -119,6 +119,7 @@ class QuantizedExpertCache:
         self._expert_prefix = expert_prefix
 
         self._cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
+        self._pinned: dict[str, torch.Tensor] | None = None
 
         self.overlays: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -174,6 +175,59 @@ class QuantizedExpertCache:
             if len(forms) == 1:
                 self._expert_prefix = forms.pop()
 
+    def _to_device(self, module_name: str,
+                  cpu_params: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Move a module's dequantized params to the device, pinned and async.
+
+        Every call used to be a fresh t.to(device) per parameter, out of
+        pageable host memory. A pageable source forces the driver to stage the
+        data through an internal bounce buffer and the copy is synchronous: the
+        host waits for it to land before it can issue anything else. This runs
+        once per trainable layer per microbatch, and twice over per layer,
+        because the backward replays a layer the forward already ran under
+        no_grad.
+
+        Pinning the host tensor the first time it is seen lets the DMA engine
+        read it directly, with no staging, and is what makes non_blocking mean
+        anything. The pinned buffer is kept so the cost is paid once per
+        parameter rather than once per layer.
+
+        The cache is keyed by module AND parameter name, never by the parameter
+        name alone. Every layer of the stack has a "gate_up_proj" of exactly
+        the same shape, so keying on the name returns whichever layer was pinned
+        first and hands it to whichever layer asks next. The existing test for
+        interleaved lookups fails on that with layer 3's weights in layer 0's
+        hands, and it would have been a silent wrong-numbers bug on hardware
+        where the shapes happen to agree, which is to say on every real model.
+
+        What this deliberately does NOT do is copy into a reused device buffer.
+        The same aliasing argument applies there, with worse consequences:
+        overwriting the previous layer's weights in place, while a graph may
+        still read them. A fresh allocation is the only version of this that
+        cannot be wrong, and the fragmentation it causes is handled by the layer
+        budget and the out-of-memory retry instead.
+
+        A host that refuses to pin falls back to a plain copy rather than
+        failing the run - only the speed is lost.
+        """
+        if self._pinned is None:
+            self._pinned = {}
+        pinned = self._pinned
+        dev = self._device
+        out: dict[str, torch.Tensor] = {}
+        for k, t in cpu_params.items():
+            ckey = (module_name, k)
+            src = pinned.get(ckey)
+            if src is None or src.shape != t.shape or src.dtype != t.dtype:
+                if dev.type == "cuda" and not t.is_pinned():
+                    try:
+                        t = t.pin_memory()
+                    except RuntimeError:
+                        pass
+                pinned[ckey] = t
+                src = t
+            out[k] = src.to(dev, non_blocking=True)
+        return out
     def get_expert_weights(self, expert_module_name: str) -> dict[str, torch.nn.Parameter]:
         """Return dequantized fp16 Parameters for *expert_module_name*, on GPU.
 
@@ -211,7 +265,7 @@ class QuantizedExpertCache:
             } - set(cpu_params.keys())
             if missing:
                 cpu_params.update(self._dequant_cpu(expert_module_name, only=missing))
-            gpu_params = {k: t.to(self._device) for k, t in cpu_params.items()}
+            gpu_params = self._to_device(expert_module_name, cpu_params)
             self._cache[expert_module_name] = gpu_params
             return {
                 pname: torch.nn.Parameter(t, requires_grad=True)
@@ -227,7 +281,7 @@ class QuantizedExpertCache:
         else:
             cpu_params = self._dequant_cpu(expert_module_name)
 
-        gpu_params = {k: t.to(self._device) for k, t in cpu_params.items()}
+        gpu_params = self._to_device(expert_module_name, cpu_params)
 
         self._cache[expert_module_name] = gpu_params
         return {
