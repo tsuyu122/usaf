@@ -22,6 +22,13 @@ def build_parser():
                    help="Sparse checkpoint to evaluate (requires --model for base weights)")
     p.add_argument("--datasets", type=str, default="synthetic-cpp",
                    help="Comma-separated dataset names")
+    # Without this there is no way to evaluate anything but the bundled C++
+    # corpus: get_eval_texts used to answer jsonl and text with that corpus
+    # when no path was given, so the run was measured on one dataset and
+    # reported under another name. Refusing is only fair if the real thing can
+    # be asked for.
+    p.add_argument("--dataset-path", type=str, default="",
+                   help="File to evaluate, for --datasets jsonl or text")
     p.add_argument("--max-samples", type=int, default=64,
                    help="Max samples per dataset")
     p.add_argument("--seq-len", type=int, default=512)
@@ -168,6 +175,7 @@ def main():
     ds_list = [d.strip() for d in ns.datasets.split(",") if d.strip()]
     cfg = BenchmarkConfig(
         datasets=ds_list,
+        dataset_paths={ds: ns.dataset_path for ds in ds_list} if ns.dataset_path else {},
         max_samples=ns.max_samples,
         seq_len=ns.seq_len,
         batch_size=ns.batch_size,

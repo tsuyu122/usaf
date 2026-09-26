@@ -31,7 +31,20 @@ def get_eval_texts(
 ) -> list[str]:
     if dataset == "synthetic-cpp":
         return SYNTHETIC_TEXTS[:max_samples]
-    if dataset in ("jsonl", "text") and path and Path(path).exists():
+    if dataset in ("jsonl", "text"):
+        # A named dataset that is not the one loaded is worse than a failure.
+        # The synthetic corpus used to be returned under the caller's name, so
+        # the report said "jsonl" and the number belonged to C++ - and eval_cli
+        # had no way to pass a path at all, so --datasets jsonl always meant
+        # that. A perplexity that is plausible, labelled correctly and belongs
+        # to something else is the worst of the three.
+        if not path:
+            raise ValueError(
+                f"dataset {dataset!r} needs a file: pass --dataset-path"
+                f" (or use 'synthetic-cpp')"
+            )
+        if not Path(path).exists():
+            raise ValueError(f"dataset file not found: {path}")
         texts: list[str] = []
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -51,7 +64,14 @@ def get_eval_texts(
                     text = line
                 if text:
                     texts.append(text[:MAX_SNIPPET_CHARS])
+        if not texts:
+            raise ValueError(f"{path} produced no usable text")
         return texts
+    if dataset != "synthetic-cpp":
+        raise ValueError(
+            f"unknown dataset {dataset!r}; this build knows synthetic-cpp,"
+            f" jsonl and text"
+        )
     return SYNTHETIC_TEXTS[:max_samples]
 
 
