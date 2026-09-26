@@ -215,7 +215,12 @@ Mixtral and a 4-layer Qwen3 with head_dim 8):
   worked together with `--eval-only` and so could not report on the weights a
   training run had just produced.
 - `--resume`, `--export`, `--eval-only`, `--eval-report`, `--save-every`,
-  `--checkpoint-dir`, reselection and accumulation.
+  `--checkpoint-dir`, reselection and accumulation. A resumed run restores the
+  active set, the trained weights, the Adam moments and the step counter, and
+  resumes at the right point in the LR schedule. It does not checkpoint the
+  sampler, so a resumed run sees a different sample order than an uninterrupted
+  one: same steps, same optimizer, different data, so the losses will not match
+  a continuous run step for step.
 - The frozen cache: the cached hidden state is compared against a fresh forward
   of the same prefix and is bit-identical, a run with the cache and a run
   without it reach the same loss, and the cache is reused across processes

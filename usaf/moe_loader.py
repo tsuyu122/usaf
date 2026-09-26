@@ -56,6 +56,27 @@ def load_quantized_state_dict(
     return loaded
 
 
+
+
+def _apply_overlay(t: torch.Tensor, idx: torch.Tensor, vals: torch.Tensor) -> torch.Tensor:
+    """Scatter compact trained values into a full-shape tensor at flat indices.
+
+    ``t.reshape(-1)`` is not ``t.view(-1)``: on a non-contiguous tensor reshape
+    returns a copy, and scattering into that copy changes nothing - the trained
+    weights would be silently replaced by the pretrained ones and nothing would
+    report it. The tensors on these paths are contiguous today, so the
+    failure mode is latent rather than live, but it is one refactor away from
+    being real. Making the copy explicit keeps the contract: the returned
+    tensor is the one that carries the overlay.
+    """
+    if t.is_contiguous():
+        flat = t.reshape(-1)
+        flat.scatter_(0, idx.reshape(-1).to(torch.long), vals.detach().reshape(-1).to(flat.dtype))
+        return t
+    # a copia contigua e o que carrega o overlay, entao e ela que volta
+    out = t.contiguous()
+    out.reshape(-1).scatter_(0, idx.reshape(-1).to(torch.long), vals.detach().reshape(-1).to(out.dtype))
+    return out
 class QuantizedExpertCache:
     """LRU cache that holds quantized expert weights on CPU and dequantizes on demand.
 
@@ -262,7 +283,7 @@ class QuantizedExpertCache:
             ov = self.overlays.get(full_name)
             if ov is not None:
                 idx, vals = ov
-                t.reshape(-1).scatter_(0, idx, vals.detach().to(t.dtype))
+                t = _apply_overlay(t, idx, vals)
 
             cpu_params[local_name] = t
         return cpu_params
@@ -286,7 +307,7 @@ class QuantizedExpertCache:
             ov = self.overlays.get(full_name)
             if ov is not None:
                 idx, vals = ov
-                t.reshape(-1).scatter_(0, idx.to(torch.long), vals.detach().to(t.dtype))
+                t = _apply_overlay(t, idx, vals)
             out[local_name] = t
         return out
 

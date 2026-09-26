@@ -83,9 +83,23 @@ class ActivationCache:
         return set(self._cache.keys())
 
     def memory_estimate_mb(self) -> float:
+        """Bytes held by the cache, walking into container entries.
+
+        Transformer blocks return a tuple, and that is exactly what the hook
+        stores, so counting only bare tensors reported zero for the modules the
+        cache exists to hold - the estimate claimed the cache was free.
+        """
+        def _nbytes(obj) -> int:
+            if isinstance(obj, torch.Tensor):
+                return obj.numel() * obj.element_size()
+            if isinstance(obj, (tuple, list)):
+                return sum(_nbytes(o) for o in obj)
+            if isinstance(obj, dict):
+                return sum(_nbytes(o) for o in obj.values())
+            return 0
+
         total = 0
-        for name, tensors in self._cache.items():
-            for t in tensors:
-                if isinstance(t, torch.Tensor):
-                    total += t.numel() * t.element_size()
+        for entries in self._cache.values():
+            for entry in entries:
+                total += _nbytes(entry)
         return total / (1024 * 1024)
