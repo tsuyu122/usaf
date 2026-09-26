@@ -12,6 +12,7 @@ from transformers import AutoConfig
 
 from .moe_loader import QuantizedExpertCache
 from .qwen3moe_dml import patch_qwen3moe_for_dml
+from .train import materialize_meta_tensors
 from .utils import get_dml_device
 
 
@@ -46,16 +47,16 @@ def load_qwen3_streaming(src: str, q4_dir: str, max_cached: int = 1):
             obj = getattr(obj, p)
         obj._parameters[parts[-1]] = torch.nn.Parameter(tensor.to(device), requires_grad=False)
 
-    for mn, mod in model.named_modules():
-        for bn, b in list(mod._buffers.items()):
-            if b is not None and b.device.type == "meta":
-                if bn == "inv_freq":
-                    hd = getattr(mod, "dim", getattr(mod, "head_dim", 128))
-                    base = getattr(mod, "base", 1000000.0)
-                    inv = 1.0 / (base ** (torch.arange(0, hd, 2, dtype=torch.float32) / hd))
-                    mod._buffers[bn] = inv.to(dtype=torch.float16, device=device)
-                else:
-                    mod._buffers[bn] = torch.zeros(b.shape, dtype=torch.float16, device=device)
+    # The RoPE frequencies used to be rebuilt here with
+    # getattr(mod, "dim", getattr(mod, "head_dim", 128)) to guess the rotary
+    # dimension, and zero-filled everything else. Rotary modules expose neither
+    # attribute, so the guess always landed on 128: a model whose real head_dim
+    # differs produced frequencies of the wrong length and the first forward
+    # died with "The size of tensor a (8) must match tensor b (128)". The same
+    # bug existed a second time here while the copy in train.py had already been
+    # fixed, which is what a duplicated fix always risks. It is one function now
+    # and both call sites share it.
+    materialize_meta_tensors(model, cfg, device, src, expert_modules=set())
 
     q_dict = torch.load(os.path.join(q4_dir, "experts_q4.pt"), map_location="cpu", weights_only=True)
     cache = QuantizedExpertCache(q_dict, device, max_cached=max_cached, group_size=128)
@@ -92,7 +93,7 @@ def load_qwen3_streaming(src: str, q4_dir: str, max_cached: int = 1):
 
 def apply_checkpoint_overlays(cache, ckpt_path: str) -> int:
     """Aplica os masters compactos de um checkpoint de treino como overlays."""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     n = 0
     for fname, aidx in ckpt["active_idx"].items():
         aidx = aidx.reshape(-1).to(torch.long)

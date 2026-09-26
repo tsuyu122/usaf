@@ -897,6 +897,175 @@ def _layer_is_trainable(param_name: str, train_layers: set[int]) -> bool:
     return idx in train_layers
 
 
+def materialize_meta_tensors(model, cfg, device, model_path, expert_modules):
+    '''Fill in every tensor a meta-device model was built with.
+
+    A model built under torch.device('meta') has no storage anywhere, and USAF
+    clears the expert parameters on purpose: they are refilled from the quantized
+    cache by forward pre-hooks. Everything else has to be filled here, because
+    the first forward to reach a meta tensor does arithmetic against a real one
+    and dies with 'Tensor on device meta is not on the expected device', which
+    names neither the tensor nor the module.
+
+    Three kinds of tensor, three treatments, in this order:
+
+    RoPE frequency buffers are rebuilt from the config, by the same code the
+    model itself uses, including the per-layer-type naming a heterogeneous stack
+    registers. The clone of the frequencies that sits next to them, under the
+    same name with an _original_ suffix, is a copy and is filled from the primary
+    it was cloned from.
+
+    A tied output head is re-tied to the input embedding, because a tied config
+    stores the weights once and a reader that goes by name finds nothing for the
+    head.
+
+    Buffers that are registered but not persisted are zero-filled and named: an
+    aux-loss accumulator has no checkpoint entry and no reconstruction rule, and
+    zeros are its true value before the first step. A PARAMETER in that position
+    is not filled, because a zeroed weight trains and exports as a model that
+    looks fine and is wrong; those stop the run with their names attached.
+
+    Expert tensors are excluded throughout: finding them on meta is the design.
+    '''
+    for mn, mod in model.named_modules():
+        for bn, b in list(mod._buffers.items()):
+            if b is not None and b.device.type == "meta":
+                # Stacks that carry one RoPE per layer type register the buffer
+                # under a name built from that type - "default_inv_freq",
+                # "hybrid_sliding_inv_freq" - and look it up by that name in
+                # forward. Matching only the literal name "inv_freq" left every
+                # one of them on meta, and the first forward died with
+                # AttributeError on "None_inv_freq". Anything ending in
+                # _inv_freq is a RoPE frequency buffer; the prefix names the
+                # layer type it belongs to.
+                # A stack with one RoPE per layer type registers two buffers per
+                # type: "<type>_inv_freq" and a clone named
+                # "<type>_original_inv_freq". transformers' own single-RoPE
+                # modules use the same "original" suffix with no prefix. Either
+                # way the "original" copy is a clone, not a per-type frequency,
+                # so it is skipped and filled from the primary below.
+                if bn == "inv_freq":
+                    _lt = None
+                elif bn == "original_inv_freq" or bn.endswith("_original_inv_freq"):
+                    _lt = None
+                    bn = None
+                elif bn.endswith("_inv_freq"):
+                    _lt = bn[: -len("_inv_freq")]
+                else:
+                    _lt = None
+                    bn = None
+                if bn is not None:
+                    # Rebuild RoPE exactly the way transformers does, from
+                    # the config. The previous code guessed the rotary dim
+                    # with getattr(mod, "dim", getattr(mod, "head_dim", 128)),
+                    # but rotary modules expose neither attribute, so it
+                    # always fell through to a hardcoded 128. On a model
+                    # whose real head_dim differs that produced an inv_freq
+                    # of the wrong length, and the forward died with
+                    # "The size of tensor a (8) must match tensor b (128)".
+                    _inv = _rebuild_inv_freq(mod, cfg, _lt).to(device=device)
+                    mod._buffers[bn] = _inv
+
+    # transformers keeps a clone of the frequencies next to the primary one,
+    # with or without a layer-type prefix, and dynamic/linear rope reads it. It
+    # is a copy, so it is filled from the primary rather than rebuilt. This runs
+    # over every module rather than inside the loop above, because the bare
+    # name is exactly the case where no primary was rebuilt to nest it in.
+    # Stripping the suffix off the bare name leaves nothing, so its primary is
+    # simply inv_freq; a per-type name keeps its type in front.
+    for _mn2, _mod2 in model.named_modules():
+        for _bn2, _b2 in list(_mod2._buffers.items()):
+            if _bn2 != "original_inv_freq" and not _bn2.endswith("_original_inv_freq"):
+                continue
+            if _b2 is None or _b2.device.type != "meta":
+                continue
+            _base = _bn2[: -len("_original_inv_freq")]
+            _prim = (_base + "_inv_freq") if _base else "inv_freq"
+            _src = _mod2._buffers.get(_prim)
+            if _src is not None and _src.device.type != "meta":
+                _mod2._buffers[_bn2] = _src.clone()
+
+
+    # A config with tie_word_embeddings does not store lm_head.weight in the
+    # checkpoint - it is the input embedding. ZAYA1-8B is tied, so lm_head came
+    # out of the load on meta and the first forward died in the head. Re-tie it
+    # from the embedding that was just loaded, which is what the tied config
+    # means, rather than inventing a second copy of the weights.
+    if getattr(cfg, "tie_word_embeddings", False):
+        _emb = dict(model.named_parameters()).get("model.embed_tokens.weight")
+        _head = None
+        for _mn3, _mod3 in model.named_modules():
+            if _mn3.endswith("lm_head"):
+                _head = _mod3
+                break
+        if _emb is not None and _head is not None and \
+                _head.weight.device.type == "meta":
+            _head.weight = nn.Parameter(
+                _emb.detach().clone().to(device=device), requires_grad=False)
+            print("  tied lm_head.weight to the input embedding", flush=True)
+
+    # Buffers that are registered but not persisted - an aux-loss accumulator
+    # like a router's balancing bias is the common case - have no checkpoint
+    # entry and no reconstruction rule. transformers builds them in __init__, and
+    # __init__ is exactly what cannot run against a meta model. Zeros are the
+    # faithful value for an accumulator that has never seen a step, so they are
+    # filled and named. A parameter in the same position is NOT zero-filled: a
+    # zeroed weight trains and exports as a model that looks fine and is wrong,
+    # so that still stops the run.
+    zeroed: list[str] = []
+    for _mn4, _mod4 in model.named_modules():
+        for _bn4, _b4 in list(_mod4._buffers.items()):
+            if _b4 is None or _b4.device.type != "meta":
+                continue
+            _mod4._buffers[_bn4] = torch.zeros(
+                _b4.shape, dtype=_b4.dtype, device=device)
+            zeroed.append(_mn4 + "." + _bn4)
+    if zeroed:
+        uniq_z = sorted(set(zeroed))
+        print(f"  {len(uniq_z)} non-persistent buffer(s) zero-filled "
+              f"(not stored in the checkpoint): "
+              + ", ".join(uniq_z[:3])
+              + (f", ... and {len(uniq_z) - 3} more" if len(uniq_z) > 3 else ""),
+              flush=True)
+
+    # Anything still on meta at this point is a tensor the model was built with
+    # and nothing ever filled in: not in the checkpoint, not an expert, and not
+    # one of the RoPE buffers repaired above. The first forward then reaches it,
+    # does arithmetic against a real tensor, and dies hundreds of lines later
+    # with "Tensor on device meta is not on the expected device", which names
+    # neither the tensor nor the module. ZAYA1-8B did exactly that on a Kaggle
+    # T4, after a completely normal-looking load. Checking here costs one walk
+    # and turns an obscure crash into a list of names.
+    #
+    # Expert tensors are excluded on purpose. They are cleared from the modules
+    # below and refilled from the quantized cache by forward pre-hooks, so
+    # finding them on meta is the design, not a defect.
+    def _is_expert(_name):
+        return any(_name == _em or _name.startswith(_em + ".") for _em in expert_modules)
+
+    still_meta = [
+        n for n, p in model.named_parameters()
+        if p is not None and p.device.type == "meta" and not _is_expert(n)
+    ]
+    for _n, _m in model.named_modules():
+        for _bn, _b in list(_m._buffers.items()):
+            if _b is not None and _b.device.type == "meta" and not _is_expert(_n):
+                still_meta.append(_n + "." + _bn)
+        for _pn, _p in list(_m._parameters.items()):
+            if _p is not None and _p.device.type == "meta" and not _is_expert(_n):
+                still_meta.append(_n + "." + _pn)
+    if still_meta:
+        uniq = sorted(set(still_meta))
+        raise SystemExit(
+            f"{len(uniq)} tensors are still on the meta device after loading, so the"
+            " first forward will fail:\n  " + "\n  ".join(uniq[:12])
+            + (f"\n  ... and {len(uniq) - 12} more" if len(uniq) > 12 else "")
+            + f"\n\nThey are not in {model_path} and are not expert weights,"
+            " so nothing in the load path can fill them. This architecture has"
+            " tensors USAF does not materialise."
+        )
+
+
 def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
                 train_layers: set[int]):
     """Load model with quantized expert streaming."""
@@ -995,144 +1164,9 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
             router_params[name] = obj._parameters[parts[-1]]
         n_loaded += 1
 
-    for mn, mod in model.named_modules():
-        for bn, b in list(mod._buffers.items()):
-            if b is not None and b.device.type == "meta":
-                # Stacks that carry one RoPE per layer type register the buffer
-                # under a name built from that type - "default_inv_freq",
-                # "hybrid_sliding_inv_freq" - and look it up by that name in
-                # forward. Matching only the literal name "inv_freq" left every
-                # one of them on meta, and the first forward died with
-                # AttributeError on "None_inv_freq". Anything ending in
-                # _inv_freq is a RoPE frequency buffer; the prefix names the
-                # layer type it belongs to.
-                # A stack with one RoPE per layer type registers two buffers per
-                # type: "<type>_inv_freq" and a clone named
-                # "<type>_original_inv_freq". transformers' own single-RoPE
-                # modules use the same "original" suffix with no prefix. Either
-                # way the "original" copy is a clone, not a per-type frequency,
-                # so it is skipped and filled from the primary below.
-                if bn == "inv_freq":
-                    _lt = None
-                elif bn == "original_inv_freq" or bn.endswith("_original_inv_freq"):
-                    _lt = None
-                    bn = None
-                elif bn.endswith("_inv_freq"):
-                    _lt = bn[: -len("_inv_freq")]
-                else:
-                    _lt = None
-                    bn = None
-                if bn is not None:
-                    # Rebuild RoPE exactly the way transformers does, from
-                    # the config. The previous code guessed the rotary dim
-                    # with getattr(mod, "dim", getattr(mod, "head_dim", 128)),
-                    # but rotary modules expose neither attribute, so it
-                    # always fell through to a hardcoded 128. On a model
-                    # whose real head_dim differs that produced an inv_freq
-                    # of the wrong length, and the forward died with
-                    # "The size of tensor a (8) must match tensor b (128)".
-                    _inv = _rebuild_inv_freq(mod, cfg, _lt).to(device=device)
-                    mod._buffers[bn] = _inv
-
-    # transformers keeps a clone of the frequencies next to the primary one,
-    # with or without a layer-type prefix, and dynamic/linear rope reads it. It
-    # is a copy, so it is filled from the primary rather than rebuilt. This runs
-    # over every module rather than inside the loop above, because the bare
-    # name is exactly the case where no primary was rebuilt to nest it in.
-    # Stripping the suffix off the bare name leaves nothing, so its primary is
-    # simply inv_freq; a per-type name keeps its type in front.
-    for _mn2, _mod2 in model.named_modules():
-        for _bn2, _b2 in list(_mod2._buffers.items()):
-            if _bn2 != "original_inv_freq" and not _bn2.endswith("_original_inv_freq"):
-                continue
-            if _b2 is None or _b2.device.type != "meta":
-                continue
-            _base = _bn2[: -len("_original_inv_freq")]
-            _prim = (_base + "_inv_freq") if _base else "inv_freq"
-            _src = _mod2._buffers.get(_prim)
-            if _src is not None and _src.device.type != "meta":
-                _mod2._buffers[_bn2] = _src.clone()
     print(f"  {n_loaded} non-expert params loaded")
+    materialize_meta_tensors(model, cfg, device, config.model_path, _expert_modules)
 
-
-    # A config with tie_word_embeddings does not store lm_head.weight in the
-    # checkpoint - it is the input embedding. ZAYA1-8B is tied, so lm_head came
-    # out of the load on meta and the first forward died in the head. Re-tie it
-    # from the embedding that was just loaded, which is what the tied config
-    # means, rather than inventing a second copy of the weights.
-    if getattr(cfg, "tie_word_embeddings", False):
-        _emb = dict(model.named_parameters()).get("model.embed_tokens.weight")
-        _head = None
-        for _mn3, _mod3 in model.named_modules():
-            if _mn3.endswith("lm_head"):
-                _head = _mod3
-                break
-        if _emb is not None and _head is not None and \
-                _head.weight.device.type == "meta":
-            _head.weight = nn.Parameter(
-                _emb.detach().clone().to(device=device), requires_grad=False)
-            print("  tied lm_head.weight to the input embedding", flush=True)
-
-    # Buffers that are registered but not persisted - an aux-loss accumulator
-    # like a router's balancing bias is the common case - have no checkpoint
-    # entry and no reconstruction rule. transformers builds them in __init__, and
-    # __init__ is exactly what cannot run against a meta model. Zeros are the
-    # faithful value for an accumulator that has never seen a step, so they are
-    # filled and named. A parameter in the same position is NOT zero-filled: a
-    # zeroed weight trains and exports as a model that looks fine and is wrong,
-    # so that still stops the run.
-    zeroed: list[str] = []
-    for _mn4, _mod4 in model.named_modules():
-        for _bn4, _b4 in list(_mod4._buffers.items()):
-            if _b4 is None or _b4.device.type != "meta":
-                continue
-            _mod4._buffers[_bn4] = torch.zeros(
-                _b4.shape, dtype=_b4.dtype, device=device)
-            zeroed.append(_mn4 + "." + _bn4)
-    if zeroed:
-        uniq_z = sorted(set(zeroed))
-        print(f"  {len(uniq_z)} non-persistent buffer(s) zero-filled "
-              f"(not stored in the checkpoint): "
-              + ", ".join(uniq_z[:3])
-              + (f", ... and {len(uniq_z) - 3} more" if len(uniq_z) > 3 else ""),
-              flush=True)
-
-    # Anything still on meta at this point is a tensor the model was built with
-    # and nothing ever filled in: not in the checkpoint, not an expert, and not
-    # one of the RoPE buffers repaired above. The first forward then reaches it,
-    # does arithmetic against a real tensor, and dies hundreds of lines later
-    # with "Tensor on device meta is not on the expected device", which names
-    # neither the tensor nor the module. ZAYA1-8B did exactly that on a Kaggle
-    # T4, after a completely normal-looking load. Checking here costs one walk
-    # and turns an obscure crash into a list of names.
-    #
-    # Expert tensors are excluded on purpose. They are cleared from the modules
-    # below and refilled from the quantized cache by forward pre-hooks, so
-    # finding them on meta is the design, not a defect.
-    def _is_expert(_name):
-        return any(_name == _em or _name.startswith(_em + ".") for _em in _expert_modules)
-
-    still_meta = [
-        n for n, p in model.named_parameters()
-        if p is not None and p.device.type == "meta" and not _is_expert(n)
-    ]
-    for _n, _m in model.named_modules():
-        for _bn, _b in list(_m._buffers.items()):
-            if _b is not None and _b.device.type == "meta" and not _is_expert(_n):
-                still_meta.append(_n + "." + _bn)
-        for _pn, _p in list(_m._parameters.items()):
-            if _p is not None and _p.device.type == "meta" and not _is_expert(_n):
-                still_meta.append(_n + "." + _pn)
-    if still_meta:
-        uniq = sorted(set(still_meta))
-        raise SystemExit(
-            f"{len(uniq)} tensors are still on the meta device after loading, so the"
-            " first forward will fail:\n  " + "\n  ".join(uniq[:12])
-            + (f"\n  ... and {len(uniq) - 12} more" if len(uniq) > 12 else "")
-            + f"\n\nThey are not in {config.model_path} and are not expert weights,"
-            " so nothing in the load path can fill them. This architecture has"
-            " tensors USAF does not materialise."
-        )
 
     q_dict = torch.load(config.quant_path, map_location="cpu", weights_only=True)
     _validate_quant_weights(q_dict, _expert_shapes(model, _expert_modules), config.quant_path)
