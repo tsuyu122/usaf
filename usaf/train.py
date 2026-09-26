@@ -497,6 +497,50 @@ def _check_resume_path(resume_path: str) -> str:
     return resume_path
 
 
+def _expert_shapes(model, expert_modules: set[str]) -> dict[str, tuple]:
+    """The expert tensors the model actually has, before anything clears them.
+
+    Called before the cache hooks wipe ``_parameters``: after that the module
+    carries whatever the q4 file said it should, which is exactly the thing
+    that needs checking.
+    """
+    out: dict[str, tuple] = {}
+    for mname, mod in model.named_modules():
+        if mname in expert_modules:
+            for pn, p in mod._parameters.items():
+                out[f"{mname}.{pn}"] = tuple(p.shape)
+    return out
+
+
+def _validate_quant_weights(q_dict: dict, expected: dict[str, tuple], path: str) -> None:
+    """Refuse a quantized file that does not describe this model.
+
+    The expert parameters are cleared and refilled straight from the cache, and
+    the training shapes are taken from the q4 file rather than from the model,
+    so a file belonging to a different MoE loads without complaint: pointing
+    tiny-moe at the Mixtral experts_q4.pt trained to a plausible loss while
+    running on entirely the wrong weights, and reported success. Every tensor
+    the model expects has to be present, at the shape the model has.
+    """
+    problems: list[str] = []
+    for name, shape in expected.items():
+        entry = q_dict.get(name)
+        if entry is None:
+            problems.append(f"{name}: not in the quantized file")
+            continue
+        got = tuple(entry["shape"]) if isinstance(entry, dict) else tuple(entry[3])
+        if got != tuple(shape):
+            problems.append(f"{name}: quantized {got}, model has {tuple(shape)}")
+    if not problems:
+        return
+    shown = "\n".join(f"  {p}" for p in problems[:8])
+    more = f"\n  ... and {len(problems) - 8} more" if len(problems) > 8 else ""
+    raise SystemExit(
+        f"quantized weights do not match the model: {path}\n{shown}{more}\n"
+        "  Quantize this model before training it, or point --quant-path at "
+        "the file that belongs to it."
+    )
+
 def _resolve_quant_path(quant_path: str, model_name: str) -> str:
     """Work out which file holds the quantized expert weights.
 
@@ -764,6 +808,7 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
     print(f"  {n_loaded} non-expert params loaded")
 
     q_dict = torch.load(config.quant_path, map_location="cpu", weights_only=True)
+    _validate_quant_weights(q_dict, _expert_shapes(model, _expert_modules), config.quant_path)
     from usaf.moe_loader import QuantizedExpertCache
     cache = QuantizedExpertCache(q_dict, device, max_cached=1, group_size=128,
                                 expert_prefix=moe_cfg.expert_prefix)

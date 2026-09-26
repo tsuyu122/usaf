@@ -210,6 +210,14 @@ what the numbers rest on.
   path that a run takes is the Q/K/V projection in `usaf/vk_layer.py`.
 - The 4-bit quantizer round-trips across five tensor shapes, packs exactly two
   values per byte, and reaches 3.76x compression.
+- That training actually *learns*. The default fixture data is random tokens,
+  so it can only show that a run does not crash; nothing learns from noise, and
+  a loss hovering near ln(vocab) is the correct result there, not a sign of a
+  broken gradient path. On a dataset with real structure - each sequence
+  repeating one token, which a copy-the-previous-token model gets nearly right -
+  all three fixture families train down, through the sparse capture path:
+  Qwen3-MoE 5.32 -> 4.20, Mixtral 4.87 -> 1.88, Qwen3 head_dim 8 4.86 -> 3.34,
+  against a uniform baseline of ln(128) = 4.85.
 - RoPE must be a rotation: the test asserts the per-head norm is preserved, not
   just that some number came out.
 
