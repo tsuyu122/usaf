@@ -333,7 +333,7 @@ def main(args=None):
     print(f"Q4 weights: {config.quant_path}")
 
     print("\nLoading model...")
-    model, cache, q_dict, wf, st_path, router_params = _load_model(
+    model, cache, q_dict, wf, st_path, router_params, model_cfg = _load_model(
         config, moe_cfg, device, train_layers)
 
     if config.use_multi_gpu and n_gpus > 1 and config.use_cuda:
@@ -440,6 +440,7 @@ def main(args=None):
                   _train_names, _shapes, train_layers,
                   layers, embed, rotary, norm_fn, lm_head,
                   router_params=router_params,
+                  model_cfg=model_cfg,
                   resume_ckpt=resume_ckpt)
 
     # --eval-report only ever did anything together with --eval-only, so a
@@ -703,7 +704,7 @@ def _expert_module_names(moe_cfg) -> set[str]:
     return {moe_cfg.expert_prefix.format(i=i) for i in range(moe_cfg.num_layers)}
 
 
-def _rebuild_inv_freq(rotary_mod, cfg) -> torch.Tensor:
+def _rebuild_inv_freq(rotary_mod, cfg, layer_type: str | None = None) -> torch.Tensor:
     """Recompute a RoPE module inv_freq buffer from the model config.
 
     The model is materialised on the meta device, so every buffer - including
@@ -711,32 +712,63 @@ def _rebuild_inv_freq(rotary_mod, cfg) -> torch.Tensor:
     routine transformers itself uses (ROPE_INIT_FUNCTIONS), driven by the
     config, so the rotary dimension, theta and any rope_scaling are honoured
     instead of being guessed.
+
+    ``layer_type`` exists for stacks that carry one RoPE per layer type. Those
+    register the buffer under a name built from the type ("default_inv_freq",
+    "hybrid_sliding_inv_freq") and look it up by that name in forward, so the
+    buffer has to be rebuilt per type from that type's own parameters. Calling
+    this with no layer_type covers the ordinary single-RoPE case and is what
+    every other model needs.
     """
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
     # rope_type lives in config.rope_parameters on transformers 5.x and in
     # config.rope_scaling (or top-level rope_theta) on 4.x. The "default"
     # type has no entry in ROPE_INIT_FUNCTIONS - it is computed by the rotary
     # class itself, so we dispatch to that static method when present.
-    rp = getattr(cfg, "rope_parameters", None) or getattr(cfg, "rope_scaling", None) or {}
+    all_rp = getattr(cfg, "rope_parameters", None) or getattr(cfg, "rope_scaling", None) or {}
+    if layer_type is None:
+        rp = all_rp
+        default_fn = getattr(type(rotary_mod), "compute_default_rope_parameters", None)
+    else:
+        sub = all_rp.get(layer_type)
+        if sub is None:
+            raise ValueError(
+                f"layer type {layer_type!r} has no rope parameters; config has "
+                f"{sorted(all_rp)}"
+            )
+        rp = sub
+        fn = ROPE_INIT_FUNCTIONS.get(rp.get("rope_type", rp.get("type", "default")))
+        if fn is not None:
+            default_fn = fn
+        else:
+            cls_fn = getattr(type(rotary_mod), "compute_default_rope_parameters", None)
+            default_fn = cls_fn if callable(cls_fn) else None
     rope_type = rp.get("rope_type", rp.get("type", "default"))
-    default_fn = getattr(type(rotary_mod), "compute_default_rope_parameters", None)
     if rope_type == "default" and callable(default_fn):
         # transformers 5.17 deprecates the device kwarg (removed in 5.18).
         # Inspect the signature so we neither emit a FutureWarning on 5.17
         # nor crash with a TypeError on 5.18+.
         import inspect as _inspect
         _params = _inspect.signature(default_fn).parameters
+        kwargs = {}
+        if layer_type is not None and "layer_type" in _params:
+            kwargs["layer_type"] = layer_type
         if "device" in _params:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", FutureWarning)
-                inv_freq, attn_scaling = default_fn(cfg, device=torch.device("cpu"))
+                inv_freq, attn_scaling = default_fn(cfg, **kwargs, device=torch.device("cpu"))
         else:
-            inv_freq, attn_scaling = default_fn(cfg)
+            inv_freq, attn_scaling = default_fn(cfg, **kwargs)
     else:
         if rope_type not in ROPE_INIT_FUNCTIONS:
             raise ValueError(f"unsupported rope_type {rope_type!r}")
-        inv_freq, attn_scaling = ROPE_INIT_FUNCTIONS[rope_type](
-            cfg, device=torch.device("cpu"), seq_len=None
+        kwargs = {}
+        _fn = ROPE_INIT_FUNCTIONS[rope_type]
+        import inspect as _inspect
+        if layer_type is not None and "layer_type" in _inspect.signature(_fn).parameters:
+            kwargs["layer_type"] = layer_type
+        inv_freq, attn_scaling = _fn(
+            cfg, **kwargs, device=torch.device("cpu"), seq_len=None
         )
     head_dim = getattr(cfg, "head_dim", None) or (
         cfg.hidden_size // cfg.num_attention_heads
@@ -758,6 +790,59 @@ def _rebuild_inv_freq(rotary_mod, cfg) -> torch.Tensor:
             f"partial_rotary_factor={prf}) requires {expected}"
         )
     return inv_freq
+
+
+class _DecoderAdapter:
+    """Runs a decoder stack that does not match USAF's assumptions.
+
+    USAF assumed every decoder layer takes a 4-D causal mask tensor, returns a
+    bare hidden state, and shares one set of rotary embeddings with the whole
+    stack. A stack that differs on any of those three is signalled by
+    transformers with ``config.layer_types`` - a per-layer type list that exists
+    precisely to say the layers are not alike. ZAYA uses it for full versus
+    sliding attention, and there the rotary looks its frequencies up by layer
+    type, attention wants a dict of named masks, and the layer returns
+    (hidden, router_hidden) as a pair.
+
+    Without this, a run gets all the way through downloading, detecting and
+    quantizing the model and then dies in the first forward. Nothing up to that
+    point says the architecture is unsupported, which is what makes it look like
+    a crash rather than a gap.
+
+    The adaptations are driven by config.layer_types rather than by a model name,
+    so they apply to any stack transformers marks as heterogeneous.
+    """
+
+    def __init__(self, layers, rotary, cfg, hidden, pos_ids, mask):
+        self.layers = layers
+        self.hybrid = bool(getattr(cfg, "layer_types", None))
+        self.layer_types = list(getattr(cfg, "layer_types", []) or [])
+        if self.hybrid:
+            self.pe = {}
+            for lt in dict.fromkeys(self.layer_types):
+                self.pe[lt] = rotary(hidden, position_ids=pos_ids, layer_type=lt)
+            self.mask = {"causal": mask, "padding": None}
+        else:
+            self.pe = rotary(hidden, position_ids=pos_ids)
+            self.mask = mask
+
+    def layer_type(self, i: int) -> str | None:
+        if not self.hybrid or i >= len(self.layer_types):
+            return None
+        return self.layer_types[i]
+
+    def call(self, i: int, h, pos_ids):
+        """Run layer i, picking the right mask and rotary and unwrapping output."""
+        lt = self.layer_type(i)
+        pe = self.pe.get(lt) if self.hybrid else self.pe
+        out = self.layers[i](h, attention_mask=self.mask, position_ids=pos_ids,
+                            position_embeddings=pe)
+        # Routers that hand a running summary to the next layer return a pair.
+        # The summary is only needed for auxiliary router losses, which the
+        # sparse path does not use, so the hidden state is the tensor to carry.
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        return out
 
 
 def _layer_is_trainable(param_name: str, train_layers: set[int]) -> bool:
@@ -876,7 +961,26 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
     for mn, mod in model.named_modules():
         for bn, b in list(mod._buffers.items()):
             if b is not None and b.device.type == "meta":
+                # Stacks that carry one RoPE per layer type register the buffer
+                # under a name built from that type - "default_inv_freq",
+                # "hybrid_sliding_inv_freq" - and look it up by that name in
+                # forward. Matching only the literal name "inv_freq" left every
+                # one of them on meta, and the first forward died with
+                # AttributeError on "None_inv_freq". Anything ending in
+                # _inv_freq is a RoPE frequency buffer; the prefix names the
+                # layer type it belongs to.
+                # "original_inv_freq" is transformers' own name for the
+                # unscaled frequencies a dynamic/linear rope keeps around - it is
+                # not a layer type, and matching it rebuilt a RoPE from a
+                # config that has no such type and stopped every run.
                 if bn == "inv_freq":
+                    _lt = None
+                elif bn.endswith("_inv_freq") and bn != "original_inv_freq":
+                    _lt = bn[: -len("_inv_freq")]
+                else:
+                    _lt = None
+                    bn = None
+                if bn is not None:
                     # Rebuild RoPE exactly the way transformers does, from
                     # the config. The previous code guessed the rotary dim
                     # with getattr(mod, "dim", getattr(mod, "head_dim", 128)),
@@ -885,8 +989,15 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
                     # whose real head_dim differs that produced an inv_freq
                     # of the wrong length, and the forward died with
                     # "The size of tensor a (8) must match tensor b (128)".
-                    mod._buffers[bn] = _rebuild_inv_freq(mod, cfg).to(
-                        device=device)
+                    _inv = _rebuild_inv_freq(mod, cfg, _lt).to(device=device)
+                    mod._buffers[bn] = _inv
+                    # These stacks also keep a per-type attention scaling next
+                    # to the buffer. Rebuilding only the frequencies left the
+                    # scaling at whatever the meta init had, so the rebuilt
+                    # module would still be missing the attribute forward reads
+                    # by name.
+                    if _lt and f"{_lt}_original_inv_freq" in mod._buffers:
+                        mod._buffers[f"{_lt}_original_inv_freq"] = _inv.clone()
 
     print(f"  {n_loaded} non-expert params loaded")
 
@@ -919,7 +1030,7 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
         mod.register_forward_pre_hook(make_pre(mname))
         mod.register_forward_hook(make_post())
 
-    return model, cache, q_dict, wf, st_path, router_params
+    return model, cache, q_dict, wf, st_path, router_params, cfg
 
 
 def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
@@ -927,6 +1038,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                   _train_names, _shapes, train_layers,
                   layers, embed, rotary, norm_fn, lm_head,
                   router_params=None,
+                  model_cfg=None,
                   resume_ckpt=None):
     """Run the full training loop using pre-extracted layer references."""
 
@@ -965,7 +1077,10 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         hidden = embed(input_ids)
         s_len = hidden.shape[1]
         pos_ids = torch.arange(s_len, device=device).unsqueeze(0)
-        cos, sin = rotary(hidden, position_ids=pos_ids)
+        # The rotary is built by the adapter, not here. A stack with one RoPE per
+        # layer type needs a different pair per type, and computing a single
+        # shared pair first would be work thrown away - and, for those stacks,
+        # the wrong one.
         # The mask is built in the run dtype. It used to be hardcoded fp16,
         # which mismatches a bf16 model: the fill value is fine in bf16 (same
         # exponent range as fp32) but an fp16 mask added to bf16 activations
@@ -974,7 +1089,8 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         mask = torch.triu(
             torch.full((s_len, s_len), torch.finfo(_dt).min, device=device, dtype=_dt),
             diagonal=1).unsqueeze(0).unsqueeze(0)
-        return hidden, pos_ids, (cos, sin), mask
+        adapter = _DecoderAdapter(layers, rotary, model_cfg, hidden, pos_ids, mask)
+        return hidden, pos_ids, adapter, mask
 
     # Frozen activation cache for layers 0..DETACH_AT.
     #
@@ -994,10 +1110,9 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
 
             def _compute_hidden(s):
                 _ids = torch.tensor(s["input_ids"], dtype=torch.long).unsqueeze(0).to(device)
-                _h, _pos, _pe, _mask = _prelude(_ids)
+                _h, _pos, _ad, _mask = _prelude(_ids)
                 for _i in range(DETACH_AT + 1):
-                    _h = layers[_i](_h, attention_mask=_mask, position_ids=_pos,
-                                    position_embeddings=_pe)
+                    _h = _ad.call(_i, _h, _pos)
                 return _h
 
             _ck = os.path.join(config.checkpoint_dir or "checkpoints",
@@ -1035,10 +1150,9 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         for s in samples[:max_n]:
             ids = torch.tensor(s["input_ids"], dtype=torch.long).unsqueeze(0).to(device)
             lbl = torch.tensor(s["labels"], dtype=torch.long).unsqueeze(0).to(device)
-            h, pos, pe, mask = _prelude(ids)
+            h, pos, ad, mask = _prelude(ids)
             for i in range(N_LAYERS):
-                h = layers[i](h, attention_mask=mask, position_ids=pos,
-                             position_embeddings=pe)
+                h = ad.call(i, h, pos)
             n_tok = int((lbl[:, 1:] != -100).sum().item())
             if n_tok:
                 total_loss += _head_loss(h, lbl).item() * n_tok
@@ -1066,11 +1180,11 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         """
         ids = torch.tensor([sample["input_ids"]], dtype=torch.long).to(device)
         lbl = torch.tensor([sample["labels"]], dtype=torch.long).to(device)
-        hidden, pos_ids, pe, mask = _prelude(ids)
+        hidden, pos_ids, ad, mask = _prelude(ids)
         xs_imp = []
         for i in range(N_LAYERS):
             xs_imp.append(hidden)
-            hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+            hidden = ad.call(i, hidden, pos_ids)
         cache.evict_all()
         h_last = hidden.detach().requires_grad_(True)
         loss = _head_loss(h_last, lbl)
@@ -1078,7 +1192,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         g_imp = h_last.grad
         for j in range(len(xs_imp) - 1, -1, -1):
             x2 = xs_imp[j].detach().requires_grad_(True)
-            out = layers[j](x2, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+            out = ad.call(j, x2, pos_ids)
             out.backward(g_imp)
             g_imp = x2.grad
             cache.evict_all()
@@ -1204,7 +1318,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             sparse_store.zero_()
         ids = torch.stack([torch.tensor(s["input_ids"], dtype=torch.long) for s in batch]).to(device)
         lbl = torch.stack([torch.tensor(s["labels"], dtype=torch.long) for s in batch]).to(device)
-        hidden, pos_ids, pe, mask = _prelude(ids)
+        hidden, pos_ids, ad, mask = _prelude(ids)
 
         with torch.no_grad():
             _cached = FROZEN_CACHE is not None and all("_fidx" in s for s in batch)
@@ -1215,12 +1329,12 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                     dim=0).to(hidden.dtype)
             else:
                 for i in range(DETACH_AT + 1):
-                    hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+                    hidden = ad.call(i, hidden, pos_ids)
             cache.evict_all()
             xs = []
             for i in range(DETACH_AT + 1, N_LAYERS):
                 xs.append(hidden)
-                hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+                hidden = ad.call(i, hidden, pos_ids)
             cache.evict_all()
 
         h_last = hidden.detach().requires_grad_(True)
@@ -1237,7 +1351,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         for j in range(len(xs) - 1, -1, -1):
             i = DETACH_AT + 1 + j
             x2 = xs[j].detach().requires_grad_(True)
-            out = layers[i](x2, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+            out = ad.call(i, x2, pos_ids)
             out.backward(g)
             g = x2.grad
             cache.evict_all()
