@@ -183,6 +183,49 @@ python -m usaf.train --model mistralai/Mixtral-8x7B --dataset data.jsonl
 | Vulkan kernels (dequant, GEMM, RMSNorm, RoPE, attention) | Built and numerically tested against PyTorch |
 | Held-out evaluation | Production |
 
+## What is actually verified
+
+The table above distinguishes code-complete from measured. Here is what the
+test suite and the end-to-end runs on this machine cover, so you know exactly
+what the numbers rest on.
+
+**Verified numerically, against an independent reference:**
+
+- The sparse gradient is identical to dense autograd. A three-layer stack is
+  differentiated twice over the same graph, once with ordinary autograd and
+  once with no graph retained, capturing only the active slice per expert via
+  the same per-expert tensor hooks the real forward uses. Every active position
+  matches. This is the claim the whole method rests on.
+- All five Vulkan kernels (attention, RMSNorm, GEMM, RoPE, 4-bit dequant)
+  against PyTorch, on a real AMD Radeon RX 6750 XT.
+- The 4-bit quantizer round-trips across five tensor shapes, packs exactly two
+  values per byte, and reaches 3.76x compression.
+- RoPE must be a rotation: the test asserts the per-head norm is preserved, not
+  just that some number came out.
+
+**Verified end to end on small fixtures** (a 4-layer Qwen3-MoE, a 4-layer
+Mixtral and a 4-layer Qwen3 with head_dim 8):
+
+- Training, and the loss going down.
+- All 31 arguments of the universal CLI, individually and in combination.
+- `--resume`, `--export`, `--eval-only`, `--eval-report`, `--save-every`,
+  `--checkpoint-dir`, reselection, accumulation, and the frozen-cache path.
+- The quantized export carries the trained values and leaves every position
+  outside the active set bit-identical to the original.
+- Every user-facing error path, each of which previously failed somewhere
+  unrelated to the actual mistake.
+
+**Not verified here:**
+
+- The CUDA and multi-GPU paths have never been executed - the reference
+  machine has no NVIDIA GPU. They are code-complete and unbenchmarked.
+- The DirectML path is the configuration behind the numbers on this page, but
+  the `torch-directml` build installed on the reference machine fails to load
+  against torch 2.13, so the runs below fell back to CPU. The numbers come from
+  the DirectML runs recorded before that.
+- The 30B-scale results are from the author's runs, not reproducible from this
+  repository on a laptop.
+
 ## Hardware
 
 - GPU with 12GB+ VRAM or 32GB RAM (CPU-only)
