@@ -12,7 +12,7 @@ import json
 import pytest
 
 from usaf.model_factory import MoEConfig, get_trainable_layers
-from usaf.train import _load_dataset
+from usaf.train import _load_dataset, _resolve_quant_path
 
 
 def _cfg(num_layers: int = 4) -> MoEConfig:
@@ -56,7 +56,11 @@ def test_non_list_input_ids_is_reported(tmp_path, capsys):
 
 
 def test_wrong_seq_len_is_reported(tmp_path):
-    p = _write(tmp_path, "short.jsonl", [json.dumps({"input_ids": [1, 2, 3], "labels": [1, 2, 3]})])
+    p = _write(
+        tmp_path,
+        "short.jsonl",
+        [json.dumps({"input_ids": [1, 2, 3], "labels": [1, 2, 3]})],
+    )
     with pytest.raises(SystemExit, match="no usable sample"):
         _load_dataset(p, 32)
 
@@ -98,3 +102,32 @@ def test_train_from_last_layer_is_allowed():
 
 def test_train_from_zero_trains_everything():
     assert get_trainable_layers(_cfg(4), 0) == {0, 1, 2, 3}
+
+
+def test_missing_quantized_weights_says_so(tmp_path):
+    with pytest.raises(SystemExit, match="quantized weights not found"):
+        _resolve_quant_path(str(tmp_path / "no.pt"), "m")
+
+
+def test_quant_path_accepts_a_directory(tmp_path):
+    d = tmp_path / "m-q4"
+    d.mkdir()
+    (d / "experts_q4.pt").write_bytes(b"")
+    assert _resolve_quant_path(str(d), "m") == str(d / "experts_q4.pt")
+    assert _resolve_quant_path(str(d / "experts_q4.pt"), "m") == str(
+        d / "experts_q4.pt"
+    )
+
+
+def test_quant_path_defaults_next_to_the_model(tmp_path, monkeypatch):
+    # With no --quant-path the weights are looked for beside the model name,
+    # and a missing file there is reported like a bad explicit one.
+    monkeypatch.chdir(tmp_path)
+    d = tmp_path / "Qwen3-30B-A3B-q4"
+    d.mkdir()
+    (d / "experts_q4.pt").write_bytes(b"")
+    assert (
+        _resolve_quant_path("", "Qwen3-30B-A3B") == "Qwen3-30B-A3B-q4/experts_q4.pt"
+    )
+    with pytest.raises(SystemExit, match="quantized weights not found"):
+        _resolve_quant_path("", "outro-modelo")

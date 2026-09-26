@@ -297,9 +297,9 @@ def main(args=None):
     print(f"Steps: {config.steps}, Batch: {config.microbatch}Ã—{config.accum}={eff_batch}")
     print(f"Tokens: {config.steps * eff_batch * config.seq_len:,}")
 
-    if not config.quant_path:
-        model_name = config.model_path.split("/")[-1]
-        config.quant_path = f"{model_name}-q4/experts_q4.pt"
+    config.quant_path = _resolve_quant_path(
+        config.quant_path, config.model_path.split("/")[-1]
+    )
     print(f"Q4 weights: {config.quant_path}")
 
     print("\nLoading model...")
@@ -408,6 +408,27 @@ def main(args=None):
                   resume_ckpt=resume_ckpt)
 
     return model
+
+
+def _resolve_quant_path(quant_path: str, model_name: str) -> str:
+    """Work out which file holds the quantized expert weights.
+
+    --quant-path names a file, but a directory is the natural thing to pass and
+    torch.load reports a directory as "PermissionError: [Errno 13] Permission
+    denied", which reads like a lock rather than a wrong path. Accept the
+    directory form, and say exactly what is expected when nothing is there.
+    """
+    if not quant_path:
+        quant_path = f"{model_name}-q4/experts_q4.pt"
+    if os.path.isdir(quant_path):
+        quant_path = os.path.join(quant_path, "experts_q4.pt")
+    if not os.path.exists(quant_path):
+        raise SystemExit(
+            f"quantized weights not found: {quant_path}\n"
+            f"  --quant-path takes the experts_q4.pt file, or the directory "
+            f"containing it. Quantize the model first."
+        )
+    return quant_path
 
 
 def _load_dataset(path: str, seq_len: int):
