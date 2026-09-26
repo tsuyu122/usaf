@@ -88,6 +88,9 @@ def build_parser():
     p.add_argument("--train-from", type=int, default=0,
                    help="First trainable layer (0=auto)")
     p.add_argument("--reselect-every", type=int, default=50)
+    p.add_argument("--generate-after", type=str, default="",
+                   help="Generate from this prompt after training ("" to skip); use || to separate several")
+    p.add_argument("--generate-tokens", type=int, default=48)
 
     p.add_argument("--no-frozen-cache", action="store_true")
     p.add_argument("--no-resident", action="store_true")
@@ -142,6 +145,8 @@ class TrainConfig:
     weight_decay: float = 0.005
     train_from: int = 0
     reselect_every: int = 50
+    generate_after: str = ""
+    generate_tokens: int = 48
     use_frozen_cache: bool = True
     frozen_cache_n: int = 0
     use_resident: bool = True
@@ -186,6 +191,8 @@ def parse_args(args=None) -> TrainConfig:
         weight_decay=ns.wd,
         train_from=ns.train_from,
         reselect_every=ns.reselect_every,
+        generate_after=ns.generate_after,
+        generate_tokens=ns.generate_tokens,
         use_frozen_cache=not ns.no_frozen_cache,
         frozen_cache_n=ns.frozen_cache_n,
         use_resident=not ns.no_resident,
@@ -1750,6 +1757,56 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             )
             print(f"  >>> checkpoint saved: {ckpt_path}", flush=True)
 
+
+    # A loss curve is evidence that something moved, not that anyone can tell.
+    # The question a person actually has after a fine-tune is what the model now
+    # says, and answering it meant reloading 17 GB of base weights in a second
+    # process. In here the model is already built and the trained values are
+    # already in the cache overlays, so the only thing missing was the call.
+    #
+    # The expert modules had their parameters cleared at load time and are
+    # refilled by forward pre-hooks from the quantized cache, which is exactly
+    # what makes a plain model(...) work here: the graph goes through the same
+    # path the training forward took, with the overlays already applied.
+    if config.generate_after:
+        try:
+            tokenizer = _get_tokenizer(config.model_path)
+            if tokenizer is None:
+                print("\n[generate] no tokenizer for this model, skipping",
+                      flush=True)
+            else:
+                # DataParallel wraps the module but does not forward generate, so the unwrapped model is what samples.
+                _gen_model = model.module if hasattr(model, "module") else model
+                _gen_model.eval()
+                for _prompt in config.generate_after.split("||"):
+                    _prompt = _prompt.strip()
+                    if not _prompt:
+                        continue
+                    _inputs = tokenizer(_prompt, return_tensors="pt").to(device)
+                    with torch.no_grad():
+                        _out = _gen_model.generate(
+                            **_inputs,
+                            max_new_tokens=config.generate_tokens,
+                            do_sample=False,
+                            temperature=None,
+                            top_p=None,
+                            pad_token_id=tokenizer.pad_token_id
+                            or tokenizer.eos_token_id,
+                        )
+                    _new = _out[0][_inputs["input_ids"].shape[1]:]
+                    print()
+                    print("=" * 66)
+                    print(f"PROMPT: {_prompt}")
+                    print("-" * 66)
+                    print(tokenizer.decode(_new, skip_special_tokens=True))
+                    print("=" * 66, flush=True)
+                _gen_model.train()
+        except Exception as _gen_err:  # noqa: BLE001
+            # Generation is a demonstration, not the point of the run. Losing it
+            # must not turn a finished training run into a failed one, but it
+            # must not be silent either: the reason goes to stdout.
+            print(f"\n[generate] failed: {type(_gen_err).__name__}: {_gen_err}",
+                  flush=True)
     t_total = time.time() - t_start
     skipped = sum(1 for l in losses if not math.isfinite(l))
 
