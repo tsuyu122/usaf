@@ -469,17 +469,23 @@ def main(args=None):
             model = _load_and_run(_layers_now)
             break
         except torch.OutOfMemoryError as _oom:
-            for _v in ("_model", "_cache", "_q_dict", "_router"):
-                globals().pop(_v, None)
+            _why = str(_oom).splitlines()[0] if _oom.args else ""
+            # The model, the expert cache and the quantized dict are locals of
+            # _load_and_run, so they go away with that frame and gc.collect()
+            # has nothing to find. An earlier version tried to clear them out of
+            # globals(), where they never were, which meant the collection was
+            # the only thing standing between a failed attempt and the next one.
+            # An even later version deleted the exception first, on the theory
+            # that a caught exception pins its traceback; measured on this
+            # interpreter, CPython does not, and the del changed nothing.
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             if len(_layers_now) <= 1:
                 raise SystemExit(
                     f"Out of memory with a single trainable layer "
-                    f"({_oom.args[0].splitlines()[0]}); the model does not fit "
-                    f"this GPU at all."
-                ) from _oom
+                    f"({_why}); the model does not fit this GPU at all."
+                )
             _keep = max(1, int(len(_layers_now) * 0.75))
             print(f"\nOut of memory with {len(_layers_now)} trainable layers. "
                   f"Retrying with the top {_keep}.", flush=True)
