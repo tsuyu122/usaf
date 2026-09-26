@@ -1380,6 +1380,26 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                     _h = _ad.call(_i, _h, _pos)
                 return _h
 
+            # Building the cache re-runs layers 0..DETACH_AT for every sample, and
+            # the experts those layers need come out of the 4-bit payload every
+            # time. For ZAYA that is 11.7 GB dequantized per sample across 124
+            # samples, and it is where the build spends its time: a 4.93 ms
+            # matmul layer against a 32 s sample, measured on a real T4. The
+            # resident set dequantizes once and keeps it, turning a repeated
+            # dequant into a repeated read. It covers only the frozen layers, it
+            # is released as soon as the cache is on disk, and the existing
+            # make_resident call for the trainable layers is untouched.
+            _cache_layers = sorted({
+                int(_m.split(".")[2])
+                for _m in cache._expert_to_params
+                if _m.startswith("model.layers.")
+            })
+            _cache_layers = [i for i in _cache_layers if i <= DETACH_AT]
+            if _cache_layers:
+                print(f"  residentizando {len(_cache_layers)} camadas do cache ",
+                      flush=True)
+                cache.make_resident(_cache_layers)
+                cache._prefetch_disabled = True
             _ck = os.path.join(config.checkpoint_dir or "checkpoints",
                                f"frozen_cache_d{DETACH_AT}.npy")
             FROZEN_CACHE = build_frozen_cache(
@@ -1393,6 +1413,18 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                 config.model_path, _compute_hidden, _ck,
             )
             print(f"  Frozen cache: layers 0..{DETACH_AT} for {len(_fc_train)} samples")
+            # The frozen layers are no longer read by anything: the cache holds
+            # their activations and free_frozen drops their 4-bit entries. Leaving
+            # them resident would keep 11.7 GB of host RAM occupied for the rest
+            # of the run, next to the resident set that the trainable layers
+            # need, and make_resident checks the budget against what is already
+            # held - so holding both is how the second one gets skipped.
+            if _cache_layers:
+                cache.free_frozen(DETACH_AT)
+                cache._resident.clear()
+                cache._resident_active = False
+                cache._prefetch_disabled = False
+                print("  resident do cache liberada apos o build", flush=True)
         else:
             print("  Frozen cache skipped: no layer is frozen (train-from is 0)")
 
