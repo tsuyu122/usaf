@@ -16,13 +16,22 @@ import torch
 
 
 def dataset_fingerprint(samples, detach_at: int, src: str) -> str:
-    """Invalidation key: sample input_ids + layer + model source."""
+    """Invalidation key: sample input_ids + layer + model source.
+
+    Each sample's length is hashed before its tokens. Without that separator,
+    samples [1,2],[3] and [1],[2,3] concatenate to the same bytes and produce
+    the same fingerprint, so a cache built for one segmentation would be
+    accepted for the other - same N, same seq, same hidden, all checks passing,
+    and the rows holding activations for entirely different samples.
+    """
     h = hashlib.sha256()
     h.update(f"{detach_at}|{src}".encode())
     for s in samples:
         ids = s["input_ids"]
         arr = ids.numpy() if hasattr(ids, "numpy") else np.asarray(ids)
-        h.update(np.asarray(arr, dtype=np.int32).tobytes())
+        flat = np.asarray(arr, dtype=np.int32).ravel()
+        h.update(len(flat).to_bytes(8, "little"))
+        h.update(flat.tobytes())
     return h.hexdigest()[:16]
 
 
