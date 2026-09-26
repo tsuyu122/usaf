@@ -1035,6 +1035,48 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
     print(f"  {n_loaded} non-expert params loaded")
 
 
+    # A config with tie_word_embeddings does not store lm_head.weight in the
+    # checkpoint - it is the input embedding. ZAYA1-8B is tied, so lm_head came
+    # out of the load on meta and the first forward died in the head. Re-tie it
+    # from the embedding that was just loaded, which is what the tied config
+    # means, rather than inventing a second copy of the weights.
+    if getattr(cfg, "tie_word_embeddings", False):
+        _emb = dict(model.named_parameters()).get("model.embed_tokens.weight")
+        _head = None
+        for _mn3, _mod3 in model.named_modules():
+            if _mn3.endswith("lm_head"):
+                _head = _mod3
+                break
+        if _emb is not None and _head is not None and \
+                _head.weight.device.type == "meta":
+            _head.weight = nn.Parameter(
+                _emb.detach().clone().to(device=device), requires_grad=False)
+            print("  tied lm_head.weight to the input embedding", flush=True)
+
+    # Buffers that are registered but not persisted - an aux-loss accumulator
+    # like a router's balancing bias is the common case - have no checkpoint
+    # entry and no reconstruction rule. transformers builds them in __init__, and
+    # __init__ is exactly what cannot run against a meta model. Zeros are the
+    # faithful value for an accumulator that has never seen a step, so they are
+    # filled and named. A parameter in the same position is NOT zero-filled: a
+    # zeroed weight trains and exports as a model that looks fine and is wrong,
+    # so that still stops the run.
+    zeroed: list[str] = []
+    for _mn4, _mod4 in model.named_modules():
+        for _bn4, _b4 in list(_mod4._buffers.items()):
+            if _b4 is None or _b4.device.type != "meta":
+                continue
+            _mod4._buffers[_bn4] = torch.zeros(
+                _b4.shape, dtype=_b4.dtype, device=device)
+            zeroed.append(_mn4 + "." + _bn4)
+    if zeroed:
+        uniq_z = sorted(set(zeroed))
+        print(f"  {len(uniq_z)} non-persistent buffer(s) zero-filled "
+              f"(not stored in the checkpoint): "
+              + ", ".join(uniq_z[:3])
+              + (f", ... and {len(uniq_z) - 3} more" if len(uniq_z) > 3 else ""),
+              flush=True)
+
     # Anything still on meta at this point is a tensor the model was built with
     # and nothing ever filled in: not in the checkpoint, not an expert, and not
     # one of the RoPE buffers repaired above. The first forward then reaches it,
