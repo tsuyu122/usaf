@@ -213,7 +213,17 @@ def setup_device(config: TrainConfig) -> tuple[torch.device, int, object]:
     patch_mixtral_for_dml()
 
     if config.use_cuda:
-        assert torch.cuda.is_available(), "CUDA requested but not available"
+        # An assert, not a check: python -O strips asserts entirely, so under -O
+        # this silently fell through to building a CUDA device on a machine
+        # with no CUDA, and the failure arrived later as a shape error inside
+        # the model. It also printed "Backend: CUDA" before dying, so the last
+        # thing on screen claimed a backend that was never used.
+        if not torch.cuda.is_available():
+            raise SystemExit(
+                "--cuda was requested but torch reports no CUDA device.\n"
+                f"  torch {torch.__version__} sees {torch.cuda.device_count()} GPUs.",
+                "  Drop --cuda to use DirectML or the CPU."
+            )
         device = torch.device("cuda")
         n_gpus = torch.cuda.device_count()
 
@@ -278,8 +288,11 @@ def main(args=None):
     print(f"Param naming: {moe_cfg.expert_prefix} -> {moe_cfg.expert_param_names}")
     print(f"Router: {moe_cfg.router_path}")
 
-    print(f"\nBackend: {'CUDA' if config.use_cuda else 'DirectML/CPU'}")
+    # setup_device first, then announce. Announcing first meant a run that died
+    # a line later still left "Backend: CUDA" as the last thing on screen,
+    # claiming a backend it never got to use.
     device, n_gpus, scaler = setup_device(config)
+    print(f"\nBackend: {'CUDA' if config.use_cuda else 'DirectML/CPU'}")
 
     if config.use_multi_gpu and n_gpus > 1 and config.use_cuda:
         print(f"Multi-GPU: DataParallel across {n_gpus} GPUs")

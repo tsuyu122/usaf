@@ -221,7 +221,10 @@ Mixtral and a 4-layer Qwen3 with head_dim 8):
 - The quantized export carries the trained values and leaves every position
   outside the active set bit-identical to the original.
 - Every user-facing error path, each of which previously failed somewhere
-  unrelated to the actual mistake.
+  unrelated to the actual mistake. `--cuda` on a machine without an NVIDIA
+  GPU now exits 1 with what torch saw and what to do instead, and does so
+  before announcing a backend, rather than printing `Backend: CUDA` and then
+  dying on a bare `assert` that `python -O` would have removed entirely.
 
 **Not verified here:**
 
