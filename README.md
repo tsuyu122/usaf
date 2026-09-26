@@ -209,7 +209,11 @@ Mixtral and a 4-layer Qwen3 with head_dim 8):
 - Training, and the loss going down.
 - All 31 arguments of the universal CLI, individually and in combination.
 - `--resume`, `--export`, `--eval-only`, `--eval-report`, `--save-every`,
-  `--checkpoint-dir`, reselection, accumulation, and the frozen-cache path.
+  `--checkpoint-dir`, reselection and accumulation.
+- The frozen cache: the cached hidden state is compared against a fresh forward
+  of the same prefix and is bit-identical, a run with the cache and a run
+  without it reach the same loss, and the cache is reused across processes
+  rather than rebuilt.
 - The quantized export carries the trained values and leaves every position
   outside the active set bit-identical to the original.
 - Every user-facing error path, each of which previously failed somewhere

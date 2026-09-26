@@ -734,6 +734,9 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     from usaf.quantization import dequantize_4bit
     from usaf.sparse_optim import SparseAdam
 
+    # Filled in once _prelude exists, just below.
+    FROZEN_CACHE = None
+
     def _prelude(input_ids):
         hidden = embed(input_ids)
         s_len = hidden.shape[1]
@@ -743,6 +746,40 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             torch.full((s_len, s_len), torch.finfo(torch.float16).min, device=device, dtype=torch.float16),
             diagonal=1).unsqueeze(0).unsqueeze(0)
         return hidden, pos_ids, (cos, sin), mask
+
+    # Frozen activation cache for layers 0..DETACH_AT.
+    #
+    # --no-frozen-cache used to be a flag that changed nothing: the config field
+    # was read, printed as "Frozen cache: True/False", and no cache was ever
+    # built. Layers 0..DETACH_AT are frozen by construction (only layers above
+    # DETACH_AT are trainable), so their output for a given sample does not
+    # change during a run and can be computed once and reused.
+    if config.use_frozen_cache:
+        if DETACH_AT >= 0:
+            from usaf.frozen_cache import build_frozen_cache
+
+            _n = config.frozen_cache_n if config.frozen_cache_n > 0 else len(train_samples)
+            _fc_train = train_samples[:_n]
+            for _i, _s in enumerate(_fc_train):
+                _s["_fidx"] = _i
+
+            def _compute_hidden(s):
+                _ids = torch.tensor(s["input_ids"], dtype=torch.long).unsqueeze(0).to(device)
+                _h, _pos, _pe, _mask = _prelude(_ids)
+                for _i in range(DETACH_AT + 1):
+                    _h = layers[_i](_h, attention_mask=_mask, position_ids=_pos,
+                                    position_embeddings=_pe)
+                return _h
+
+            _ck = os.path.join(config.checkpoint_dir or "checkpoints",
+                               f"frozen_cache_d{DETACH_AT}.npy")
+            FROZEN_CACHE = build_frozen_cache(
+                _fc_train, SEQ, model.config.hidden_size, DETACH_AT,
+                config.model_path, _compute_hidden, _ck,
+            )
+            print(f"  Frozen cache: layers 0..{DETACH_AT} for {len(_fc_train)} samples")
+        else:
+            print("  Frozen cache skipped: no layer is frozen (train-from is 0)")
 
     def _head_loss(hidden, labels):
         h = norm_fn(hidden)
@@ -879,8 +916,15 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         hidden, pos_ids, pe, mask = _prelude(ids)
 
         with torch.no_grad():
-            for i in range(DETACH_AT + 1):
-                hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
+            _cached = FROZEN_CACHE is not None and all("_fidx" in s for s in batch)
+            if _cached:
+                from usaf.frozen_cache import get_hidden
+                hidden = torch.cat(
+                    [get_hidden(FROZEN_CACHE, s["_fidx"], device) for s in batch],
+                    dim=0).to(hidden.dtype)
+            else:
+                for i in range(DETACH_AT + 1):
+                    hidden = layers[i](hidden, attention_mask=mask, position_ids=pos_ids, position_embeddings=pe)
             cache.evict_all()
             xs = []
             for i in range(DETACH_AT + 1, N_LAYERS):
