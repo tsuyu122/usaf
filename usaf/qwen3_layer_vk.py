@@ -118,11 +118,31 @@ def rope_vk(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tens
 
 class Qwen3LayerWeights:
     """Holds layer weights as fp16 tensors on CPU, uploaded to Vulkan on demand."""
-    def __init__(self, weights_dict, device="cpu"):
+
+    def __init__(self, weights_dict, device="cpu", head_dim: int = 128):
         self.W = {}
         for k, v in weights_dict.items():
             self.W[k] = _fp16_to(v, device)
         self.device = device
+        # head_dim cannot be recovered from these tensors. q_proj has shape
+        # [num_heads * head_dim, hidden], so any divisor is consistent with any
+        # head count, and every wrong answer produces a tensor that reshapes
+        # cleanly and an attention that is quietly the wrong shape - no error,
+        # just a different number. It used to be the constant 128, which is
+        # only Qwen3-30B-A3B: a model with head_dim 256, like ZAYA1-8B at
+        # hidden 2048 with 8 heads, was reported as 16 heads of 128 and computed
+        # its attention over twice as many heads as it has. Callers pass the
+        # real value; 128 stays the default so existing callers keep working.
+        for key in ("self_attn.q_proj.weight", "self_attn.k_proj.weight"):
+            w = self.W.get(key)
+            if w is not None and w.shape[0] % head_dim:
+                raise ValueError(
+                    f"{key} projects to {w.shape[0]} values, which is not a "
+                    f"multiple of head_dim={head_dim}. A head_dim that does "
+                    f"not divide it would give a head count that is wrong "
+                    f"without anything raising."
+                )
+        self._head_dim = head_dim
 
     def get(self, key):
         return self.W[key]
@@ -143,7 +163,7 @@ class Qwen3LayerWeights:
 
     @property
     def head_dim(self):
-        return 128  # Qwen3-30B-A3B
+        return self._head_dim
 
 
 def qwen3_layer_forward_vk(
