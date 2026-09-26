@@ -27,9 +27,30 @@ def ram() -> float:
     return psutil.Process(os.getpid()).memory_info().rss / 1024**3
 
 
-def _get_tokenizer():
-    """Get the global tokenizer instance, if available."""
-    return getattr(_get_tokenizer, "_instance", None)
+def _get_tokenizer(model_path: str | None = None):
+    """Return a tokenizer for ``model_path``, or None if there is none.
+
+    This used to return a global set by _set_tokenizer(), which in turn was
+    only ever fed from ``model.tokenizer``. Models are built here with
+    ``from_config`` and carry no tokenizer attribute at all, so the global
+    was always None and --eval-only died with a bare
+    "'NoneType' object is not callable" from deep inside perplexity.py.
+    """
+    tok = getattr(_get_tokenizer, "_instance", None)
+    if tok is not None:
+        return tok
+    if not model_path:
+        return None
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    except Exception as e:
+        print(f"  [warn] no tokenizer for {model_path}: {type(e).__name__}")
+        return None
+    if tok.pad_token is None and tok.eos_token is not None:
+        tok.pad_token = tok.eos_token
+    _set_tokenizer(tok)
+    return tok
 
 
 def _set_tokenizer(tok):
@@ -340,14 +361,38 @@ def main(args=None):
         from usaf.eval.report import save_report
 
         ds_list = [d.strip() for d in config.eval_datasets.split(",") if d.strip()]
+        if not ds_list:
+            raise SystemExit(
+                "--eval-only needs at least one dataset in --eval-datasets"
+            )
+        tokenizer = _get_tokenizer(config.model_path)
+        if tokenizer is None:
+            raise SystemExit(
+                f"--eval-only needs a tokenizer, and none could be loaded "
+                f"from {config.model_path}. A model built with from_config "
+                f"has none, so save one next to the weights "
+                f"(tokenizer.json / tokenizer_config.json), or pass a model "
+                f"id that ships one. Use the normal training path if you only "
+                f"want perplexity on the training dataset."
+            )
+        # A tokenizer whose vocabulary does not fit the model produces token
+        # ids past the embedding table, which used to crash deep inside
+        # torch.embedding with a bare "index out of range in self".
+        model_vocab = getattr(getattr(model, "config", None), "vocab_size", None)
+        tok_vocab = max(len(tokenizer), getattr(tokenizer, "vocab_size", 0) or 0)
+        if model_vocab and tok_vocab > model_vocab:
+            raise SystemExit(
+                f"--eval-only: the tokenizer produces {tok_vocab} distinct "
+                f"ids but {config.model_path} has an embedding table of only "
+                f"{model_vocab}. These are not the same model's tokenizer."
+            )
         eval_cfg = BenchmarkConfig(
             datasets=ds_list,
             max_samples=config.eval_samples,
             seq_len=config.seq_len,
         )
         results = run_benchmark(
-            model, model.tokenizer if hasattr(model, "tokenizer") else _get_tokenizer(),
-            device, eval_cfg,
+            model, tokenizer, device, eval_cfg,
             model_name=config.model_path,
         )
         results.print()

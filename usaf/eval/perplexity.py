@@ -15,6 +15,18 @@ def compute_perplexity(
     desc: str = "Evaluating",
     verbose: bool = True,
 ) -> dict[str, float]:
+    if tokenizer is None:
+        # Previously this surfaced as "'NoneType' object is not callable" a
+        # dozen frames down, giving no hint that the caller never loaded a
+        # tokenizer at all.
+        raise ValueError(
+            "compute_perplexity() needs a tokenizer; got None. Load one with "
+            "AutoTokenizer.from_pretrained(model_path)."
+        )
+    if not callable(tokenizer):
+        raise TypeError(
+            f"expected a callable tokenizer, got {type(tokenizer).__name__}"
+        )
     model.eval()
     total_loss = 0.0
     total_tokens = 0
