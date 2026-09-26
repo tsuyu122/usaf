@@ -192,11 +192,32 @@ def _auto_configure_training(config: MoEConfig, vram_gb: float, system_ram_gb: f
 def get_trainable_layers(config: MoEConfig, custom_train_from: int | None = None) -> set[int]:
     """Get the set of trainable layer indices.
 
+    ``custom_train_from`` of 0 or None means "let the memory budget decide", which
+    is what --train-from documents (its default is 0 and its help says 0=auto).
+    That budget is what _auto_configure_training computed into max_trainable_layers
+    and train_from, and it takes the last N layers so the deepest ones get the
+    sparse treatment.
+
+    Taking 0 as a literal start instead - which is what this did, because main()
+    always passes the parsed int rather than None - overrode the budget with
+    "from the first layer" and trained every layer of every model. The sizing
+    work in _auto_configure_training was therefore inert on every default
+    invocation, and a run that did not fit in VRAM found out at the first
+    allocation instead of at the point where the budget was chosen.
+
     An empty result used to reach the caller and blow up as "min() arg is an
     empty sequence" while formatting a progress line. A train-from past the end
     of the model trains nothing, which is always a mistake, so say so here.
     """
-    start = custom_train_from if custom_train_from is not None else config.train_from
+    if custom_train_from is None or custom_train_from == 0:
+        cap = config.max_trainable_layers
+        if cap and cap > 0:
+            start = max(0, config.num_layers - min(cap, config.num_layers))
+        else:
+            # No budget was computed, so honour whatever train_from says.
+            start = config.train_from
+    else:
+        start = custom_train_from
     if start < 0:
         raise SystemExit(f"train-from must not be negative, got {start}")
     if start >= config.num_layers:

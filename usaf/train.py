@@ -969,13 +969,18 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
                 # AttributeError on "None_inv_freq". Anything ending in
                 # _inv_freq is a RoPE frequency buffer; the prefix names the
                 # layer type it belongs to.
-                # "original_inv_freq" is transformers' own name for the
-                # unscaled frequencies a dynamic/linear rope keeps around - it is
-                # not a layer type, and matching it rebuilt a RoPE from a
-                # config that has no such type and stopped every run.
+                # A stack with one RoPE per layer type registers two buffers per
+                # type: "<type>_inv_freq" and a clone named
+                # "<type>_original_inv_freq". transformers' own single-RoPE
+                # modules use the same "original" suffix with no prefix. Either
+                # way the "original" copy is a clone, not a per-type frequency,
+                # so it is skipped and filled from the primary below.
                 if bn == "inv_freq":
                     _lt = None
-                elif bn.endswith("_inv_freq") and bn != "original_inv_freq":
+                elif bn == "original_inv_freq" or bn.endswith("_original_inv_freq"):
+                    _lt = None
+                    bn = None
+                elif bn.endswith("_inv_freq"):
                     _lt = bn[: -len("_inv_freq")]
                 else:
                     _lt = None
