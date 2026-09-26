@@ -53,10 +53,20 @@ def detect_model(model_path: str, vram_gb: float = 0, system_ram_gb: float = 0) 
     try:
         cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     except Exception as e:
-        if looks_local and not os.path.exists(os.path.join(model_path, "config.json")):
+        cfg_path = os.path.join(model_path, "config.json")
+        if looks_local and not os.path.exists(cfg_path):
             raise SystemExit(
                 f"{model_path} has no config.json; that is not a model directory "
                 f"(original error: {type(e).__name__}: {e})"
+            ) from e
+        # The file is there but AutoConfig still cannot read it: a config with no
+        # model_type, a truncated download, a directory that is not a model. The raw
+        # ValueError from deep inside configuration_auto names none of those.
+        if looks_local:
+            raise SystemExit(
+                f"{cfg_path} is not a config transformers can read "
+                f"({type(e).__name__}: {e}). A model directory needs a "
+                f"config.json with a model_type key."
             ) from e
         raise
 
