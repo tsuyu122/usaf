@@ -1414,10 +1414,21 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         ids = torch.tensor([sample["input_ids"]], dtype=torch.long).to(device)
         lbl = torch.tensor([sample["labels"]], dtype=torch.long).to(device)
         hidden, pos_ids, ad, mask = _prelude(ids)
+        # Under no_grad, like the training forward. The loop below replays every
+        # layer from xs_imp in reverse and threads the gradient through by hand,
+        # so the graph this loop used to build was never used for anything - it
+        # only pinned one layer worth of expert weights per layer, all at once,
+        # because autograd keeps a matmul weight alive until that matmul is
+        # differentiated. On a model small enough to fit, that is invisible. On
+        # one with eleven trainable layers it is the whole card, and it is why
+        # the importance pass ran out of memory on every layer count including
+        # two: the peak had nothing to do with how many layers were trainable,
+        # because it was always every layer at once.
         xs_imp = []
-        for i in range(N_LAYERS):
-            xs_imp.append(hidden)
-            hidden = ad.call(i, hidden, pos_ids)
+        with torch.no_grad():
+            for i in range(N_LAYERS):
+                xs_imp.append(hidden)
+                hidden = ad.call(i, hidden, pos_ids)
         cache.evict_all()
         h_last = hidden.detach().requires_grad_(True)
         loss = _head_loss(h_last, lbl)
