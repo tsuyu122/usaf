@@ -6,11 +6,17 @@ and num_kv_heads by dividing the projection widths by it. That is right for
 Qwen3-30B-A3B and wrong for everything else, and wrong in the worst way:
 
 head_dim cannot be recovered from these tensors at all. q_proj is [num_heads *
-head_dim, hidden], so every divisor is consistent with every head count. A model
-with head_dim 256 - ZAYA1-8B is hidden 2048 with 8 heads, so exactly 256 - was
-reported as 16 heads of 128. Every reshape still worked, because 2048 = 16 *
-128 just as well as 8 * 256, and the attention was computed over twice as many
-heads as the model has. Nothing raises; the answer is just a different number.
+head_dim, hidden], so every divisor is consistent with every head count. Take a
+projector of width 2048: read as 16 heads of 128 or as 8 heads of 256, both are
+arithmetic on the same number. Every reshape still works, and the attention is
+computed over the wrong number of heads. Nothing raises; the answer is just a
+different number.
+
+ZAYA1-8B is exactly that shape - hidden 2048, 8 heads, so 256 by the division -
+and the test below originally used it as a head_dim 256 example. ZayaConfig
+declares head_dim = 128, so q_proj projects to 1024 and 8 heads of 128 is the
+right answer. The config is the authority and the division is the mistake this
+parameter exists to prevent, which is worth more than the example was.
 
 head_dim is a constructor argument now, and it is checked against the
 projections: a head_dim that does not divide them is rejected rather than

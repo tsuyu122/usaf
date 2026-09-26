@@ -128,11 +128,19 @@ class Qwen3LayerWeights:
         # [num_heads * head_dim, hidden], so any divisor is consistent with any
         # head count, and every wrong answer produces a tensor that reshapes
         # cleanly and an attention that is quietly the wrong shape - no error,
-        # just a different number. It used to be the constant 128, which is
-        # only Qwen3-30B-A3B: a model with head_dim 256, like ZAYA1-8B at
-        # hidden 2048 with 8 heads, was reported as 16 heads of 128 and computed
-        # its attention over twice as many heads as it has. Callers pass the
-        # real value; 128 stays the default so existing callers keep working.
+        # just a different number.
+        #
+        # It used to be the constant 128. That is a fact about the Qwen3
+        # releases, not about the model in front of you, and a config that
+        # declares head_dim is the authority. The callers read it off the
+        # config; 128 stays the default so existing callers keep working.
+        #
+        # ZAYA1-8B is a case where 128 is right: it is hidden 2048 with 8
+        # heads, which suggests 256, but ZayaConfig declares head_dim = 128,
+        # so q_proj projects to 1024 and the answer is 8 heads of 128. An
+        # earlier version of this comment claimed ZAYA was a head_dim 256
+        # model on the strength of that division alone. Dividing hidden by
+        # heads is the very inference this parameter exists to stop making.
         for key in ("self_attn.q_proj.weight", "self_attn.k_proj.weight"):
             w = self.W.get(key)
             if w is not None and w.shape[0] % head_dim:
