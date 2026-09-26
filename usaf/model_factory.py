@@ -13,6 +13,8 @@ class MoEConfig:
     num_key_value_heads: int = 0
     head_dim: int = 0
     vocab_size: int = 0
+    tie_word_embeddings: bool = False
+    estimated_fixed_gb: float = 0.0
     num_experts: int = 0
     num_experts_per_tok: int = 2
     expert_intermediate: int = 0
@@ -78,6 +80,7 @@ def detect_model(model_path: str, vram_gb: float = 0, system_ram_gb: float = 0) 
         num_key_value_heads=getattr(cfg, 'num_key_value_heads', cfg.num_attention_heads),
         head_dim=getattr(cfg, 'head_dim', cfg.hidden_size // cfg.num_attention_heads),
         vocab_size=cfg.vocab_size,
+    tie_word_embeddings=bool(getattr(cfg, "tie_word_embeddings", False)),
     )
 
     config.num_experts = _detect_num_experts(cfg)
@@ -164,25 +167,37 @@ def _auto_configure_training(config: MoEConfig, vram_gb: float, system_ram_gb: f
     optimizer_gb = expert_bytes * 0.5 * 2
     overhead_gb = 0.5
 
-    config.estimated_per_layer_gb = resident_gb + q4_gb + optimizer_gb + overhead_gb
+    # layers train, and the budget never counted them. ZAYA1-8B ties its head to
+    # the input embedding, so that is one tensor of vocab x hidden - 262272 x
+    # 2048 in fp16 is 1.07 GB, a fifteenth of a 15.6 GB card. The run that
+    # estimated 14 trainable layers then died 65 minutes in trying to allocate
+    # 256 MB with 194 MB free, because the layers it had budgeted for and the
+    # embedding it had ignored together exceeded the card.
+    _vocab = getattr(config, "vocab_size", 0) or 0
+    _heads = 1 if getattr(config, "tie_word_embeddings", False) else 2
+    fixed_gb = (_vocab * config.hidden_size * 2 * _heads) / 1e9 if _vocab else 0.0
+    config.estimated_fixed_gb = fixed_gb
 
+    # The attention weights of each trainable layer are also resident and are
+    # not part of the expert tensors the estimate is built from: four projections
+    # of hidden x hidden in fp16.
+    attn_gb = (4 * config.hidden_size * config.hidden_size * 2) / 1e9
+    config.estimated_per_layer_gb = (
+        resident_gb + q4_gb + optimizer_gb + overhead_gb + attn_gb
+    )
+
+    # The embedding and the output head are on the device no matter how many
     usable_ram = system_ram_gb * 0.6
     max_by_ram = int(usable_ram / max(config.estimated_per_layer_gb, 0.1))
 
-    # The resident expert weights and the optimizer moments sit on the device,
-    # so host RAM is the wrong bound whenever there is a GPU. Sizing by host RAM
-    # only made the estimate track the machine rather than the card: on a Kaggle
-    # kernel, about 30 GB of host RAM against 15.6 GB of VRAM, ZAYA1-8B came out
-    # at 29 trainable layers times 0.617 GB - 17.9 GB of layers in a 15.6 GB
-    # card. Raising the VRAM from 15.6 to 79 GB changed the answer not at all,
-    # because vram_gb was stored in the config and then read by nothing.
-    #
-    # vram_gb is set to 0 just above and overwritten from torch.cuda when a
-    # device exists, so it is greater than zero exactly when one was found.
+    # The safety factor is 0.8 rather than 0.9 because the tail of a real run is
+    # fragmentation and the frozen activation cache, neither of which is a tensor
+    # the estimate knows about. The 0.9 fitted the layer count on paper and
+    # overflowed in practice.
     if vram_gb > 0:
-        max_by_vram = int((vram_gb * 0.9)
+        max_by_vram = int(((vram_gb * 0.8) - fixed_gb)
                          / max(config.estimated_per_layer_gb, 0.1))
-        max_by_ram = min(max_by_ram, max_by_vram)
+        max_by_ram = min(max_by_ram, max(1, max_by_vram))
 
     config.max_trainable_layers = max(1, min(config.num_layers, max_by_ram))
 

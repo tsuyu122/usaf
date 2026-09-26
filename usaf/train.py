@@ -8,6 +8,7 @@ Usage:
     python -m usaf.train --help
 """
 import argparse
+import gc
 import json
 import math
 import os
@@ -349,116 +350,135 @@ def main(args=None):
     )
     print(f"Q4 weights: {config.quant_path}")
 
-    print("\nLoading model...")
-    model, cache, q_dict, wf, st_path, router_params, model_cfg = _load_model(
-        config, moe_cfg, device, train_layers)
+    # A layer budget is an estimate, and the estimate for a model only ever
+    # met on real hardware was optimistic: it chose 14 trainable layers for
+    # ZAYA1-8B on a 15.6 GB T4, the run got 65 minutes in, and it died trying to
+    # allocate 256 MB with 194 MB free. Rather than treat that as a lost run,
+    # the load and the training loop are repeated with fewer layers: each OOM
+    # drops the layer count to three quarters and starts again. The frozen
+    # activation cache is rebuilt from scratch on the way in, so nothing from
+    # the failed attempt is carried over.
+    #
+    # A shrink that cannot save memory never will, so at one layer the loop stops
+    # and reports rather than grinding.
+    def _load_and_run(_layers):
+        print(f"\nLoading model... (trainable: {len(_layers)} layers)")
+        _model, _cache, _q_dict, _wf, _st, _router, _model_cfg = _load_model(
+            config, moe_cfg, device, _layers)
 
-    if config.use_multi_gpu and n_gpus > 1 and config.use_cuda:
-        model = nn.DataParallel(model)
+        if config.use_multi_gpu and n_gpus > 1 and config.use_cuda:
+            _model = nn.DataParallel(_model)
 
-    param_patterns = get_param_patterns(moe_cfg)
-    _train_names = []
-    for li in sorted(train_layers):
-        _train_names.extend(param_patterns[li])
+        _patterns = get_param_patterns(moe_cfg)
+        _train_names = []
+        for _li in sorted(_layers):
+            _train_names.extend(_patterns[_li])
 
-    def _q_shape(fn):
-        e = q_dict[fn]
-        if isinstance(e, dict):
-            return tuple(e["shape"])
-        return tuple(e[3])
+        def _q_shape(fn):
+            e = _q_dict[fn]
+            if isinstance(e, dict):
+                return tuple(e["shape"])
+            return tuple(e[3])
 
-    _shapes = {fn: _q_shape(fn) for fn in _train_names}
+        _shapes = {fn: _q_shape(fn) for fn in _train_names}
 
-    base = model.module if hasattr(model, 'module') else model
-    if hasattr(base, 'model') and hasattr(base.model, 'layers'):
-        transformer = base.model
-    elif hasattr(base, 'transformer') and hasattr(base.transformer, 'layers'):
-        transformer = base.transformer
-    else:
-        raise RuntimeError("Cannot find transformer layers in model. Expected .model.layers or .transformer.layers")
+        _base = _model.module if hasattr(_model, 'module') else _model
+        if hasattr(_base, 'model') and hasattr(_base.model, 'layers'):
+            _transformer = _base.model
+        elif hasattr(_base, 'transformer') and hasattr(_base.transformer, 'layers'):
+            _transformer = _base.transformer
+        else:
+            raise RuntimeError(
+                "Cannot find transformer layers in model. Expected .model.layers"
+                " or .transformer.layers")
 
-    layers = transformer.layers
-    embed = transformer.embed_tokens
-    rotary = transformer.rotary_emb
-    norm_fn = transformer.norm
-    lm_head = base.lm_head
+        _layers_mod = _transformer.layers
+        _embed = _transformer.embed_tokens
+        _rotary = _transformer.rotary_emb
+        _norm_fn = _transformer.norm
+        _lm_head = _base.lm_head
 
-    resume_ckpt = None
-    resume_path = _check_resume_path(config.resume_path)
-    if resume_path:
-        print(f"Resuming from checkpoint: {resume_path}")
-        from usaf.checkpoint import load_sparse_checkpoint
-        resume_ckpt = load_sparse_checkpoint(resume_path)
-        print(f"  Resumed at step {resume_ckpt.get('step', 0)}, "
-              f"{len(resume_ckpt.get('losses', []))} logged losses")
+        _resume = None
+        _rpath = _check_resume_path(config.resume_path)
+        if _rpath:
+            print(f"Resuming from checkpoint: {_rpath}")
+            from usaf.checkpoint import load_sparse_checkpoint
+            _resume = load_sparse_checkpoint(_rpath)
+            print(f"  Resumed at step {_resume.get('step', 0)}, "
+                  f"{len(_resume.get('losses', []))} logged losses")
 
-    print("\nStarting training...")
-    print(f"  Sparsity: {config.frac*100:.1f}%")
-    print(f"  RigL: every {config.reselect_every} steps")
-    print(f"  Resident: {config.use_resident}")
-    print(f"  Frozen cache: {config.use_frozen_cache}")
-    if resume_ckpt:
-        print(f"  Resume: step {resume_ckpt['step']}")
-    if config.export_path:
-        print(f"  Export: {config.export_path}")
-    print(f"  RAM: {ram():.1f}GB\n")
+        print("\nStarting training...")
+        print(f"  Sparsity: {config.frac*100:.1f}%")
+        print(f"  RigL: every {config.reselect_every} steps")
+        _eval_cfg = None
+        if config.eval_only:
+            print("\n=== Eval-only mode (skipping training) ===\n")
+            from usaf.eval.benchmark import BenchmarkConfig, run_benchmark
+            from usaf.eval.report import save_report
 
-    if config.eval_only:
-        print("\n=== Eval-only mode (skipping training) ===\n")
-        from usaf.eval.benchmark import BenchmarkConfig, run_benchmark
-        from usaf.eval.report import save_report
-
-        ds_list = [d.strip() for d in config.eval_datasets.split(",") if d.strip()]
-        if not ds_list:
-            raise SystemExit(
-                "--eval-only needs at least one dataset in --eval-datasets"
+            _ds_list = [d.strip()
+                        for d in config.eval_datasets.split(",") if d.strip()]
+            tokenizer = _get_tokenizer(config.model_path)
+            # torch.embedding with a bare "index out of range in self".
+            _mv = getattr(getattr(_model, "config", None), "vocab_size", None)
+            _tv = max(len(tokenizer), getattr(tokenizer, "vocab_size", 0) or 0)
+            if _mv and _tv > _mv:
+                raise SystemExit(
+                    f"--eval-only: the tokenizer produces {_tv} distinct "
+                    f"ids but {config.model_path} has an embedding table of only "
+                    f"{_mv}. These are not the same model's tokenizer."
+                )
+            _eval_cfg = BenchmarkConfig(
+                datasets=_ds_list,
+                max_samples=config.eval_samples,
+                seq_len=config.seq_len,
             )
-        tokenizer = _get_tokenizer(config.model_path)
-        if tokenizer is None:
-            raise SystemExit(
-                f"--eval-only needs a tokenizer, and none could be loaded "
-                f"from {config.model_path}. A model built with from_config "
-                f"has none, so save one next to the weights "
-                f"(tokenizer.json / tokenizer_config.json), or pass a model "
-                f"id that ships one. Use the normal training path if you only "
-                f"want perplexity on the training dataset."
+            if _resume is not None:
+                _apply_resume_overlays(_resume, _cache)
+                print(f"  Applied trained weights from {_resume.get('step', '?')} "
+                      f"steps ({len(_resume['masters'])} tensors)")
+            results = run_benchmark(
+                _model, tokenizer, device, _eval_cfg,
+                model_name=config.model_path,
             )
-        # A tokenizer whose vocabulary does not fit the model produces token
-        # ids past the embedding table, which used to crash deep inside
-        # torch.embedding with a bare "index out of range in self".
-        model_vocab = getattr(getattr(model, "config", None), "vocab_size", None)
-        tok_vocab = max(len(tokenizer), getattr(tokenizer, "vocab_size", 0) or 0)
-        if model_vocab and tok_vocab > model_vocab:
-            raise SystemExit(
-                f"--eval-only: the tokenizer produces {tok_vocab} distinct "
-                f"ids but {config.model_path} has an embedding table of only "
-                f"{model_vocab}. These are not the same model's tokenizer."
-            )
-        eval_cfg = BenchmarkConfig(
-            datasets=ds_list,
-            max_samples=config.eval_samples,
-            seq_len=config.seq_len,
-        )
-        if resume_ckpt is not None:
-            _apply_resume_overlays(resume_ckpt, cache)
-            print(f"  Applied trained weights from {resume_ckpt.get('step', '?')} "
-                  f"steps ({len(resume_ckpt['masters'])} tensors)")
-        results = run_benchmark(
-            model, tokenizer, device, eval_cfg,
-            model_name=config.model_path,
-        )
-        results.print()
-        if config.eval_report:
-            save_report(results, config.eval_report)
-        return model
+            results.print()
+            if config.eval_report:
+                save_report(results, config.eval_report)
+            return _model
 
-    _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
-                  train_samples, eval_samples, heldout_samples,
-                  _train_names, _shapes, train_layers,
-                  layers, embed, rotary, norm_fn, lm_head,
-                  router_params=router_params,
-                  model_cfg=model_cfg,
-                  resume_ckpt=resume_ckpt)
+        _run_training(config, moe_cfg, _model, _cache, _q_dict, device, scaler,
+                      train_samples, eval_samples, heldout_samples,
+                      _train_names, _shapes, _layers,
+                      _layers_mod, _embed, _rotary, _norm_fn, _lm_head,
+                      router_params=_router,
+                      model_cfg=_model_cfg,
+                      resume_ckpt=_resume)
+        return _model
+
+    _layers_now = list(train_layers)
+    model = None
+    for _attempt in range(1, 6):
+        try:
+            model = _load_and_run(_layers_now)
+            break
+        except torch.OutOfMemoryError as _oom:
+            for _v in ("_model", "_cache", "_q_dict", "_router"):
+                globals().pop(_v, None)
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if len(_layers_now) <= 1:
+                raise SystemExit(
+                    f"Out of memory with a single trainable layer "
+                    f"({_oom.args[0].splitlines()[0]}); the model does not fit "
+                    f"this GPU at all."
+                ) from _oom
+            _keep = max(1, int(len(_layers_now) * 0.75))
+            print(f"\nOut of memory with {len(_layers_now)} trainable layers. "
+                  f"Retrying with the top {_keep}.", flush=True)
+            _layers_now = _layers_now[-_keep:]
+    if model is None:
+        raise SystemExit("Training did not complete and no memory error explained it.")
 
     # --eval-report only ever did anything together with --eval-only, so a
     # training run accepted it, stored it, and wrote no report - the run that
