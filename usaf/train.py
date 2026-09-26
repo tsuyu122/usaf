@@ -414,6 +414,10 @@ def main(args=None):
             max_samples=config.eval_samples,
             seq_len=config.seq_len,
         )
+        if resume_ckpt is not None:
+            _apply_resume_overlays(resume_ckpt, cache)
+            print(f"  Applied trained weights from {resume_ckpt.get('step', '?')} "
+                  f"steps ({len(resume_ckpt['masters'])} tensors)")
         results = run_benchmark(
             model, tokenizer, device, eval_cfg,
             model_name=config.model_path,
@@ -496,6 +500,23 @@ def _check_resume_path(resume_path: str) -> str:
         )
     return resume_path
 
+
+def _apply_resume_overlays(resume_ckpt: dict, cache) -> dict[str, torch.Tensor]:
+    """Scatter the trained weights from a checkpoint into the expert cache.
+
+    Returns the active index map, which the training path needs as well.
+
+    --eval-only used to skip this entirely: it ran the benchmark and returned
+    before the resume block, so a model that had been trained down to a loss of
+    1.37 benchmarked to exactly the same perplexity as the untouched base, and
+    the report said so with a straight face. Evaluating a checkpoint you did not
+    apply is worse than not evaluating at all.
+    """
+    active_idx = {k: v.to(torch.long) for k, v in resume_ckpt["active_idx"].items()}
+    for fname, vals in resume_ckpt["masters"].items():
+        p = torch.nn.Parameter(vals.float(), requires_grad=False)
+        cache.overlays[fname] = (active_idx[fname].reshape(-1).to(torch.long), p)
+    return active_idx
 
 def _expert_shapes(model, expert_modules: set[str]) -> dict[str, tuple]:
     """The expert tensors the model actually has, before anything clears them.
@@ -1042,13 +1063,10 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     else:
         print(f"Resuming: restoring active_idx ({len(resume_ckpt['active_idx'])} tensors) "
               f"and masters ({len(resume_ckpt['masters'])} tensors)")
-        active_idx = {k: v.to(torch.long) for k, v in resume_ckpt["active_idx"].items()}
-        masters = {}
-        for fname, vals in resume_ckpt["masters"].items():
-            p = nn.Parameter(vals.float(), requires_grad=False)
-            masters[fname] = p
-            aidx = active_idx[fname].reshape(-1).to(torch.long)
-            cache.overlays[fname] = (aidx, p)
+        active_idx = _apply_resume_overlays(resume_ckpt, cache)
+        masters = {
+            fname: cache.overlays[fname][1] for fname in resume_ckpt["masters"]
+        }
         losses = list(resume_ckpt.get("losses", []))
         start_step = resume_ckpt.get("step", 0) + 1
         if start_step > STEPS:
