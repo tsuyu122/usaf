@@ -123,10 +123,24 @@ if USE_CUDA:
     else:
         _amp_scaler = None
 else:
-    import torch_directml_native
-    torch_directml_native.disable_tiled_resources(True)
-    device = get_dml_device()
-    n_gpus = 1
+    # DirectML is optional. The README promises an automatic CPU fallback and
+    # the module-level `cpu` device below exists for it, but the import used
+    # to be unguarded: any machine without torch-directml, or with a build
+    # that fails to load against the installed torch (which is what a
+    # mismatched torch-directml does), died with a bare ImportError from
+    # inside torch_directml_native. Fall back to CPU instead.
+    try:
+        import torch_directml_native
+        torch_directml_native.disable_tiled_resources(True)
+        device = get_dml_device()
+        n_gpus = 1
+        print("  DirectML: enabled")
+    except Exception as e:
+        print(f"  DirectML unavailable ({type(e).__name__}: {e})")
+        print("  Falling back to CPU. Expect a large slowdown; the sparse")
+        print("  mechanism is unchanged, only the device differs.")
+        device = torch.device("cpu")
+        n_gpus = 1
     _amp_scaler = None
 cpu = torch.device("cpu")
 
@@ -187,6 +201,30 @@ def _q_shape(fn):
 def _experts_name(i): return f"model.layers.{i}.mlp.experts"
 _train_names=[f"model.layers.{li}.mlp.experts.{pn}"
               for li in sorted(TRAIN_LAYERS) for pn in ("gate_up_proj","down_proj")]
+
+# TRAIN_LAYERS is still the pre-model guess at this point; the depth clamp only
+# runs once the model is loaded, further down. On a model shallower than the
+# default of 48 layers this indexes layers the quantized file does not have and
+# dies with a bare KeyError. Restrict to the layers actually present.
+_q_layers=set()
+for _fn in q_dict:
+    _parts=_fn.split('.')
+    if len(_parts)>=4 and _parts[0]=='model' and _parts[1]=='layers':
+        try: _q_layers.add(int(_parts[2]))
+        except ValueError: pass
+_missing=[li for li in sorted(TRAIN_LAYERS) if li not in _q_layers]
+if _missing:
+    _present=sorted(li for li in TRAIN_LAYERS if li in _q_layers)
+    if not _present:
+        raise SystemExit(f'{Q4} has no expert weights for any layer in '
+                         f'TRAIN_FROM={min(TRAIN_LAYERS)}..{max(TRAIN_LAYERS)}; '
+                         f'it contains layers {sorted(_q_layers)}')
+    print(f'  quantized file has no experts for layer(s) {_missing}; '
+          f'training {_present} instead')
+    TRAIN_LAYERS=set(_present)
+    DETACH_AT=min(TRAIN_LAYERS)-1
+_train_names=[f'model.layers.{li}.mlp.experts.{pn}'
+              for li in sorted(TRAIN_LAYERS) for pn in ('gate_up_proj','down_proj')]
 _shapes={fn:_q_shape(fn) for fn in _train_names}
 capture_store=TopKImportanceStore(_shapes,frac=FRAC)
 
@@ -464,6 +502,16 @@ if USE_VK_STREAMING:
     print(f"  VK streaming ready in {time.time()-t_vk:.0f}s")
 
 # ── Frozen cache: precompute hidden@DETACH_AT for all samples ──
+# A frozen cache exists to skip the layers below the first trainable one.
+# With TRAIN_FROM=0 the first trainable layer is 0, so DETACH_AT is -1 and
+# there is nothing to cache: the build still ran and died on a shape
+# mismatch, because frozen_forward returns the embedding output of shape
+# [SEQ, H] while the cache was allocated for [SEQ, hidden_size].
+if USE_FROZEN_CACHE and DETACH_AT < 0:
+    print("  Frozen cache skipped: TRAIN_FROM=0, so no layer can be frozen "
+          "and there is nothing to precompute")
+    USE_FROZEN_CACHE = False
+
 if USE_FROZEN_CACHE:
     from usaf.frozen_cache import build_frozen_cache, get_hidden
     FROZEN_EVAL = os.environ.get("FROZEN_EVAL", "0") == "1"  # default: only train samples in cache

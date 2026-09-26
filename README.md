@@ -294,6 +294,15 @@ python train.py
 | NVIDIA dual GPU | `USE_CUDA=1 USE_MULTI_GPU=1 python train.py` |
 | CPU fallback | `python train.py` (automatic) |
 
+The CPU fallback is real: if `torch-directml` is missing, or present but built
+against a different torch than the installed one, the run prints why and
+continues on CPU instead of dying on the import. It is much slower - the sparse
+mechanism is unchanged, only the device differs.
+
+`TRAIN_FROM` is clamped to the model's real depth. If the quantized weights do
+not cover the requested range, the run trains the layers that are present and
+says so rather than failing.
+
 ### Troubleshooting
 
 **"CUDA out of memory"**: Reduce `MICROBATCH` to 1 or increase `TRAIN_FROM` to freeze more layers.
