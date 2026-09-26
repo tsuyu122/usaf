@@ -32,7 +32,15 @@ class ThresholdSelector:
     def select(self, scores: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         cat = torch.cat([s.reshape(-1) for s in scores.values()])
         n = cat.numel()
-        idx = min(max(int(n * self.percentile / 100.0), 0), n - 1)
+        # percentile means "keep the top X% of scores", so the threshold has
+        # to be taken at (100 - percentile) from the low end, not at
+        # percentile. Using percentile directly inverted the result: at
+        # percentile=100 it kept the single highest score, and the 99.98 that
+        # DynamicSelector relies on to keep almost everything instead kept
+        # one element.
+        keep_frac = min(max(self.percentile, 0.0), 100.0) / 100.0
+        idx = int(n * (1.0 - keep_frac))
+        idx = min(max(idx, 0), n - 1)
         arr = cat.numpy()
         threshold = float(np.partition(arr, idx)[idx])
         del cat, arr
