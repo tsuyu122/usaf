@@ -1433,8 +1433,15 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         logits = lm_head(h)
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
+        # ignore_index=-100 is not optional. cross_entropy only treats -100 as
+        # "no target here" when told to; left at the default 0 it is used as a
+        # class index, and the result is nan rather than an error. A dataset that
+        # masks its prompt tokens - which is how a chat dataset is built - sends
+        # every run to nan, and the finiteness guard then skips every step and
+        # the run reports Complete having done nothing.
         return nn.functional.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1), ignore_index=-100)
 
     evals = []
 
