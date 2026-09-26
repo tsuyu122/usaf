@@ -22,6 +22,8 @@ import psutil
 import torch
 import torch.nn as nn
 
+from usaf.utils import resolve_dtype
+
 
 def ram() -> float:
     return psutil.Process(os.getpid()).memory_info().rss / 1024**3
@@ -115,6 +117,11 @@ def build_parser():
                    help="Max samples per eval dataset")
     p.add_argument("--eval-report", type=str, default="",
                    help="Path to save eval report JSON")
+    p.add_argument("--dtype", type=str, default="auto",
+                   choices=["auto", "fp16", "bf16", "fp32"],
+                   help="Weight and activation precision. "
+                        "auto picks bf16 on CUDA hardware that has it, "
+                        "fp16 on older CUDA and DirectML, fp32 on CPU")
 
     return p
 
@@ -151,6 +158,7 @@ class TrainConfig:
     eval_datasets: str = "synthetic-cpp"
     eval_samples: int = 64
     eval_report: str = ""
+    dtype: str = "auto"
 
 
 def parse_args(args=None) -> TrainConfig:
@@ -194,6 +202,7 @@ def parse_args(args=None) -> TrainConfig:
         eval_datasets=ns.eval_datasets,
         eval_samples=ns.eval_samples,
         eval_report=ns.eval_report,
+        dtype=ns.dtype,
     )
 
 
@@ -691,13 +700,36 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
     _expert_modules = _expert_module_names(moe_cfg)
     mp = dict(model.named_parameters())
     n_loaded = 0
+    # Every non-expert weight used to be cast with .half(), whatever the model
+    # was written in. A bf16 checkpoint - ZAYA1 declares dtype bfloat16 and
+    # keeps its residual stream in fp32 by design - came back as fp16, and the
+    # mismatch is what made it unusable. The run dtype is chosen once, up
+    # front, and applies to the weights, the causal mask and the rotary path.
+    run_dtype = resolve_dtype(getattr(config, "dtype", "auto"), device)
+    # The 4-bit format is fp16 by construction: dequantize_4bit, the expert
+    # cache and the mmapped readers all hand back float16, and the scales are
+    # stored as fp16. Loading the dense weights in a different precision only
+    # produces "expected m1 and m2 to have the same dtype". So a quantized run
+    # is fp16, and asking for anything else is an error rather than a silent
+    # half-applied setting. Unquantized runs are free to use bf16, which is
+    # what a bf16-native model on a T4 should run as.
+    if run_dtype != torch.float16:
+        raise SystemExit(
+            f"--dtype {getattr(config, 'dtype', 'auto')!r} is not supported yet: the "
+            "expert path is float16 by construction. dequantize_4bit, the mmapped "
+            "readers and the expert cache all return float16, and dense weights in "
+            "another precision fail at the first expert matmul with a dtype "
+            "mismatch. The 4-bit scales are stored as fp16 too.\n"
+            "  Use --dtype fp16 (or auto). Making the expert path precision-parametric "
+            "is what would unlock bf16, and it is a real change, not a flag."
+        )
     for name in sorted(wf.keys()):
         if any(name.startswith(m + ".") for m in _expert_modules):
             continue
         if name not in mp:
             continue
         with safe_open(os.path.join(st_path, wf[name]), framework="pt") as sf:
-            tensor = sf.get_tensor(name).half()
+            tensor = sf.get_tensor(name).to(run_dtype)
         parts = name.split(".")
         obj = model
         for p in parts[:-1]:
@@ -806,8 +838,13 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         s_len = hidden.shape[1]
         pos_ids = torch.arange(s_len, device=device).unsqueeze(0)
         cos, sin = rotary(hidden, position_ids=pos_ids)
+        # The mask is built in the run dtype. It used to be hardcoded fp16,
+        # which mismatches a bf16 model: the fill value is fine in bf16 (same
+        # exponent range as fp32) but an fp16 mask added to bf16 activations
+        # either promotes the whole block or fails, depending on the kernel.
+        _dt = hidden.dtype
         mask = torch.triu(
-            torch.full((s_len, s_len), torch.finfo(torch.float16).min, device=device, dtype=torch.float16),
+            torch.full((s_len, s_len), torch.finfo(_dt).min, device=device, dtype=_dt),
             diagonal=1).unsqueeze(0).unsqueeze(0)
         return hidden, pos_ids, (cos, sin), mask
 

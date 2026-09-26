@@ -26,9 +26,63 @@ def get_cpu_device() -> torch.device:
 
 
 def get_optimal_dtype(device: torch.device) -> torch.dtype:
+    """The dtype a run should use when the caller did not choose one.
+
+    This used to return float32 for every backend except DirectML, including
+    CUDA. On a T4 or P100 that is the worst available answer: it doubles the
+    weight footprint against fp16/bf16 and roughly halves throughput, and for
+    an 8B model it is the difference between fitting on a 16GB card and not.
+    Nothing called it, so the choice was never actually made in the first
+    place.
+
+    bf16 is preferred over fp16 on hardware that has it. Its range matches
+    fp32, so models that carry fp32 residuals - ZAYA1 keeps its residual
+    stream in fp32 on purpose - do not overflow when a weight is loaded in a
+    narrower dtype.
+    """
     if device.type == "privateuseone":
+        # DirectML has no bf16 kernels; fp16 is the only reduced precision there.
+        return torch.float16
+    if device.type == "cuda":
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
         return torch.float16
     return torch.float32
+
+
+def resolve_dtype(name: str, device: torch.device) -> torch.dtype:
+    """Turn a ``--dtype`` value into the dtype a run will actually use.
+
+    ``auto`` resolves to float16, not to whatever the hardware would prefer,
+    because the expert path constrains it: ``dequantize_4bit``, the mmapped
+    readers and the expert cache all produce float16, and a run whose dense
+    weights are a different precision dies at the first expert matmul with
+    "expected m1 and m2 to have the same dtype". Claiming bf16 here because the
+    GPU supports it would be a flag that lies.
+
+    The explicit values are still accepted, and a run that asks for one the
+    expert path cannot provide is rejected up front with that explanation
+    rather than crashing later.
+    """
+    key = (name or "auto").strip().lower()
+    named = {
+        "auto": torch.float16,
+        "": torch.float16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "float": torch.float32,
+    }
+    if key not in named:
+        raise SystemExit(
+            f"--dtype {name!r} is not a precision. "
+            "Use one of: auto, fp16, bf16, fp32."
+        )
+    return named[key]
 
 
 def count_parameters(model: torch.nn.Module, trainable_only: bool = False) -> int:
