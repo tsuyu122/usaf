@@ -45,6 +45,27 @@ def test_save_report_round_trips(tmp_path):
     assert p.endswith("r.json")
 
 
+def test_public_api_is_importable_and_deduplicated():
+    """Every name in __all__ must exist, and `from usaf import *` must work.
+
+    __all__ is the package's contract with its callers: a name listed there
+    that does not exist breaks `from usaf import *` outright, and one listed
+    twice is a sign the module and the conditional import block disagree about
+    who owns it.
+    """
+    import usaf
+
+    missing = [n for n in usaf.__all__ if not hasattr(usaf, n)]
+    assert not missing, f"__all__ names that do not exist: {missing}"
+
+    dupes = sorted({n for n in usaf.__all__ if usaf.__all__.count(n) > 1})
+    assert not dupes, f"__all__ lists these more than once: {dupes}"
+
+    ns = {}
+    exec("from usaf import *", ns)
+    assert "SparseAdam" in ns
+
+
 def test_save_report_writes_compact_json_when_asked(tmp_path):
     r = _res({"d": {"perplexity": 1.0, "loss": 0.0}})
     p = tmp_path / "c.json"

@@ -78,6 +78,9 @@ if _HAS_QUANTIZATION:
         "dequantize_with_outliers",
     ]
 
+# apply_captured_expert_grads is deliberately listed only here: the module
+# re-exported above from olmoe_streaming is the same function, and listing it
+# in both places put it in __all__ twice.
 if _HAS_MOE_LOADER:
     __all__ += [
         "QuantizedExpertCache",
@@ -85,7 +88,6 @@ if _HAS_MOE_LOADER:
         "load_quantized_state_dict",
         "setup_quantized_streaming",
         "get_quantized_cache",
-        "apply_captured_expert_grads",
         "load_and_stream",
     ]
 
