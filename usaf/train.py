@@ -571,7 +571,18 @@ def _resolve_quant_path(quant_path: str, model_name: str) -> str:
     directory form, and say exactly what is expected when nothing is there.
     """
     if not quant_path:
-        quant_path = f"{model_name}-q4/experts_q4.pt"
+        # Next to the model, not next to wherever the user happens to be.
+        #
+        # usaf.quantize writes <model>-q4/experts_q4.pt resolved from the model
+        # directory it was pointed at. The trainer looked for a bare relative
+        # name, so the two commands only agreed when the model was a directory
+        # sitting in the current directory. Handed any other path - what the Kaggle
+        # kernel does, and what anyone who types a path does - quantize succeeded
+        # and train then said the file was not there.
+        _mp = os.path.abspath(model_name)
+        quant_path = os.path.join(os.path.dirname(_mp),
+                                 os.path.basename(_mp) + "-q4",
+                                 "experts_q4.pt")
     if os.path.isdir(quant_path):
         quant_path = os.path.join(quant_path, "experts_q4.pt")
     if not os.path.exists(quant_path):

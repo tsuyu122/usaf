@@ -145,14 +145,31 @@ def test_quant_path_accepts_a_directory(tmp_path):
 
 
 def test_quant_path_defaults_next_to_the_model(tmp_path, monkeypatch):
-    # With no --quant-path the weights are looked for beside the model name,
-    # and a missing file there is reported like a bad explicit one.
+    # With no --quant-path the weights are looked for beside the model, and a
+    # missing file there is reported like a bad explicit one.
+    #
+    # Beside the model directory, not beside the current directory. Those are
+    # the same place only when the model is a bare name in the cwd, which is how
+    # this was written and tested. usaf.quantize resolves the output from the
+    # model it was pointed at, so the two commands disagreed for every model
+    # given as a path - a subdirectory, an absolute path, the Kaggle kernel -
+    # and quantize would succeed and train would then report the file missing.
     monkeypatch.chdir(tmp_path)
     d = tmp_path / "Qwen3-30B-A3B-q4"
     d.mkdir()
     (d / "experts_q4.pt").write_bytes(b"")
-    assert (
-        _resolve_quant_path("", "Qwen3-30B-A3B") == "Qwen3-30B-A3B-q4/experts_q4.pt"
+    assert _resolve_quant_path("", "Qwen3-30B-A3B") == str(
+        d / "experts_q4.pt"
     )
+
+    # and the same holds when the model is not in the current directory
+    nested = tmp_path / "deep" / "nested-model"
+    (tmp_path / "deep").mkdir()
+    nested.mkdir()
+    nd = tmp_path / "deep" / "nested-model-q4"
+    nd.mkdir()
+    (nd / "experts_q4.pt").write_bytes(b"")
+    assert _resolve_quant_path("", str(nested)) == str(nd / "experts_q4.pt")
+
     with pytest.raises(SystemExit, match="quantized weights not found"):
         _resolve_quant_path("", "outro-modelo")

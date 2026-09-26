@@ -167,10 +167,24 @@ def _auto_configure_training(config: MoEConfig, vram_gb: float, system_ram_gb: f
     config.estimated_per_layer_gb = resident_gb + q4_gb + optimizer_gb + overhead_gb
 
     usable_ram = system_ram_gb * 0.6
-    config.max_trainable_layers = max(1, min(
-        config.num_layers,
-        int(usable_ram / max(config.estimated_per_layer_gb, 0.1))
-    ))
+    max_by_ram = int(usable_ram / max(config.estimated_per_layer_gb, 0.1))
+
+    # The resident expert weights and the optimizer moments sit on the device,
+    # so host RAM is the wrong bound whenever there is a GPU. Sizing by host RAM
+    # only made the estimate track the machine rather than the card: on a Kaggle
+    # kernel, about 30 GB of host RAM against 15.6 GB of VRAM, ZAYA1-8B came out
+    # at 29 trainable layers times 0.617 GB - 17.9 GB of layers in a 15.6 GB
+    # card. Raising the VRAM from 15.6 to 79 GB changed the answer not at all,
+    # because vram_gb was stored in the config and then read by nothing.
+    #
+    # vram_gb is set to 0 just above and overwritten from torch.cuda when a
+    # device exists, so it is greater than zero exactly when one was found.
+    if vram_gb > 0:
+        max_by_vram = int((vram_gb * 0.9)
+                         / max(config.estimated_per_layer_gb, 0.1))
+        max_by_ram = min(max_by_ram, max_by_vram)
+
+    config.max_trainable_layers = max(1, min(config.num_layers, max_by_ram))
 
     config.train_from = max(0, config.num_layers - config.max_trainable_layers)
 
