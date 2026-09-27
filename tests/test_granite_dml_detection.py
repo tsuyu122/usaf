@@ -136,3 +136,38 @@ def test_a_variadic_forward_is_not_a_container():
             self.down_proj = nn.Parameter(torch.zeros(4, 6, 8))
 
     assert not _looks_like_experts(Plain)
+
+class _Rotary(nn.Module):
+    """Three positional parameters, none of them the routing."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate_up_proj = nn.Parameter(torch.zeros(4, 16, 6))
+        self.down_proj = nn.Parameter(torch.zeros(4, 6, 8))
+
+    def forward(self, x, position_ids):
+        return x
+
+
+class _DecoderLayer(nn.Module):
+    """Everything after the hidden states is optional."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate_up_proj = nn.Parameter(torch.zeros(4, 16, 6))
+        self.down_proj = nn.Parameter(torch.zeros(4, 6, 8))
+
+    def forward(self, hidden_states, attention_mask=None, position_ids=None,
+                **kwargs):
+        return hidden_states
+
+
+def test_a_class_with_three_positional_parameters_is_not_a_container():
+    # The rotary embedding is the one that was patched by accident: it takes the
+    # hidden states and the positions, which is three with self in the count and
+    # one short of the container. Patching it produces a model that trains and
+    # then falls over in the first backward that touches a position.
+    assert not _looks_like_experts(_Rotary)
+    assert not _looks_like_experts(_DecoderLayer)
+    assert _looks_like_experts(Container)
+    assert _looks_like_experts(FusedContainer)

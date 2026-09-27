@@ -43,55 +43,42 @@ _CANDIDATE_MODULES = (
 
 def issubclass_safe(obj) -> bool:
     return isinstance(obj, type) and issubclass(obj, torch.nn.Module)
-
+
+
 def _looks_like_experts(cls) -> bool:
     """An expert container: a module that owns the stacked expert weights.
 
-    Two checks, because either alone matches the wrong thing. The names in
-    __init__ decide which release it is - one builds the container with the
-    fused names, another with input_linear and output_linear - and the block
-    that holds the container mentions both of either pair. The forward
-    signature is what tells them apart, and it is the honest check: the
-    container takes the hidden states plus the routing the router just
-    produced, the block takes the hidden states alone.
+    Decided by the forward signature alone, because that is the only part of
+    the answer that does not depend on how this release happens to spell
+    things. Requiring the right names in __init__ as well meant the container
+    was refused on a release that builds its experts from names none of the
+    four had heard of, and the run trained dense for as long as it took to
+    find out - which the log said as a single line, naming nothing.
 
-    Matching on the names alone patched the block. The block's forward - the
-    one that runs the router - was replaced with a three-argument expert
-    forward, and the run died on a TypeError one line later, after printing
-    that the experts had been routed sparse. Checking for nn.Parameter in
-    __init__ is closer but still a guess about how the next release spells
-    the construction; the signature is the class telling us what it does.
+    The container takes the hidden states, the routing index and the routing
+    weights, and nothing else in the package has that shape. The block takes
+    only the hidden states and runs the router itself. The gating takes only
+    the hidden states. The decoder layer and the model above it take
+    arguments that are all optional, and the rotary embedding takes the
+    positions.
+
+    Four, because self counts. Three is what the rotary embedding has, and
+    patching it produced a model that trained and then fell over in the
+    first backward that touched a position.
     """
     if not isinstance(cls, type) or not issubclass(cls, torch.nn.Module):
         return False
     try:
-        src = inspect.getsource(cls.__init__)
-    except (OSError, TypeError, ValueError):
-        return False
-
-    pairs = (("gate_up_proj", "down_proj"),
-             ("input_linear", "output_linear"),)
-    if not any(a in src and b in src for a, b in pairs):
-        return False
-
-    # Can it actually be handed the routing? That is the question the sparse
-    # forward asks of it, so it is the question worth asking the class, and it
-    # survives a release that adds an optional argument - which counting
-    # parameters does not, and which is how the check below started refusing the
-    # container it was written for.
-    #
-    # self, the hidden states, and the routing the router just produced.
-    try:
         sig = inspect.signature(cls.forward)
-        named = [p for p in sig.parameters.values()
-                 if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
-        sig.bind(
-            object(), torch.zeros(1), torch.zeros(1), torch.zeros(1))
     except (TypeError, ValueError):
         return False
-    # A *args forward binds anything, and nn.Module.forward is exactly that, so
-    # binding alone is not enough - the names have to be there as well.
-    return len(named) >= 3
+
+    positional = [
+        p for p in sig.parameters.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    return (len(positional) >= 4
+            and not any(p.default is not p.empty for p in positional))
 
 def _candidate_modules():
     """Every module GraniteMoe could have put its expert container in.
