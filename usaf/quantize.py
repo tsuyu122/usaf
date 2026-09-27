@@ -21,7 +21,7 @@ import sys
 
 import torch
 
-from usaf.model_factory import detect_model, get_param_patterns
+from usaf.model_factory import detect_model, get_param_patterns, resolve_expert_layout
 from usaf.quantization import quantize_state_dict
 
 
@@ -162,6 +162,24 @@ def main(argv=None) -> int:
             'not a mixture-of-experts model, so there are no expert '
             'weights to quantize'
         )
+
+    # The same resolution the trainer does, on a model built on the meta device
+    # so it costs nothing. The quantiser and the trainer are separate processes
+    # and the file is what they both read, and the file cannot say which of the
+    # four layouts the loaded module has - so the quantiser wrote keys under one
+    # spelling and the trainer looked under another, and the run died on a
+    # KeyError naming a tensor the quantiser had just written.
+    try:
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        probe = AutoModelForCausalLM.from_config(
+            AutoConfig.from_pretrained(model_path), trust_remote_code=True)
+        cfg = resolve_expert_layout(probe, cfg)
+        del probe
+    except Exception as e:
+        print(f'  note: could not resolve the layout from a probe model '
+              f'({type(e).__name__}: {e}); using what the checkpoint says',
+              flush=True)
 
     patterns = get_param_patterns(cfg)
     if args.layers:
