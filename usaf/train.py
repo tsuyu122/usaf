@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from usaf.model_factory import _loaded_router_name
+from usaf.place import _clear, _place
 from usaf.utils import resolve_dtype
 
 
@@ -708,28 +709,30 @@ def _install_expert_hooks(model, expert_modules: set[str], cache) -> int:
     The count is returned so a caller can say so, and so a test can check the
     installation rather than the lookup that feeds it - a test on the lookup alone
     passes with the installation broken, which is the other half of the same trap.
+
+    The names are written with _place rather than assigned onto the container,
+    because on a release that keeps the experts inside submodules the forward reads
+    the submodule and not the container, and the assignment is silently a no-op.
     """
     found = _expert_modules_by_name(model, expert_modules)
     for mname, mod in found.items():
-        mod._parameters.clear()
-        if hasattr(mod, "_buffers"):
-            mod._buffers.clear()
-
         def make_pre(name):
             def pre(module, args):
-                weights = cache.get_expert_weights(name)
-                for pn, param in weights.items():
-                    module._parameters[pn] = param
+                for pn, param in cache.get_expert_weights(name).items():
+                    _place(module, pn, param)
             return pre
 
-        def make_post():
+        def make_post(name):
             def post(module, args, output):
-                module._parameters.clear()
+                for pn in cache.get_expert_weights(name):
+                    _clear(module, [pn])
                 return output
             return post
 
+        _clear(mod, cache.get_expert_weights(mname))
+
         mod.register_forward_pre_hook(make_pre(mname))
-        mod.register_forward_hook(make_post())
+        mod.register_forward_hook(make_post(mname))
 
     return len(found)
 

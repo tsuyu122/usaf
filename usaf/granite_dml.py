@@ -47,7 +47,18 @@ def _looks_like_experts(cls) -> bool:
         src = inspect.getsource(cls.__init__)
     except (OSError, TypeError):
         return False
-    return "gate_up_proj" in src and "down_proj" in src
+    # Both spellings, because the release decides. One builds the container with
+    # the fused names, another builds it from input_linear and output_linear and
+    # the loaded names are the converted ones. The detector looked only for the
+    # first, so on the second release it found no container, patched nothing, and
+    # said so - and the run then trained dense while nothing in the loss curve
+    # said which of the two it was doing.
+    #
+    # The answer is still a lookup on the class, so it either finds a container
+    # that is one or it finds none, and a class binding neither pair is not one.
+    pairs = (("gate_up_proj", "down_proj"),
+             ("input_linear", "output_linear"),)
+    return any(a in src and b in src for a, b in pairs)
 
 
 def _candidate_modules():

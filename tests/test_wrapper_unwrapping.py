@@ -113,6 +113,9 @@ def test_the_hooks_fill_the_cleared_parameters_and_empty_them_again():
         'model.layers.0.block_sparse_moe.experts']
 
     assert len(mod._parameters) == 0
+    # Installing asked the cache for every module; only the forward should be
+    # counted from here.
+    cache.asked.clear()
     mod(torch.zeros(1))
     assert set(cache.asked) == {'model.layers.0.block_sparse_moe.experts'}
     assert len(mod._parameters) == 0
