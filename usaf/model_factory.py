@@ -1,5 +1,9 @@
 """Auto-detect MoE architecture from any HuggingFace model config."""
+import glob
+import json
 import os
+import re
+import struct
 from dataclasses import dataclass, field
 
 
@@ -126,17 +130,161 @@ def _detect_expert_intermediate(cfg) -> int:
     return cfg.intermediate_size if hasattr(cfg, 'intermediate_size') else 0
 
 
-def _detect_param_names(cfg, model_path) -> tuple[str, list[str], str]:
-    """Detect parameter naming conventions based on model architecture.
 
-    From transformers >= 4.53 every supported MoE family (Qwen3-MoE, Mixtral,
-    OLMoE) exposes a *fused* expert container with 3D parameters named
-    gate_up_proj / down_proj under ".mlp.experts". Older transformers used
-    block_sparse_moe with per-expert w1/w2/w3 for Mixtral and separate
-    gate_proj/up_proj/down_proj for OLMoE; that layout is no longer produced
-    by the installed transformers, so the legacy branches are gone and every
-    family resolves to the fused names below.
+def _keys_from_single_safetensors(model_path) -> list[str]:
+    """Tensor names from a one-file checkpoint, without loading any weight.
+
+    safetensors keeps its key table in the first 8 bytes as a JSON length, so
+    this costs a header read rather than a 1.6 GB download. Reading the header
+    is also the only way to fail early and cheaply on a model whose names this
+    code does not understand, which is much better than finding out at the
+    first optimizer step.
     """
+    files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if len(files) != 1:
+        # Several shards and no index is a layout this has never been asked
+        # about; say so rather than guessing across the shards.
+        return []
+    try:
+        with open(files[0], "rb") as fh:
+            (n,) = struct.unpack("<Q", fh.read(8))
+            if n > 100_000_000:
+                return []
+            header = json.loads(fh.read(n).decode("utf-8"))
+    except (OSError, ValueError, struct.error, UnicodeDecodeError):
+        return []
+    return [k for k in header if k != "__metadata__"]
+
+
+def _loaded_router_name(on_disk: str) -> str:
+    """The router name on the loaded module, given its name in the file.
+
+    GraniteMoe stores ``router.layer.weight`` and the converter flattens it to
+    ``router.weight`` when the module is built. The detector has to answer for
+    the module, because the module is what the trainer resolves names in - and
+    a path that exists only on disk is a path that resolves to nothing at
+    runtime, with no error, which is the ZAYA failure in different clothes.
+
+    Only a path with that middle ``layer`` is collapsed. Anything else is passed
+    through untouched, because rewriting a name this code does not understand
+    is worse than reporting the name it was given.
+    """
+    parts = on_disk.split(".")
+    if len(parts) >= 3 and parts[0] == "router" and parts[1] == "layer":
+        return ".".join([parts[0]] + parts[2:])
+    return on_disk
+
+
+def _expert_names_from_index(model_path) -> tuple[str, list[str], str] | None:
+    """Read the expert and router names off a checkpoint, or None.
+
+    Every answer here is checked against the real file rather than assumed from
+    the family name. Returns None when there is no index, no single file to read,
+    or no expert tensor at all - the caller then falls back and says so.
+    """
+    if not os.path.isdir(model_path):
+        return None
+
+    keys: list[str] = []
+    for index_path in sorted(glob.glob(os.path.join(model_path, "*.index.json"))):
+        try:
+            with open(index_path, encoding="utf-8") as fh:
+                keys = list(json.load(fh).get("weight_map", {}).keys())
+        except (OSError, ValueError):
+            return None
+        break
+    if not keys:
+        # A single-file checkpoint has no index. The names are still readable,
+        # and GraniteMoe is exactly this shape: one 1.6 GB safetensors, so the
+        # index path alone would have declared it undetectable.
+        keys = _keys_from_single_safetensors(model_path)
+    if not keys:
+        return None
+
+    # The names on disk and the names after loading are not always the same.
+    # GraniteMoe stores its experts as input_linear / output_linear and the
+    # converter renames them to gate_up_proj / down_proj on the way in, so a
+    # model can be perfectly loadable and still match neither spelling here.
+    fused = re.compile(
+        r"^model\.layers\.\d+\.(.+)\.experts\.(gate_up_proj|down_proj)$"
+    )
+    stored = re.compile(
+        r"^model\.layers\.\d+\.(.+)\.(input_linear|output_linear)\.weight$"
+    )
+    rename = {"input_linear": "gate_up_proj", "output_linear": "down_proj"}
+
+    prefixes: list[str] = []
+    names: list[str] = []
+    for k in keys:
+        m = fused.match(k)
+        if m:
+            prefixes.append(m.group(1))
+            names.append(m.group(2))
+            continue
+        m = stored.match(k)
+        if m:
+            prefixes.append(m.group(1))
+            names.append(rename[m.group(2)])
+    if not prefixes or not names:
+        return None
+
+    # Every layer must agree, or the prefix is not the prefix. One layer under
+    # mlp and another under block_sparse_moe is not a naming convention, it is
+    # a model this does not understand, and picking one trains half of it.
+    if len(set(prefixes)) != 1:
+        return None
+
+    ordered = [n for n in ("gate_up_proj", "down_proj") if n in names]
+    if len(ordered) < 2:
+        return None
+    block = prefixes[0]
+
+    # The router is the sibling that is not an expert tensor. input_linear has
+    # no "expert" in its name, so a name-only filter returns it and the router
+    # path ends up pointing at a weight matrix.
+    sibling = re.compile(
+        r"^model\.layers\.\d+\." + re.escape(block) + r"\.(.+)$"
+    )
+    expert_tensors = {"experts." + n for n in ordered}
+    expert_tensors.update({"input_linear.weight", "output_linear.weight"})
+    router = None
+    for k in keys:
+        m = sibling.match(k)
+        if not m:
+            continue
+        rel = m.group(1)
+        if rel in expert_tensors or "expert" in rel:
+            continue
+        router = rel
+        break
+    if router is None:
+        return None
+
+    prefix = "model.layers.{i}." + block + ".experts"
+    return prefix, ordered, "." + block + "." + _loaded_router_name(router)
+
+
+def _detect_param_names(cfg, model_path) -> tuple[str, list[str], str]:
+    """Detect parameter naming conventions from the checkpoint itself.
+
+    Reading the names out of the weight file is the only way this is right for a
+    model nobody has seen before, and the two families that motivated the old
+    table are the argument for it: ZAYA1-8B puts its experts under mlp.experts
+    with a router at mlp.gate.weight, GraniteMoe puts the same tensors under
+    block_sparse_moe.experts with a router at block_sparse_moe.router.weight, and
+    both are MoE while neither matches the other.
+
+    A model that trains is a stronger requirement than a model that is on the
+    list, so the file is consulted first and the historical names are the
+    fallback - used only when there is no file to read, and reported as such.
+    """
+    found = _expert_names_from_index(model_path)
+    if found is not None:
+        return found
+    # No checkpoint to read. Returning the Qwen layout here is a guess that has
+    # no evidence behind it, and a wrong guess produces a model that loads and
+    # trains nothing - the failure this function exists to prevent - so the
+    # caller is told the names were not verified rather than handed a lie.
     return ("model.layers.{i}.mlp.experts",
             ["gate_up_proj", "down_proj"],
             ".mlp.gate.weight")
