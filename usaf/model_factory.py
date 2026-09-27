@@ -433,89 +433,6 @@ def get_router_path(config: MoEConfig, layer_idx: int) -> str:
     return f"model.layers.{layer_idx}{config.router_path}"
 
 
-def resolve_expert_prefix(model, cfg: MoEConfig) -> MoEConfig:
-    """Point the expert prefix at the container this model actually has.
-
-    The prefix is read off the checkpoint, which cannot answer this. A checkpoint
-    names a tensor by the key it was saved under; the module that holds it may sit
-    under a different path entirely, and whether there is a container at all is a
-    property of the transformers release, not of the file.
-
-    GraniteMoe is exactly that case. The file has input_linear and output_linear
-    under block_sparse_moe, and the loaded module either wraps them in a
-    block_sparse_moe.experts container or inlines them straight into
-    block_sparse_moe, depending on the release. Reading the file answers
-    block_sparse_moe for both, and picking one form means the other finds no
-    expert modules at all: no hooks, no sparse gradient, a loss that falls on the
-    dense parameters alone, and a run that reports progress throughout.
-
-    So the candidates are tried against the model and the one that resolves to
-    real parameters wins. Asking the model is the only source that knows, and the
-    same question has now been answered wrongly four times by reading the file
-    instead.
-    """
-    def names_of(prefix: str) -> set[str]:
-        out = set()
-        for li in range(cfg.num_layers):
-            p = prefix.format(i=li)
-            for pn in cfg.expert_param_names:
-                out.add(p + "." + pn)
-        return out
-
-    params = set(dict(model.named_parameters()))
-
-    base = cfg.expert_prefix
-    candidates = [base]
-    if base.endswith(".experts"):
-        candidates.append(base[: -len(".experts")])
-    else:
-        candidates.append(base + ".experts")
-
-    for cand in candidates:
-        wanted = names_of(cand)
-        if wanted and wanted <= params:
-            if cand != base:
-                cfg.expert_prefix = cand
-            return cfg
-
-    sample = sorted(
-        n for n in params
-        if n.startswith("model.layers.0."))[:24]
-    raise SystemExit(
-        f"the expert prefix {cfg.expert_prefix} resolves to no parameters on "
-        f"this model.\n  tried: {candidates}"
-        f"\n  layer 0 parameters: {sample}"
-    )
-
-
-# The tail a tensor is stored under, and the one it is loaded under. GraniteMoe
-# renames on the way in, so the file and the module disagree about every expert
-# weight and about the router, and an export that writes the module spelling
-# produces a directory that loads into a model full of fresh random experts.
-_STORED_TAIL = {
-    "gate_up_proj": "input_linear.weight",
-    "down_proj": "output_linear.weight",
-}
-
-
-def _stored_name(loaded: str) -> str:
-    """The name this tensor has in the file, given the name on the module.
-
-    The inverse of _loaded_router_name for the router, and the same treatment for
-    the expert weights, which the quantiser discovered separately and kept to
-    itself. Both questions have one answer - what is the tensor called in the
-    file - and two copies of the answer is how they drift apart.
-
-    Only the tails listed are rewritten. Everything else is returned as given,
-    because renaming a tensor this code does not recognise is how a working
-    export turns into a model full of random weights.
-    """
-    parts = loaded.split(".")
-    if parts and parts[-1] in _STORED_TAIL:
-        return ".".join(parts[:-1] + [_STORED_TAIL[parts[-1]]])
-    return _router_disk_name(loaded)
-
-
 def _candidates(loaded: str) -> list[str]:
     """The file spellings this module name could have, best guess first.
 
@@ -566,3 +483,127 @@ def resolve_stored_name(loaded: str, keys) -> str:
         if cand in keys:
             return cand
     return _stored_name(loaded)
+
+
+# The tail a tensor is stored under, and the one it is loaded under. GraniteMoe
+# renames on the way in, so the file and the module disagree about every expert
+# weight and about the router, and code that writes the module spelling produces
+# a directory that loads into a model full of fresh random experts.
+_STORED_TAIL = {
+    "gate_up_proj": "input_linear.weight",
+    "down_proj": "output_linear.weight",
+}
+
+# The reverse, for a module whose release kept the converted names. Which of the
+# two a release uses is not something the checkpoint can tell you: the file says
+# the same thing either way.
+_LOADED_TAIL = {
+    "input_linear.weight": "gate_up_proj",
+    "output_linear.weight": "down_proj",
+    "input_linear": "gate_up_proj",
+    "output_linear": "down_proj",
+}
+
+
+def _stored_name(loaded: str) -> str:
+    """The name this tensor has in the file, given the name on the module.
+
+    The inverse of _loaded_router_name for the router, and the same treatment for
+    the expert weights, which the quantiser had discovered separately and kept to
+    itself. Both questions have one answer - what is the tensor called in the file
+    - and two copies of the answer is how they drift apart.
+    """
+    parts = loaded.split(".")
+    if parts and parts[-1] in _STORED_TAIL:
+        return ".".join(parts[:-1] + [_STORED_TAIL[parts[-1]]])
+    return _router_disk_name(loaded)
+
+
+def _name_candidates(prefix: str, pn: str) -> list[str]:
+    """How a tensor called pn under this prefix could be spelled on a module.
+
+    Four shapes, because two things vary independently: whether the converted name
+    or the stored one survived, and whether the tensor is a Parameter or sits in a
+    submodule of its own - which is what makes named_parameters report
+    input_linear.weight rather than input_linear. A release may present any of
+    the four, and the list is a lookup against the model rather than a guess
+    about which release is installed: it either hits or it does not.
+    """
+    stems = [pn]
+    for spelling in (pn, _STORED_TAIL.get(pn), _LOADED_TAIL.get(pn)):
+        if spelling and spelling not in stems:
+            stems.append(spelling)
+    out = []
+    for stem in stems:
+        for tail in (stem, stem + ".weight"):
+            if prefix + "." + tail not in out:
+                out.append(prefix + "." + tail)
+    return out
+
+def resolve_expert_layout(model, cfg: MoEConfig) -> MoEConfig:
+    """Point the expert prefix and the expert names at what this model has.
+
+    The checkpoint answers neither question. A checkpoint names a tensor by the
+    key it was saved under; which module holds it and under what name are both
+    properties of the transformers release, and they change independently - one
+    release keeps an .experts container and the loaded names, another drops the
+    container and keeps the stored names, and the file is identical in both.
+
+    So the prefix and the names are looked up on the model. Asking the model is
+    the only source that knows, and reading the file instead has been wrong four
+    times: it produces a run with no expert modules, then a run whose experts it
+    cannot find, then a run that leaves every router on the meta device, each time
+    while the loss curve still looks like training.
+    """
+    params = set(dict(model.named_parameters()))
+    base = cfg.expert_prefix
+
+    prefixes = [base]
+    if base.endswith(".experts"):
+        prefixes.append(base[: -len(".experts")])
+    else:
+        prefixes.append(base + ".experts")
+
+    def names_of(prefix, pns):
+        out = set()
+        for li in range(cfg.num_layers):
+            for pn in pns:
+                out.update(_name_candidates(prefix.format(i=li), pn))
+        return out
+
+    # A working prefix is one where at least one spelling of the first tensor of
+    # every layer is present. All of them or none: a release does not rename half
+    # its layers.
+    for cand in prefixes:
+        names = names_of(cand, [cfg.expert_param_names[0]])
+        if not names or not (names & params):
+            continue
+        ordered = []
+        head = cand.format(i=0)
+        for pn in cfg.expert_param_names:
+            # The name relative to the prefix. Taking only the last component
+            # would turn input_linear.weight into weight, which names a tensor
+            # that does not exist on a module that registers it inside a
+            # submodule of its own.
+            hit = next(
+                (c[len(head) + 1:]
+                 for c in _name_candidates(head, pn) if c in params),
+                None,
+            )
+            if hit is None:
+                ordered = []
+                break
+            ordered.append(hit)
+        if not ordered:
+            continue
+        cfg.expert_prefix = cand
+        cfg.expert_param_names = ordered
+        return cfg
+
+    sample = sorted(
+        n for n in params if n.startswith("model.layers.0."))[:24]
+    raise SystemExit(
+        f"the expert layout {cfg.expert_prefix} {cfg.expert_param_names} "
+        f"resolves to no parameters on this model.\n  tried: {prefixes}"
+        f"\n  layer 0 parameters: {sample}"
+    )

@@ -262,7 +262,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from usaf.model_factory import MoEConfig, resolve_expert_prefix
+from usaf.model_factory import MoEConfig, resolve_expert_layout
 
 N_LAYERS, N_EXP, INTER, HID = 3, 4, 8, 6
 PREFIX = "model.layers.{i}.block_sparse_moe"
@@ -313,7 +313,7 @@ class _Model(nn.Module):
 
 def test_a_release_that_keeps_the_container_keeps_the_prefix():
     cfg = _cfg(WITH_CONTAINER)
-    resolve_expert_prefix(_Model(with_container=True), cfg)
+    resolve_expert_layout(_Model(with_container=True), cfg)
     assert cfg.expert_prefix == WITH_CONTAINER
 
 
@@ -324,7 +324,7 @@ def test_a_release_that_inlines_them_resolves_to_the_block():
     # at all, which is a run with no hooks and a loss that falls on the dense
     # weights alone.
     cfg = _cfg(WITH_CONTAINER)
-    resolve_expert_prefix(_Model(with_container=False), cfg)
+    resolve_expert_layout(_Model(with_container=False), cfg)
     assert cfg.expert_prefix == PREFIX
 
 
@@ -332,7 +332,7 @@ def test_the_prefix_read_off_the_file_is_corrected_wherever_it_was_wrong():
     # The detector may guess either way depending on the file it read, and the
     # model settles it. Both guesses have to survive being wrong.
     cfg = _cfg(PREFIX)
-    resolve_expert_prefix(_Model(with_container=True), cfg)
+    resolve_expert_layout(_Model(with_container=True), cfg)
     assert cfg.expert_prefix == WITH_CONTAINER
 
 
@@ -352,7 +352,103 @@ def test_a_prefix_that_matches_nothing_names_the_tensors_it_found():
                     torch.zeros(N_EXP, HID))
 
     with pytest.raises(SystemExit) as exc:
-        resolve_expert_prefix(Empty(), _cfg(WITH_CONTAINER))
+        resolve_expert_layout(Empty(), _cfg(WITH_CONTAINER))
     text = str(exc.value)
     assert "router.weight" in text
     assert WITH_CONTAINER in text
+import torch.nn as nn
+
+N_LAYERS, N_EXP, INTER, HID = 3, 4, 8, 6
+BLOCK = "model.layers.{i}.block_sparse_moe"
+CONTAINER = BLOCK + ".experts"
+
+
+def _cfg(prefix=CONTAINER, names=("gate_up_proj", "down_proj")):
+    return MoEConfig(
+        model_path="x",
+        num_layers=N_LAYERS,
+        num_experts=N_EXP,
+        expert_prefix=prefix,
+        expert_param_names=list(names),
+        router_path=".block_sparse_moe.router.weight",
+    )
+
+
+def _param(parent, name, shape):
+    """A tensor registered as name, with or without a submodule of its own."""
+    if name.endswith(".weight"):
+        sub = nn.Module()
+        sub.weight = nn.Parameter(torch.zeros(*shape))
+        setattr(parent, name[:-len(".weight")], sub)
+    else:
+        setattr(parent, name, nn.Parameter(torch.zeros(*shape)))
+
+
+def _model(container, up, down):
+    """The four combinations two releases disagree about, independently."""
+    m = nn.Module()
+    m.model = nn.Module()
+    m.model.layers = nn.ModuleList([nn.Module() for _ in range(N_LAYERS)])
+    for layer in m.model.layers:
+        b = nn.Module()
+        layer.block_sparse_moe = b
+        if container:
+            b.experts = nn.Module()
+        holder = b.experts if container else b
+        _param(holder, up, (N_EXP, 2 * INTER, HID))
+        _param(holder, down, (N_EXP, HID, INTER))
+        b.router = nn.Module()
+        b.router.weight = nn.Parameter(torch.zeros(N_EXP, HID))
+    return m
+
+
+CASES = [
+    ("container + loaded names", True, "gate_up_proj", "down_proj",
+     CONTAINER, ["gate_up_proj", "down_proj"]),
+    ("container + stored names", True, "input_linear.weight", "output_linear.weight",
+     CONTAINER, ["input_linear.weight", "output_linear.weight"]),
+    ("inlined  + loaded names", False, "gate_up_proj", "down_proj",
+     BLOCK, ["gate_up_proj", "down_proj"]),
+    ("inlined  + stored names", False, "input_linear.weight", "output_linear.weight",
+     BLOCK, ["input_linear.weight", "output_linear.weight"]),
+]
+
+
+def test_every_combination_a_release_can_present_resolves():
+    for label, container, up, down, want_prefix, want_names in CASES:
+        cfg = _cfg()
+        resolve_expert_layout(_model(container, up, down), cfg)
+        assert cfg.expert_prefix == want_prefix, (label, cfg.expert_prefix)
+        assert cfg.expert_param_names == want_names, (label, cfg.expert_param_names)
+
+
+def test_a_prefix_read_wrong_from_the_file_is_corrected():
+    # The detector can hand over either spelling, depending on the file it read.
+    # The model settles it, so both guesses have to survive being wrong.
+    for guess in (BLOCK, CONTAINER):
+        cfg = _cfg(prefix=guess)
+        resolve_expert_layout(
+            _model(False, "input_linear.weight", "output_linear.weight"), cfg)
+        assert cfg.expert_prefix == BLOCK, (guess, cfg.expert_prefix)
+
+
+def test_a_model_with_no_experts_names_what_it_found():
+    import pytest
+
+    class Empty(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList(
+                [nn.Module() for _ in range(N_LAYERS)])
+            for layer in self.model.layers:
+                layer.block_sparse_moe = nn.Module()
+                layer.block_sparse_moe.router = nn.Module()
+                layer.block_sparse_moe.router.weight = nn.Parameter(
+                    torch.zeros(N_EXP, HID))
+
+    with pytest.raises(SystemExit) as exc:
+        resolve_expert_layout(Empty(), _cfg())
+    text = str(exc.value)
+    assert "router.weight" in text
+    assert CONTAINER in text

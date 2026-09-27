@@ -1261,10 +1261,10 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
     # which module holds it, and those are not the same question. Resolving the
     # prefix here is what keeps a release that inlines the experts from being
     # read as one that has no expert modules at all.
-    from usaf.model_factory import resolve_expert_prefix
+    from usaf.model_factory import resolve_expert_layout
 
     before_prefix = moe_cfg.expert_prefix
-    moe_cfg = resolve_expert_prefix(model, moe_cfg)
+    moe_cfg = resolve_expert_layout(model, moe_cfg)
     if moe_cfg.expert_prefix != before_prefix:
         print(f"Expert prefix: {before_prefix} -> {moe_cfg.expert_prefix} "
               f"(this release keeps them there)")
