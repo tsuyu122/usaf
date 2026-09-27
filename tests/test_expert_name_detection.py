@@ -194,3 +194,31 @@ def test_a_path_with_no_checkpoint_falls_back_and_says_so(tmp_path):
         ["gate_up_proj", "down_proj"],
         ".mlp.gate.weight",
     )
+
+
+def test_the_router_name_is_collapsed_in_a_full_path_too():
+    # The detector is handed a suffix, but the weight loader walks whole
+    # checkpoint keys. A collapse that only works on a bare suffix leaves every
+    # router on the meta device, and the run dies naming a weight that was in the
+    # file all along.
+    full = "model.layers.7.block_sparse_moe.router.layer.weight"
+    assert _loaded_router_name(full) == (
+        "model.layers.7.block_sparse_moe.router.weight")
+
+
+def test_a_non_router_name_is_never_collapsed():
+    # The layer component is only the routers quirk. Rewriting a name this code
+    # does not understand is worse than reporting the name it was given.
+    for name in (
+        "model.layers.7.block_sparse_moe.router.weight",
+        "model.layers.7.mlp.experts.gate_up_proj",
+        "model.layers.7.input_layernorm.weight",
+        "router.layer_norm.weight",
+    ):
+        assert _loaded_router_name(name) == name, name
+
+
+def test_a_granite_router_collapses_where_a_qwen_router_does_not():
+    # Both are routers; only one of them is stored under the extra layer.
+    assert _loaded_router_name("router.layer.weight") == "router.weight"
+    assert _loaded_router_name("mlp.gate.weight") == "mlp.gate.weight"

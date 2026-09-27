@@ -240,6 +240,7 @@ def setup_device(config: TrainConfig) -> tuple[torch.device, int, object]:
     # nothing. Each family gets its own patch because the expert container
     # class and the router API differ, even though from transformers>=4.53
     # they all share the fused gate_up_proj/down_proj layout.
+    from usaf.granite_dml import patch_granite_for_dml
     from usaf.mixtral_dml import patch_mixtral_for_dml
     from usaf.olmoe_dml import patch_olmoe_for_dml
     from usaf.qwen3moe_dml import patch_qwen3moe_for_dml
@@ -253,6 +254,7 @@ def setup_device(config: TrainConfig) -> tuple[torch.device, int, object]:
     # never fires, select() returns nothing, and the run trains only the
     # non-expert parameters with the loss falling throughout.
     patch_zaya_for_dml()
+    patch_granite_for_dml()
 
     if config.use_cuda:
         # An assert, not a check: python -O strips asserts entirely, so under -O
@@ -1214,6 +1216,8 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
 
     # Router bookkeeping: suffix (from the detected config) and the dict of
     # trainable gate params, returned so _run_training can optimize them.
+    from usaf.model_factory import _loaded_router_name
+
     router_suffix = moe_cfg.router_path
     router_params: dict[str, nn.Parameter] = {}
 
@@ -1257,13 +1261,14 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
             "  Use --dtype fp16 (or auto). Making the expert path precision-parametric "
             "is what would unlock bf16, and it is a real change, not a flag."
         )
-    for name in sorted(wf.keys()):
+    for disk_name in sorted(wf.keys()):
+        name = _loaded_router_name(disk_name)
         if any(name.startswith(m + ".") for m in _expert_modules):
             continue
         if name not in mp:
             continue
-        with safe_open(os.path.join(st_path, wf[name]), framework="pt") as sf:
-            tensor = sf.get_tensor(name).to(run_dtype)
+        with safe_open(os.path.join(st_path, wf[disk_name]), framework="pt") as sf:
+            tensor = sf.get_tensor(disk_name).to(run_dtype)
         parts = name.split(".")
         obj = model
         for p in parts[:-1]:

@@ -170,9 +170,30 @@ def _loaded_router_name(on_disk: str) -> str:
     is worse than reporting the name it was given.
     """
     parts = on_disk.split(".")
-    if len(parts) >= 3 and parts[0] == "router" and parts[1] == "layer":
-        return ".".join([parts[0]] + parts[2:])
+    if (len(parts) >= 3 and parts[-3] == "router" and parts[-2] == "layer"
+            and parts[-1] == "weight"):
+        return ".".join(parts[:-3] + [parts[-3], parts[-1]])
     return on_disk
+
+
+def _router_disk_name(loaded: str) -> str:
+    """The router name in the file, given the name on the loaded module.
+
+    The inverse of _loaded_router_name, and needed for the same reason from the
+    other side. The trainer walks the keys of the checkpoint and fills the model
+    from them, so a module name with no key of its own in the file is simply not
+    loaded: the parameter keeps the meta device it was built with and the first
+    forward dies naming a weight that was sitting in the file all along. For
+    GraniteMoe that is 24 routers, one per layer.
+
+    Only router.weight gains the layer component. Everything else is returned as
+    given, for the same reason as above: rewriting a name this code does not
+    understand is worse than reporting it.
+    """
+    parts = loaded.split(".")
+    if len(parts) >= 2 and parts[-2] == "router" and parts[-1] == "weight":
+        return ".".join(parts[:-2] + ["router", "layer", "weight"])
+    return loaded
 
 
 def _expert_names_from_index(model_path) -> tuple[str, list[str], str] | None:
