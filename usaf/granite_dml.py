@@ -61,7 +61,6 @@ def _looks_like_experts(cls) -> bool:
         return False
     try:
         src = inspect.getsource(cls.__init__)
-        params = inspect.signature(cls.forward).parameters
     except (OSError, TypeError, ValueError):
         return False
 
@@ -70,17 +69,24 @@ def _looks_like_experts(cls) -> bool:
     if not any(a in src and b in src for a, b in pairs):
         return False
 
-    # self, the hidden states, and the routing: at least three, and none of
-    # them keyword-only or defaulted, which is how a block can be told apart
-    # from a container that happens to mention the same names.
-    positional = [
-        p for p in params.values()
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-    ]
-    return (
-        len(positional) >= 3
-        and not any(p.default is not p.empty for p in positional)
-    )
+    # Can it actually be handed the routing? That is the question the sparse
+    # forward asks of it, so it is the question worth asking the class, and it
+    # survives a release that adds an optional argument - which counting
+    # parameters does not, and which is how the check below started refusing the
+    # container it was written for.
+    #
+    # self, the hidden states, and the routing the router just produced.
+    try:
+        sig = inspect.signature(cls.forward)
+        named = [p for p in sig.parameters.values()
+                 if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        sig.bind(
+            object(), torch.zeros(1), torch.zeros(1), torch.zeros(1))
+    except (TypeError, ValueError):
+        return False
+    # A *args forward binds anything, and nn.Module.forward is exactly that, so
+    # binding alone is not enough - the names have to be there as well.
+    return len(named) >= 3
 
 def _candidate_modules():
     """Every module GraniteMoe could have put its expert container in.

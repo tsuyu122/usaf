@@ -1316,6 +1316,13 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
     else:
         print(f"Expert prefix: {moe_cfg.expert_prefix} confirmed on the model")
 
+    # The names too, because the prefix alone is half the answer and the half that
+    # prints is the half that was already right. A run that resolves the prefix,
+    # finds the modules, and then writes the weights somewhere the forward does
+    # not look looks identical from here to a run that is working, and the two
+    # differ only in a line that was not printed. What it will use, it says.
+    print(f"Expert tensors: {moe_cfg.expert_param_names}")
+
     # Router bookkeeping: suffix (from the detected config) and the dict of
     # trainable gate params, returned so _run_training can optimize them.
 
@@ -1396,7 +1403,9 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
     cache = QuantizedExpertCache(q_dict, device, max_cached=1, group_size=128,
                                 expert_prefix=moe_cfg.expert_prefix)
 
-    _install_expert_hooks(model, _expert_modules, cache)
+    _n_hooked = _install_expert_hooks(model, _expert_modules, cache)
+    print(f'Expert modules: {_n_hooked} of {len(_expert_modules)} hooked,'
+          f'over {moe_cfg.num_layers} layers')
 
     return model, cache, q_dict, wf, st_path, router_params, cfg
 
