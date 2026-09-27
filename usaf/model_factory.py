@@ -486,3 +486,83 @@ def resolve_expert_prefix(model, cfg: MoEConfig) -> MoEConfig:
         f"this model.\n  tried: {candidates}"
         f"\n  layer 0 parameters: {sample}"
     )
+
+
+# The tail a tensor is stored under, and the one it is loaded under. GraniteMoe
+# renames on the way in, so the file and the module disagree about every expert
+# weight and about the router, and an export that writes the module spelling
+# produces a directory that loads into a model full of fresh random experts.
+_STORED_TAIL = {
+    "gate_up_proj": "input_linear.weight",
+    "down_proj": "output_linear.weight",
+}
+
+
+def _stored_name(loaded: str) -> str:
+    """The name this tensor has in the file, given the name on the module.
+
+    The inverse of _loaded_router_name for the router, and the same treatment for
+    the expert weights, which the quantiser discovered separately and kept to
+    itself. Both questions have one answer - what is the tensor called in the
+    file - and two copies of the answer is how they drift apart.
+
+    Only the tails listed are rewritten. Everything else is returned as given,
+    because renaming a tensor this code does not recognise is how a working
+    export turns into a model full of random weights.
+    """
+    parts = loaded.split(".")
+    if parts and parts[-1] in _STORED_TAIL:
+        return ".".join(parts[:-1] + [_STORED_TAIL[parts[-1]]])
+    return _router_disk_name(loaded)
+
+
+def _candidates(loaded: str) -> list[str]:
+    """The file spellings this module name could have, best guess first.
+
+    Two things vary independently between releases: whether there is an .experts
+    container at all, and whether the tensor inside it is stored under its loaded
+    name or the converted one. The order is the answer on this machine first, and
+    every other combination after, so a release that changed one thing still
+    resolves.
+    """
+    parts = loaded.split(".")
+    tail = parts[-1]
+    stems = []
+    if len(parts) >= 2 and parts[-2] == "experts":
+        head = parts[:-2]
+        stems.append(head)
+        stems.append(parts[:-1])
+    else:
+        stems.append(parts[:-1])
+        stems.append(parts[:-2] + ["experts"] if len(parts) >= 2 else None)
+    out = []
+    for stem in stems:
+        if stem is None:
+            continue
+        for name in (tail, _STORED_TAIL.get(tail)):
+            if name is None:
+                continue
+            out.append(".".join(stem + [name]))
+            if stem and stem[-1] == "router" and name == "weight":
+                out.append(".".join(stem + ["router", "layer", "weight"]))
+    seen = set()
+    uniq = []
+    for c in out:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+
+def resolve_stored_name(loaded: str, keys) -> str:
+    """The key this module name has in a checkpoint that holds `keys`.
+
+    Asking the file is the only way to know: a checkpoint written by one release
+    and loaded by another does not rename the same way, and the export has to use
+    the spelling that is actually in the file or from_pretrained fills the
+    difference with fresh random weights and reports success.
+    """
+    for cand in _candidates(loaded):
+        if cand in keys:
+            return cand
+    return _stored_name(loaded)

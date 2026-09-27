@@ -87,15 +87,15 @@ def collect_expert_tensors(cfg, patterns=None) -> dict:
     # names reads a file the model itself was built from and finds nothing. The
     # shapes are already the stacked ones - (E, 2*inter, hidden) and
     # (E, hidden, inter) - so there is nothing to stack, only a name to map.
-    aliased = {}
-    for name in names:
-        stem = name.rsplit('.', 1)[0]
-        tail = name.rsplit('.', 1)[-1]
-        old = stem.rsplit('.', 1)[0] + '.' + {
-            'gate_up_proj': 'input_linear.weight',
-            'down_proj': 'output_linear.weight',
-        }.get(tail, tail)
-        aliased[name] = old
+    from usaf.model_factory import resolve_stored_name
+
+    disk_keys = set()
+    for shard in shards:
+        from safetensors import safe_open
+
+        with safe_open(shard, framework='pt') as sf:
+            disk_keys.update(sf.keys())
+    aliased = {name: resolve_stored_name(name, disk_keys) for name in names}
     legacy_names = [aliased[n] for n in names]
     found = read(legacy_names)
     if len(found) == len(legacy_names):

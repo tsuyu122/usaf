@@ -24,6 +24,7 @@ def save_sparse_checkpoint(
     losses: list[float],
     train_layers: list[int],
     metric: float | None = None,
+    routers: dict[str, Any] | None = None,
 ) -> str:
     path = str(path)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -36,6 +37,8 @@ def save_sparse_checkpoint(
         "config": config,
         "metric": metric,
         "active_idx": {k: v.cpu() for k, v in active_idx.items()},
+        "routers": {k: v.detach().cpu()
+                    for k, v in (routers or {}).items()},
         "masters": {k: v.detach().cpu() for k, v in masters.items()},
         "optimizer": optimizer_state,
     }

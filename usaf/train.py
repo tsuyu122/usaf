@@ -2020,6 +2020,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                  "train_from": config.train_from, "reselect_every": RESELECT_EVERY,
                  "save_every": config.save_every, "tag": config.tag},
                 step, losses, list(train_layers), metric=step_loss,
+                routers=router_params,
             )
             print(f"  >>> checkpoint saved: {ckpt_path}", flush=True)
 
