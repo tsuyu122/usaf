@@ -81,6 +81,26 @@ def collect_expert_tensors(cfg, patterns=None) -> dict:
     if len(found) == len(names):
         return found
 
+    # Same tensors, the names the checkpoint was written with. GraniteMoe stores
+    # input_linear / output_linear and the loading converter renames them to
+    # gate_up_proj / down_proj, so a quantiser that looks only for the loaded
+    # names reads a file the model itself was built from and finds nothing. The
+    # shapes are already the stacked ones - (E, 2*inter, hidden) and
+    # (E, hidden, inter) - so there is nothing to stack, only a name to map.
+    aliased = {}
+    for name in names:
+        stem = name.rsplit('.', 1)[0]
+        tail = name.rsplit('.', 1)[-1]
+        old = stem.rsplit('.', 1)[0] + '.' + {
+            'gate_up_proj': 'input_linear.weight',
+            'down_proj': 'output_linear.weight',
+        }.get(tail, tail)
+        aliased[name] = old
+    legacy_names = [aliased[n] for n in names]
+    found = read(legacy_names)
+    if len(found) == len(legacy_names):
+        return {new: found[old] for new, old in aliased.items()}
+
     # Per-expert layout: rebuild the stacked tensors the trainer expects.
     n_experts = cfg.num_experts
     parts = {}
