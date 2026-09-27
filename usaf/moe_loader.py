@@ -154,7 +154,27 @@ class QuantizedExpertCache:
             if len(parts) != 2:
                 continue
             module_name, param_name = parts
-            expert_to_params.setdefault(module_name, []).append((full_name, param_name))
+            expert_to_params.setdefault(module_name, []).append(
+                (full_name, param_name))
+
+            # A tensor is addressable by every prefix its name can end at, not
+            # only by the one before its last component. A release that keeps the
+            # expert weights in submodules spells them
+            # block_sparse_moe.input_linear.weight: the container asked for is
+            # block_sparse_moe and the parameter is input_linear.weight, while
+            # indexing only on the last component files the tensor under
+            # block_sparse_moe.input_linear and the caller never finds it. The
+            # pre-hook then places nothing, the forward runs on what is still the
+            # meta tensor, and the backward says so - with a loss curve in front
+            # of it that looks like a run that is working.
+            #
+            # So the index holds the same tensor at every address it answers to.
+            # The file is the one vocabulary both sides already share.
+            head, _, tail = module_name.rpartition(".")
+            while head and tail:
+                expert_to_params.setdefault(head, []).append(
+                    (full_name, f"{tail}.{param_name}"))
+                head, _, tail = head.rpartition(".")
 
         self._expert_to_params = expert_to_params
 
