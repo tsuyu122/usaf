@@ -694,19 +694,33 @@ def _expert_modules_by_name(model, expert_modules):
     objects, so unwrapping changes which names are looked up and nothing else -
     the attributes land on the same modules the forward pass uses.
 
-    The count is checked because the failure mode is silence. A model whose
-    experts are named differently from what detect_model reports has the same
-    shape of problem, and a run that quietly learns nothing is worse than one
-    that stops.
+    The unwrapping is by attribute rather than by isinstance, because the
+    wrapper under CUDA is not the class imported on this machine, and a check
+    against the wrong class is a check that never fires. The chain is followed
+    only while it finds nothing, so a model that needs no unwrapping is left alone.
+
+    The count is checked because the failure mode is silence, and the error names
+    what it did find as well as what it wanted: a list of what is missing on its
+    own is a guess, and the guess was wrong three times before this line.
     """
-    root = model.module if isinstance(model, nn.DataParallel) else model
+    root = model
     found = {n: m for n, m in root.named_modules() if n in expert_modules}
+    depth = 0
+    while not found and hasattr(root, "module"):
+        root = root.module
+        depth += 1
+        if depth > 8:
+            break
+        found = {n: m for n, m in root.named_modules() if n in expert_modules}
     if len(found) != len(expert_modules):
         missing = sorted(expert_modules - set(found))
+        seen = [n for n, _ in root.named_modules() if "expert" in n][:6]
         raise SystemExit(
-            "no expert modules found: " + str(len(found)) + " of "
-            + str(len(expert_modules)) + " matched under "
-            + type(model).__name__ + ". First missing: " + str(missing[:3])
+            f"no expert modules found: {len(found)} of {len(expert_modules)}"
+            f" matched under {type(model).__name__}, unwrapped {depth} time(s)"
+            f" to {type(root).__name__}."
+            f"\n  expected: {missing[:3]}"
+            f"\n  expert-like names actually present: {seen}"
         )
     return found
 
