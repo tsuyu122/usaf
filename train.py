@@ -1,13 +1,20 @@
 """Qwen3-30B-A3B 12h training — curated bugfix+Vulkan dataset with USAF sparse fine-tuning."""
-import json, math, os, random, time
+import json
+import math
+import os
+import random
+import time
 from pathlib import Path
-import psutil, torch
-from transformers import AutoConfig
+
+import psutil
+import torch
 from safetensors import safe_open
+from transformers import AutoConfig
+
+from usaf.moe_loader import QuantizedExpertCache, SparseGradStore, TopKImportanceStore
 from usaf.qwen3moe_dml import patch_qwen3moe_for_dml
 from usaf.sparse_optim import SparseAdam
 from usaf.utils import get_dml_device
-from usaf.moe_loader import QuantizedExpertCache, SparseGradStore, TopKImportanceStore
 
 os.environ["TQDM_DISABLE"]="1"
 proc=psutil.Process(os.getpid())
@@ -59,7 +66,7 @@ random.seed(42)
 
 def load_jsonl(path):
     out=[]
-    with open(path,"r",encoding="utf-8") as f:
+    with open(path,encoding="utf-8") as f:
         for line in f:
             if line.strip(): out.append(json.loads(line))
     return out
@@ -119,7 +126,7 @@ if USE_CUDA:
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        print(f"  AMP (manual loss scaling) + cuDNN benchmark + TF32 enabled")
+        print("  AMP (manual loss scaling) + cuDNN benchmark + TF32 enabled")
     else:
         _amp_scaler = None
 else:
@@ -250,8 +257,8 @@ for mname,mod in model.named_modules():
 
 # ── Vulkan persistent forward for attention ──
 if USE_VK:
+
     from usaf.vk_layer import create_vk_layers
-    import numpy as np
     _vk_w = {}
     for li in sorted(TRAIN_LAYERS):
         prefix = f"model.layers.{li}."
@@ -264,7 +271,7 @@ if USE_VK:
         _VK_NH = model.config.num_attention_heads
         _VK_NKV = model.config.num_key_value_heads
     else:
-        print(f"  Vulkan: no weights loaded")
+        print("  Vulkan: no weights loaded")
 else:
     VK_LAYERS = {}
     _VK_HD = _VK_NH = _VK_NKV = 0
@@ -467,7 +474,7 @@ def log_jsonl(rec):
     with open(LOG_PATH,"a") as f: f.write(json.dumps(rec)+"\n")
 
 # ── 4. Resume or importance+selection ──
-print(f"\n3/4  Training (12h config)")
+print("\n3/4  Training (12h config)")
 ckpt=None
 if os.path.exists(CKPT_PATH):
     ckpt=torch.load(CKPT_PATH,map_location="cpu",weights_only=False)
@@ -539,6 +546,7 @@ if USE_FROZEN_CACHE:
     gc.collect()
 
 from usaf.quantization import dequantize_4bit
+
 masters={}
 for fname,aidx in active_idx.items():
     aidx=aidx.reshape(-1).to(torch.long)
@@ -569,7 +577,7 @@ if USE_RESIDENT:
             cache.setup_vk_dequant(TRAIN_LAYERS)
             print(f"  VK dequant: {len(cache._vk_q4)} params na GPU")
         print(f"  Residentes prontos em {time.time()-_t:.0f}s | RAM: {ram():.1f}GB"
-              + (f" (parcial: gate_up_proj apenas)" if _resident_params else ""))
+              + (" (parcial: gate_up_proj apenas)" if _resident_params else ""))
     else:
         _resident_params = ["gate_up_proj"] if len(TRAIN_LAYERS) > 8 else None
         cache.make_resident(TRAIN_LAYERS, only_params=_resident_params)
@@ -794,9 +802,9 @@ iel,ipp=(evals[0][1],evals[0][2]) if evals else (fel,fpp)
 ihp=evals[0][4] if evals else fhp
 sm=sum(losses[-10:])/min(len(losses),10) if losses else 0
 
-print(f"\n4/4  Results")
+print("\n4/4  Results")
 if SKIP_FINAL_EVAL:
-    print("  Train: {:.4f} -> {:.4f} | skipped {}".format(losses[0], sm, n_skipped))
+    print(f"  Train: {losses[0]:.4f} -> {sm:.4f} | skipped {n_skipped}")
     print("  Eval/HELD-OUT ppl: SKIPPED (SKIP_FINAL_EVAL=1) - not measured")
 else:
     print(f"  Train: {losses[0]:.4f} -> {sm:.4f} | Eval ppl: {ipp:.2f} -> {fpp:.2f} | skipped {n_skipped}")

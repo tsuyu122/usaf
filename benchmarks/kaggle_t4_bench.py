@@ -13,7 +13,16 @@ Usage:
     python usaf_kaggle_train.py
 """
 
-import os, sys, json, time, math, random, gc, subprocess, faulthandler, traceback
+import faulthandler
+import gc
+import json
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from pathlib import Path
 
@@ -78,11 +87,9 @@ if _usaf_parent:
 else:
     print("WARNING: usaf package not found under /kaggle/input", flush=True)
 
-import numpy as np
+import psutil
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-import psutil
 
 # ===============================================
 # CONFIG - modify these for different runs
@@ -165,9 +172,10 @@ else:
 
 print(f"\n=== Loading model === ({_ram()})")
 import transformers
+
 print(f"transformers {transformers.__version__}")
-from transformers import AutoConfig
 from safetensors import safe_open
+from transformers import AutoConfig
 
 cfg = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
 H = cfg.hidden_size
@@ -239,6 +247,7 @@ print(f"Model loaded on {device}")
 # Without it the native HF forward runs but sparse grads stay zero (no training).
 # Same dense-masked path as the DML baseline -> apples-to-apples tok/s.
 from usaf.qwen3moe_dml import patch_qwen3moe_for_dml
+
 patch_qwen3moe_for_dml()
 print("Applied qwen3moe grad-capture forward patch")
 
@@ -250,6 +259,8 @@ print("Applied qwen3moe grad-capture forward patch")
 # per-expert grad-capture protocol (store.add). Requires the sparse-store path
 # (TopKImportanceStore / SparseGradStore), which this benchmark uses.
 import torch.nn.functional as _F
+
+
 def sparse_qwen3_experts_forward(self, hidden_states, weights):
     N, Hd = hidden_states.shape
     final = torch.zeros(N, Hd, dtype=torch.float32, device=hidden_states.device)
@@ -357,20 +368,20 @@ for mname, mod in model.named_modules():
     mod._parameters.clear()
     if hasattr(mod, '_buffers'):
         mod._buffers.clear()
-    
+
     def make_pre(name):
         def pre(module, args):
             weights = cache.get_expert_weights(name)
             for pn, param in weights.items():
                 module._parameters[pn] = param
         return pre
-    
+
     def make_post():
         def post(module, args, output):
             module._parameters.clear()
             return output
         return post
-    
+
     mod.register_forward_pre_hook(make_pre(mname))
     mod.register_forward_hook(make_post())
 
@@ -451,8 +462,8 @@ def _head_loss(hidden, labels):
 # ===============================================
 
 print("\n=== Training setup ===")
-from usaf.sparse_optim import SparseAdam
 from usaf.quantization import dequantize_4bit
+from usaf.sparse_optim import SparseAdam
 
 DETACH_AT = TRAIN_FROM - 1
 _train_names = [f"model.layers.{li}.mlp.experts.{pn}"
@@ -469,6 +480,7 @@ _shapes = {fn: _q_shape(fn) for fn in _train_names}
 
 # Importance phase
 from usaf.moe_loader import TopKImportanceStore
+
 imp_store = TopKImportanceStore(_shapes, frac=FRAC)
 
 # Register grad capture hooks
@@ -586,6 +598,7 @@ for fname, aidx in active_idx.items():
 
 # SparseGradStore
 from usaf.moe_loader import SparseGradStore
+
 sparse_store = SparseGradStore(active_idx, _shapes)
 for mname, mod in model.named_modules():
     if not mname.endswith(".mlp.experts"):
@@ -638,7 +651,7 @@ loss_scale = 4096.0
 
 for step in range(1, STEPS + 1):
     t_step = time.time()
-    
+
     # LR schedule: cosine decay
     if step <= max(1, int(STEPS * 0.05)):
         lr = LR_PEAK * step / max(1, int(STEPS * 0.05))
@@ -646,23 +659,23 @@ for step in range(1, STEPS + 1):
         progress = (step - max(1, int(STEPS * 0.05))) / max(1, STEPS - max(1, int(STEPS * 0.05)))
         lr = LR_PEAK * 0.1 + LR_PEAK * 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
     opt.lr = lr
-    
+
     sparse_store.zero_()
     step_loss = 0.0
-    
+
     for a in range(ACCUM):
         item = frozen_cache[si % len(frozen_cache)]
         si += 1
         loss_val = fwd_bwd(item, zero_store=False, bwd_scale=loss_scale)
         step_loss += loss_val
-    
+
     step_loss /= ACCUM
-    
+
     # Optimizer
     denom = loss_scale * ACCUM
     cg = {n: v / denom for n, v in sparse_store.compact.items()}
     finite = all(torch.isfinite(v).all().item() for v in cg.values())
-    
+
     if finite:
         opt.step(compact_grads=cg)
         cache.sync_resident(active_idx, masters)
@@ -671,27 +684,27 @@ for step in range(1, STEPS + 1):
             loss_scale = min(loss_scale * 2, 65536.0)
     else:
         loss_scale = max(loss_scale / 2, 64.0)
-    
+
     cache.evict_all()
     losses.append(step_loss)
-    
+
     pr = ram()
     if pr > pr_peak:
         pr_peak = pr
-    
+
     dt = time.time() - t_step
     step_dts.append(dt)
     pct = 100.0 * step / STEPS
     eta_h = (STEPS - step) * dt / 3600
     tok_s = eff_batch * SEQ_LEN / dt
-    
+
     print(f"  [{int(pct//4)*'#'+'-'*25:25s}] {pct:5.1f}% | step {step:03d}/{STEPS} | "
           f"loss {step_loss:.4f} | {tok_s:.0f} tok/s | LR {lr:.1e} | RAM {pr:.1f}G | ETA {eta_h:.1f}h",
           flush=True)
 
 t_total = time.time() - t_start
 _probe_after = _eval_loss(frozen_cache[0])
-print(f"\n=== Training complete ===")
+print("\n=== Training complete ===")
 print(f"Probe loss (sample 0): {_probe_before:.4f} -> {_probe_after:.4f} "
       f"(delta {_probe_after - _probe_before:+.4f})")
 print(f"Time: {t_total/3600:.1f}h")
