@@ -222,3 +222,39 @@ def test_a_granite_router_collapses_where_a_qwen_router_does_not():
     # Both are routers; only one of them is stored under the extra layer.
     assert _loaded_router_name("router.layer.weight") == "router.weight"
     assert _loaded_router_name("mlp.gate.weight") == "mlp.gate.weight"
+
+def test_the_module_name_wins_when_the_model_has_it():
+    # The loader asks the model which spelling it has, because the answer
+    # differs by release: some transformers flatten router.layer.weight to
+    # router.weight on the module, some keep both. Collapsing unconditionally
+    # fixes the first and breaks the second, and the second dies with every
+    # router still on the meta device, under a name that is in the checkpoint.
+    from usaf.train import _resolve_module_name
+
+    disk = 'model.layers.0.block_sparse_moe.router.layer.weight'
+    flat = 'model.layers.0.block_sparse_moe.router.weight'
+
+    assert _resolve_module_name(disk, {flat: 0}) == flat
+    assert _resolve_module_name(disk, {disk: 0}) == disk
+
+
+def test_a_name_the_model_has_neither_way_is_not_invented():
+    # Resolving must not fabricate a third spelling no loader would find. The
+    # membership test downstream is what rejects it.
+    from usaf.train import _resolve_module_name
+
+    disk = 'model.layers.0.block_sparse_moe.router.layer.weight'
+    assert _resolve_module_name(disk, {}) not in ({}, {disk})
+
+
+def test_an_untouched_weight_keeps_its_own_name():
+    # Everything that is not a router resolves to itself, either way round.
+    from usaf.train import _resolve_module_name
+
+    for name in (
+        'model.embed_tokens.weight',
+        'model.layers.3.mlp.down_proj.weight',
+        'model.norm.weight',
+    ):
+        assert _resolve_module_name(name, {name: 0}) == name
+        assert _resolve_module_name(name, {}) == name

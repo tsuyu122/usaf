@@ -23,6 +23,7 @@ import psutil
 import torch
 import torch.nn as nn
 
+from usaf.model_factory import _loaded_router_name
 from usaf.utils import resolve_dtype
 
 
@@ -859,6 +860,26 @@ def _expert_module_names(moe_cfg) -> set[str]:
     return {moe_cfg.expert_prefix.format(i=i) for i in range(moe_cfg.num_layers)}
 
 
+def _resolve_module_name(disk_name: str, mp: dict) -> str:
+    """The name this tensor has on the model, given the name in the file.
+
+    The router keeps its layer component in some transformers releases and loses
+    it in others, so the same tensor has two spellings and which one the module
+    uses is a property of the release, not of the file. Asking the model is the
+    only thing that answers it: collapsing unconditionally fixes the flattened
+    release and breaks the one that kept it, and the failure is every router left
+    on the meta device, reported under a name that is in the checkpoint already.
+
+    The exact name is tried first, so a model that does have it is never
+    rewritten. A name the model has neither way comes back collapsed, which the
+    caller rejects on the membership test - resolving must not invent a third
+    spelling that no loader would find.
+    """
+    if disk_name in mp:
+        return disk_name
+    return _loaded_router_name(disk_name)
+
+
 def _rebuild_inv_freq(rotary_mod, cfg, layer_type: str | None = None) -> torch.Tensor:
     """Recompute a RoPE module inv_freq buffer from the model config.
 
@@ -1216,7 +1237,6 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
 
     # Router bookkeeping: suffix (from the detected config) and the dict of
     # trainable gate params, returned so _run_training can optimize them.
-    from usaf.model_factory import _loaded_router_name
 
     router_suffix = moe_cfg.router_path
     router_params: dict[str, nn.Parameter] = {}
@@ -1262,7 +1282,7 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
             "is what would unlock bf16, and it is a real change, not a flag."
         )
     for disk_name in sorted(wf.keys()):
-        name = _loaded_router_name(disk_name)
+        name = _resolve_module_name(disk_name, mp)
         if any(name.startswith(m + ".") for m in _expert_modules):
             continue
         if name not in mp:
