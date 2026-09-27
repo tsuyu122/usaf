@@ -1382,6 +1382,12 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     # built. Layers 0..DETACH_AT are frozen by construction (only layers above
     # DETACH_AT are trainable), so their output for a given sample does not
     # change during a run and can be computed once and reused.
+    #
+    # Declared here rather than inside the block: the release that follows the
+    # importance pass reads it, and with the frozen cache disabled it would not
+    # exist - which is how a run with --no-frozen-cache died with
+    # UnboundLocalError after the importance pass instead of training.
+    _cache_layers: list[int] = []
     if config.use_frozen_cache:
         if DETACH_AT >= 0:
             from usaf.frozen_cache import build_frozen_cache
@@ -1439,10 +1445,16 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             # held - so holding both is how the second one gets skipped.
             if _cache_layers:
                 cache.free_frozen(DETACH_AT)
-                cache._resident.clear()
-                cache._resident_active = False
+                # _resident is deliberately NOT cleared here. The importance
+                # pass runs after this block and replays every layer by calling
+                # the module directly, which relies on the pre-hook having
+                # populated its expert weights. With the resident set dropped
+                # the weights are gone, the module has no gate_up_proj, and the
+                # run dies with AttributeError after spending an hour building
+                # the cache. The set is released once the importance pass is
+                # done, which is the first point where nothing reads it again.
                 cache._prefetch_disabled = False
-                print("  resident do cache liberada apos o build", flush=True)
+                print("  resident mantida ate o importance pass", flush=True)
         else:
             print("  Frozen cache skipped: no layer is frozen (train-from is 0)")
 
@@ -1594,6 +1606,14 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         # by the OOM killer at the step-50 reselect with 20.1 GB already used and
         # this 9.66 GB sitting unused beside it.
         imp_store.zero_()
+        # The frozen cache's resident set was kept alive through the importance
+        # pass for the reason in the build block. Nothing reads it after this:
+        # the trainable layers have their own resident set, and holding two of
+        # them is what makes the second one get skipped for want of memory.
+        if _cache_layers:
+            cache._resident.clear()
+            cache._resident_active = False
+            print("  resident do cache liberada apos o importance pass", flush=True)
         # A run that selects nothing is a run that trains no experts, and every
         # other signal in it says otherwise: the architecture prints, the
         # quantiser writes the tensors, the loss falls, the kernel reports
