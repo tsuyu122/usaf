@@ -691,6 +691,48 @@ def _apply_resume_overlays(resume_ckpt: dict, cache) -> dict[str, torch.Tensor]:
         cache.overlays[fname] = (active_idx[fname].reshape(-1).to(torch.long), p)
     return active_idx
 
+def _install_expert_hooks(model, expert_modules: set[str], cache) -> int:
+    """Put the fill-and-empty hooks on the expert modules, and return how many.
+
+    This is its own function because installing the hooks and finding the expert
+    modules are the same question asked twice, and asking it two different ways is
+    exactly the bug: the importance capture unwrapped the model and found all 24,
+    while the installation enumerated the wrapper, matched nothing, and installed
+    nothing. The expert parameters were then cleared and never refilled, the hooks
+    meant to refill them did not exist, and the first backward died on a tensor
+    still sitting on the meta device it had been built with.
+
+    Nothing about that is visible until the backward, and the loss curve before it
+    looks like a run that is working.
+
+    The count is returned so a caller can say so, and so a test can check the
+    installation rather than the lookup that feeds it - a test on the lookup alone
+    passes with the installation broken, which is the other half of the same trap.
+    """
+    found = _expert_modules_by_name(model, expert_modules)
+    for mname, mod in found.items():
+        mod._parameters.clear()
+        if hasattr(mod, "_buffers"):
+            mod._buffers.clear()
+
+        def make_pre(name):
+            def pre(module, args):
+                weights = cache.get_expert_weights(name)
+                for pn, param in weights.items():
+                    module._parameters[pn] = param
+            return pre
+
+        def make_post():
+            def post(module, args, output):
+                module._parameters.clear()
+                return output
+            return post
+
+        mod.register_forward_pre_hook(make_pre(mname))
+        mod.register_forward_hook(make_post())
+
+    return len(found)
+
 def _expert_modules_by_name(model, expert_modules):
     """Map expert module name to module, looking through a DataParallel wrapper.
 
@@ -1351,28 +1393,7 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
     cache = QuantizedExpertCache(q_dict, device, max_cached=1, group_size=128,
                                 expert_prefix=moe_cfg.expert_prefix)
 
-    for mname, mod in model.named_modules():
-        if mname not in _expert_modules:
-            continue
-        mod._parameters.clear()
-        if hasattr(mod, '_buffers'):
-            mod._buffers.clear()
-
-        def make_pre(name):
-            def pre(module, args):
-                weights = cache.get_expert_weights(name)
-                for pn, param in weights.items():
-                    module._parameters[pn] = param
-            return pre
-
-        def make_post():
-            def post(module, args, output):
-                module._parameters.clear()
-                return output
-            return post
-
-        mod.register_forward_pre_hook(make_pre(mname))
-        mod.register_forward_hook(make_post())
+    _install_expert_hooks(model, _expert_modules, cache)
 
     return model, cache, q_dict, wf, st_path, router_params, cfg
 
