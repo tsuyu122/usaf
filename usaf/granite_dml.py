@@ -13,55 +13,136 @@ dimension, and num_experts. Granite was renamed onto the fused layout rather
 than onto a different one, which is why this is a class swap and not a
 translation.
 
-Only the expert container is replaced. The router is untouched, because USAF
-trains the router as an ordinary parameter rather than through this path.
+The class is found by shape rather than by name. It is a module attribute in
+some transformers releases and absent in others, where the experts live under
+a different module path - and pinning a name turns a version difference into a
+run that dies in the first thirty seconds, before it has said what it found.
+Nothing here raises: a release whose layout is one this does not recognise gets
+a line in the log, and the importance pass two minutes later is the check that
+actually matters - it is the one that reports Active: 0/0 in plain words.
+
+The router is left alone, because USAF trains the router as an ordinary
+parameter rather than through this path.
 """
+
+import inspect
 
 import torch
 
-_ORIGINAL = None
+_PATCHED: dict[str, object] = {}
+_PATCHED_VALUES: set[int] = set()
+
+_CANDIDATE_MODULES = (
+    "transformers.models.granitemoe.modeling_granitemoe",
+    "transformers.models.granitemoe.modeling_granite_moe",
+    "transformers.models.granitemoe",
+)
 
 
-def patch_granite_for_dml() -> bool:
-    """Install the sparse expert forward on GraniteMoeExperts.
-
-    Returns whether anything was patched, so a transformers version without
-    the class is a no-op rather than an ImportError at the top of a run.
-    """
-    global _ORIGINAL
-    try:
-        from transformers.models.granitemoe import modeling_granitemoe as G
-    except ImportError:
+def _looks_like_experts(cls) -> bool:
+    """An expert container: a module whose __init__ binds the fused names."""
+    if not isinstance(cls, type) or not issubclass(cls, torch.nn.Module):
         return False
+    try:
+        src = inspect.getsource(cls.__init__)
+    except (OSError, TypeError):
+        return False
+    return "gate_up_proj" in src and "down_proj" in src
 
-    if getattr(G.GraniteMoeExperts.forward, "_usaf_sparse", False):
-        return True
 
+def _candidate_modules():
+    """Every module GraniteMoe could have put its expert container in.
+
+    The three pinned paths come first because they are where it has been, and
+    the package walk after them so that a release which moved the class still
+    finds it. Guessing a path is how the previous version of this file turned a
+    transformers version difference into a crash thirty seconds into every run.
+    """
+    for name in _CANDIDATE_MODULES:
+        try:
+            yield __import__(name, fromlist=["*"])
+        except ImportError:
+            continue
+    try:
+        import pkgutil
+
+        import transformers.models.granitemoe as pkg
+    except ImportError:
+        return
+    for info in pkgutil.iter_modules(pkg.__path__):
+        try:
+            yield __import__(f"{pkg.__name__}.{info.name}", fromlist=["*"])
+        except ImportError:
+            continue
+
+
+def cls_already_patched(cls) -> bool:
+    """This exact class was patched already, under whatever name it was found by."""
+    return cls in _PATCHED_VALUES
+
+
+def _find_expert_classes():
+    """Every expert container GraniteMoe has, found by what it holds.
+
+    More than one is possible across releases - some keep a separate class, some
+    inline the experts into the block - and patching only the first would leave
+    a second container running dense without saying so.
+    """
+    found = []
+    seen = set()
+    for mod in _candidate_modules():
+        for attr, obj in vars(mod).items():
+            if not _looks_like_experts(obj):
+                continue
+            if not obj.__module__.startswith("transformers.models.granitemoe"):
+                continue
+            if id(obj) in seen or id(obj) in _PATCHED_VALUES:
+                continue
+            seen.add(id(obj))
+            found.append((attr, obj))
+    return found
+
+
+def patch_granite_for_dml() -> list[str]:
+    """Install the sparse expert forward. Returns the class names it patched."""
     from usaf.qwen3moe_dml import dml_qwen3_experts_forward
 
-    _ORIGINAL = G.GraniteMoeExperts.forward
+    patched = []
+    for attr, cls in _find_expert_classes():
+        if getattr(cls.forward, "_usaf_sparse", False):
+            patched.append(attr)
+            continue
+        original = cls.forward
 
-    def sparse_forward(
-        self,
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        return dml_qwen3_experts_forward(
-            self, hidden_states, top_k_index, top_k_weights)
+        def sparse_forward(
+            self,
+            hidden_states: torch.Tensor,
+            top_k_index: torch.Tensor,
+            top_k_weights: torch.Tensor,
+        ) -> torch.Tensor:
+            return dml_qwen3_experts_forward(
+                self, hidden_states, top_k_index, top_k_weights)
 
-    sparse_forward._usaf_sparse = True
-    G.GraniteMoeExperts.forward = sparse_forward
-    return True
+        sparse_forward._usaf_sparse = True
+        _PATCHED[attr] = original
+        _PATCHED_VALUES.add(id(cls))
+        cls.forward = sparse_forward
+        patched.append(attr)
+
+    if patched:
+        print(f"  granite experts routed sparse: {patched}", flush=True)
+    else:
+        print("  granite experts: no container found, nothing patched", flush=True)
+    return patched
 
 
 def unpatch_granite_for_dml() -> None:
-    """Put the original GraniteMoeExperts forward back."""
-    global _ORIGINAL
-    if _ORIGINAL is None:
-        return
-    from transformers.models.granitemoe import modeling_granitemoe as G
-
-    G.GraniteMoeExperts.forward = _ORIGINAL
-
-_ORIGINAL = None
+    """Put the original forwards back."""
+    for attr, original in list(_PATCHED.items()):
+        for mod in _candidate_modules():
+            cls = getattr(mod, attr, None)
+            if cls is not None and getattr(cls.forward, "_usaf_sparse", False):
+                cls.forward = original
+                break
+    _PATCHED.clear()
+    _PATCHED_VALUES.clear()
