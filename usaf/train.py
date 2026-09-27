@@ -1249,6 +1249,20 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
             from transformers.models.qwen3_moe import Qwen3MoeForCausalLM
             model = Qwen3MoeForCausalLM(cfg)
 
+    # The checkpoint says which key a tensor was saved under; the model says
+    # which module holds it, and those are not the same question. Resolving the
+    # prefix here is what keeps a release that inlines the experts from being
+    # read as one that has no expert modules at all.
+    from usaf.model_factory import resolve_expert_prefix
+
+    before_prefix = moe_cfg.expert_prefix
+    moe_cfg = resolve_expert_prefix(model, moe_cfg)
+    if moe_cfg.expert_prefix != before_prefix:
+        print(f"Expert prefix: {before_prefix} -> {moe_cfg.expert_prefix} "
+              f"(this release keeps them there)")
+    else:
+        print(f"Expert prefix: {moe_cfg.expert_prefix} confirmed on the model")
+
     # Router bookkeeping: suffix (from the detected config) and the dict of
     # trainable gate params, returned so _run_training can optimize them.
 

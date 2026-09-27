@@ -258,3 +258,101 @@ def test_an_untouched_weight_keeps_its_own_name():
     ):
         assert _resolve_module_name(name, {name: 0}) == name
         assert _resolve_module_name(name, {}) == name
+import pytest
+import torch
+import torch.nn as nn
+
+from usaf.model_factory import MoEConfig, resolve_expert_prefix
+
+N_LAYERS, N_EXP, INTER, HID = 3, 4, 8, 6
+PREFIX = "model.layers.{i}.block_sparse_moe"
+WITH_CONTAINER = PREFIX + ".experts"
+
+
+def _cfg(prefix):
+    return MoEConfig(
+        model_path="x",
+        num_layers=N_LAYERS,
+        num_experts=N_EXP,
+        expert_prefix=prefix,
+        expert_param_names=["gate_up_proj", "down_proj"],
+        router_path=".block_sparse_moe.router.weight",
+    )
+
+
+def _block(with_container):
+    """A layer block, in the two shapes releases disagree about.
+
+    with_container=True  -> the experts live in a .experts submodule
+    with_container=False -> they sit straight in the block
+    """
+    b = nn.Module()
+    b.gate_up_proj = nn.Parameter(torch.zeros(N_EXP, 2 * INTER, HID))
+    b.down_proj = nn.Parameter(torch.zeros(N_EXP, HID, INTER))
+    b.router = nn.Module()
+    b.router.weight = nn.Parameter(torch.zeros(N_EXP, HID))
+    if with_container:
+        holder = nn.Module()
+        holder.gate_up_proj = b.gate_up_proj
+        holder.down_proj = b.down_proj
+        b.experts = holder
+        del b.gate_up_proj
+        del b.down_proj
+    return b
+
+
+class _Model(nn.Module):
+    def __init__(self, with_container):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList(
+            [nn.Module() for _ in range(N_LAYERS)])
+        for layer in self.model.layers:
+            layer.block_sparse_moe = _block(with_container)
+
+
+def test_a_release_that_keeps_the_container_keeps_the_prefix():
+    cfg = _cfg(WITH_CONTAINER)
+    resolve_expert_prefix(_Model(with_container=True), cfg)
+    assert cfg.expert_prefix == WITH_CONTAINER
+
+
+def test_a_release_that_inlines_them_resolves_to_the_block():
+    # The checkpoint answers block_sparse_moe for both releases - the key is the
+    # same in both - and the loaded module is the only thing that knows. Reading
+    # the file picks one of the two shapes and the other finds no expert modules
+    # at all, which is a run with no hooks and a loss that falls on the dense
+    # weights alone.
+    cfg = _cfg(WITH_CONTAINER)
+    resolve_expert_prefix(_Model(with_container=False), cfg)
+    assert cfg.expert_prefix == PREFIX
+
+
+def test_the_prefix_read_off_the_file_is_corrected_wherever_it_was_wrong():
+    # The detector may guess either way depending on the file it read, and the
+    # model settles it. Both guesses have to survive being wrong.
+    cfg = _cfg(PREFIX)
+    resolve_expert_prefix(_Model(with_container=True), cfg)
+    assert cfg.expert_prefix == WITH_CONTAINER
+
+
+def test_a_prefix_that_matches_nothing_names_the_tensors_it_found():
+    # "no expert modules found" without the list of what is there is a guess,
+    # and the guess was wrong four times in a row before this message existed.
+    class Empty(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList(
+                [nn.Module() for _ in range(N_LAYERS)])
+            for layer in self.model.layers:
+                layer.block_sparse_moe = nn.Module()
+                layer.block_sparse_moe.router = nn.Module()
+                layer.block_sparse_moe.router.weight = nn.Parameter(
+                    torch.zeros(N_EXP, HID))
+
+    with pytest.raises(SystemExit) as exc:
+        resolve_expert_prefix(Empty(), _cfg(WITH_CONTAINER))
+    text = str(exc.value)
+    assert "router.weight" in text
+    assert WITH_CONTAINER in text

@@ -431,3 +431,58 @@ def get_param_patterns(config: MoEConfig) -> dict[str, list[str]]:
 def get_router_path(config: MoEConfig, layer_idx: int) -> str:
     """Get the router (gate) parameter path for a given layer."""
     return f"model.layers.{layer_idx}{config.router_path}"
+
+
+def resolve_expert_prefix(model, cfg: MoEConfig) -> MoEConfig:
+    """Point the expert prefix at the container this model actually has.
+
+    The prefix is read off the checkpoint, which cannot answer this. A checkpoint
+    names a tensor by the key it was saved under; the module that holds it may sit
+    under a different path entirely, and whether there is a container at all is a
+    property of the transformers release, not of the file.
+
+    GraniteMoe is exactly that case. The file has input_linear and output_linear
+    under block_sparse_moe, and the loaded module either wraps them in a
+    block_sparse_moe.experts container or inlines them straight into
+    block_sparse_moe, depending on the release. Reading the file answers
+    block_sparse_moe for both, and picking one form means the other finds no
+    expert modules at all: no hooks, no sparse gradient, a loss that falls on the
+    dense parameters alone, and a run that reports progress throughout.
+
+    So the candidates are tried against the model and the one that resolves to
+    real parameters wins. Asking the model is the only source that knows, and the
+    same question has now been answered wrongly four times by reading the file
+    instead.
+    """
+    def names_of(prefix: str) -> set[str]:
+        out = set()
+        for li in range(cfg.num_layers):
+            p = prefix.format(i=li)
+            for pn in cfg.expert_param_names:
+                out.add(p + "." + pn)
+        return out
+
+    params = set(dict(model.named_parameters()))
+
+    base = cfg.expert_prefix
+    candidates = [base]
+    if base.endswith(".experts"):
+        candidates.append(base[: -len(".experts")])
+    else:
+        candidates.append(base + ".experts")
+
+    for cand in candidates:
+        wanted = names_of(cand)
+        if wanted and wanted <= params:
+            if cand != base:
+                cfg.expert_prefix = cand
+            return cfg
+
+    sample = sorted(
+        n for n in params
+        if n.startswith("model.layers.0."))[:24]
+    raise SystemExit(
+        f"the expert prefix {cfg.expert_prefix} resolves to no parameters on "
+        f"this model.\n  tried: {candidates}"
+        f"\n  layer 0 parameters: {sample}"
+    )
