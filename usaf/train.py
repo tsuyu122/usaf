@@ -692,6 +692,34 @@ def _apply_resume_overlays(resume_ckpt: dict, cache) -> dict[str, torch.Tensor]:
         cache.overlays[fname] = (active_idx[fname].reshape(-1).to(torch.long), p)
     return active_idx
 
+def _weights_to_load(wf: dict, mp, expert_tensor_names: set[str]) -> dict:
+    """Which file keys to load, and under which module name.
+
+    Returns disk name -> module name for everything that is not an expert
+    weight and exists on the model.
+
+    The exclusion is by exact name, and the shape of this function is the reason.
+    It used to be "is this name under one of the expert modules", which is right
+    when the experts are a module of their own and wrong when they are not: a
+    release that inlines them into block_sparse_moe puts the router in the same
+    place. The router was then skipped along with the experts, never loaded, left
+    on the meta device it had been built with, and the first backward died on it -
+    after a line reporting 146 of 170 parameters loaded, which is 24 short, which
+    is one router per layer, which nothing said out loud.
+
+    Both the count and what the models actually are are decided here, so a test
+    can ask this function rather than re-deciding what it does.
+    """
+    out = {}
+    for disk_name in wf:
+        name = _resolve_module_name(disk_name, mp)
+        if name in expert_tensor_names:
+            continue
+        if name not in mp:
+            continue
+        out[disk_name] = name
+    return out
+
 def _install_expert_hooks(model, expert_modules: set[str], cache) -> int:
     """Put the fill-and-empty hooks on the expert modules, and return how many.
 
@@ -1344,6 +1372,18 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
                 wf[key] = os.path.basename(fn)
 
     _expert_modules = _expert_module_names(moe_cfg)
+    # The expert TENSORS, as names. The skip used to be "is this name under one
+    # of the expert modules", which is right when the experts are a module of
+    # their own and wrong when they are not: a release that inlines them into
+    # block_sparse_moe puts the router in the same place, so the router was
+    # skipped along with the experts, stayed on the meta device, and the backward
+    # died on it. The expert tensors are named exactly; nothing else under the
+    # module is one.
+    _expert_tensor_names = {
+        f"{moe_cfg.expert_prefix.format(i=li)}.{pn}"
+        for li in range(moe_cfg.num_layers)
+        for pn in moe_cfg.expert_param_names
+    }
     mp = dict(model.named_parameters())
     n_loaded = 0
     # Every non-expert weight used to be cast with .half(), whatever the model
@@ -1369,12 +1409,9 @@ def _load_model(config: TrainConfig, moe_cfg, device: torch.device,
             "  Use --dtype fp16 (or auto). Making the expert path precision-parametric "
             "is what would unlock bf16, and it is a real change, not a flag."
         )
-    for disk_name in sorted(wf.keys()):
-        name = _resolve_module_name(disk_name, mp)
-        if any(name.startswith(m + ".") for m in _expert_modules):
-            continue
-        if name not in mp:
-            continue
+    _to_load = _weights_to_load(wf, mp, _expert_tensor_names)
+    for disk_name in sorted(_to_load):
+        name = _to_load[disk_name]
         with safe_open(os.path.join(st_path, wf[disk_name]), framework="pt") as sf:
             tensor = sf.get_tensor(disk_name).to(run_dtype)
         parts = name.split(".")
@@ -1421,6 +1458,18 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
 
     N_LAYERS = moe_cfg.num_layers
     _expert_modules = _expert_module_names(moe_cfg)
+    # The expert TENSORS, as names. The skip used to be "is this name under one
+    # of the expert modules", which is right when the experts are a module of
+    # their own and wrong when they are not: a release that inlines them into
+    # block_sparse_moe puts the router in the same place, so the router was
+    # skipped along with the experts, stayed on the meta device, and the backward
+    # died on it. The expert tensors are named exactly; nothing else under the
+    # module is one.
+    _expert_tensor_names = {
+        f"{moe_cfg.expert_prefix.format(i=li)}.{pn}"
+        for li in range(moe_cfg.num_layers)
+        for pn in moe_cfg.expert_param_names
+    }
     DETACH_AT = min(train_layers) - 1
     MICROBATCH = config.microbatch
     ACCUM = config.accum
