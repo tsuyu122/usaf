@@ -45,6 +45,21 @@ def issubclass_safe(obj) -> bool:
     return isinstance(obj, type) and issubclass(obj, torch.nn.Module)
 
 
+def _signature_of(cls) -> str:
+    """The forward signature, or why there is not one.
+
+    Printed with every candidate, because "no container found" plus a list of
+    names says the class was not recognised and not what shape it is, and the
+    difference between those is the whole fix.
+    """
+    if not hasattr(cls, "forward"):
+        return " (not a module with a forward)"
+    try:
+        return str(inspect.signature(cls.forward))
+    except (TypeError, ValueError) as e:
+        return f" (no signature: {type(e).__name__})"
+
+
 def _looks_like_experts(cls) -> bool:
     """An expert container: a module that owns the stacked expert weights.
 
@@ -73,12 +88,15 @@ def _looks_like_experts(cls) -> bool:
     except (TypeError, ValueError):
         return False
 
-    positional = [
+    # Only the REQUIRED ones, so a release that adds an optional argument of its
+    # own is still recognised - which is what refusing it on the previous
+    # release did. Counting all of them made an extra keyword break the match.
+    required = [
         p for p in sig.parameters.values()
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        if p.default is p.empty
+        and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
     ]
-    return (len(positional) >= 4
-            and not any(p.default is not p.empty for p in positional))
+    return len(required) >= 4
 
 def _candidate_modules():
     """Every module GraniteMoe could have put its expert container in.
@@ -130,7 +148,7 @@ def _find_expert_classes():
             # "no container found" and each time a different class was in there
             # that the check did not recognise; a list of what it saw is what turns
             # the next run into a fix instead of another guess.
-            _SEEN.add(attr)
+            _SEEN.add((attr, _signature_of(obj)))
             if not _looks_like_experts(obj):
                 continue
             if id(obj) in seen or id(obj) in _PATCHED_VALUES:
@@ -173,8 +191,8 @@ def patch_granite_for_dml() -> list[str]:
         # What it looked at, not only what it wanted. Every run that said
         # this had a class in the package the check did not recognise, and the
         # name of that class is the whole answer - which is why it is printed.
-        for attr in sorted(_SEEN):
-            print(f"    saw {attr}", flush=True)
+        for attr, sig in sorted(_SEEN):
+            print(f"    saw {attr}{sig}", flush=True)
         if not _SEEN:
             print("    no classes from transformers.models.granitemoe at all",
                   flush=True)

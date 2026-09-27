@@ -171,3 +171,44 @@ def test_a_class_with_three_positional_parameters_is_not_a_container():
     assert not _looks_like_experts(_DecoderLayer)
     assert _looks_like_experts(Container)
     assert _looks_like_experts(FusedContainer)
+
+class _OptionalExtra(nn.Module):
+    """A container that grew an argument between releases."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate_up_proj = nn.Parameter(torch.zeros(4, 16, 6))
+        self.down_proj = nn.Parameter(torch.zeros(4, 6, 8))
+
+    def forward(self, hidden_states, top_k_index, top_k_weights,
+                expert_mask=None):
+        return hidden_states
+
+
+class _Attention(nn.Module):
+    """Takes the hidden states and a second thing it does not have to have."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate_up_proj = nn.Parameter(torch.zeros(4, 16, 6))
+        self.down_proj = nn.Parameter(torch.zeros(4, 6, 8))
+
+    def forward(self, hidden_states, position_embeddings=None,
+                attention_mask=None, past_key_values=None, **kwargs):
+        return hidden_states
+
+
+def test_a_container_that_grew_an_argument_is_still_a_container():
+    # Counting every positional parameter made an added keyword break the match,
+    # and the container was then refused on a release where it works - the mirror
+    # image of the run before it, where a name that had changed broke it. Only the
+    # required ones are counted now.
+    assert _looks_like_experts(_OptionalExtra)
+
+
+def test_a_class_whose_only_other_arguments_are_optional_is_not_a_container():
+    # The attention is the one that has several: hidden states, positions, mask,
+    # cache, kwargs. Only the first is required, and self does not make three.
+    assert not _looks_like_experts(_Attention)
+    assert not _looks_like_experts(_DecoderLayer)
+    assert not _looks_like_experts(_Rotary)
