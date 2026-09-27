@@ -40,26 +40,47 @@ _CANDIDATE_MODULES = (
 
 
 def _looks_like_experts(cls) -> bool:
-    """An expert container: a module whose __init__ binds the fused names."""
+    """An expert container: a module that owns the stacked expert weights.
+
+    Two checks, because either alone matches the wrong thing. The names in
+    __init__ decide which release it is - one builds the container with the
+    fused names, another with input_linear and output_linear - and the block
+    that holds the container mentions both of either pair. The forward
+    signature is what tells them apart, and it is the honest check: the
+    container takes the hidden states plus the routing the router just
+    produced, the block takes the hidden states alone.
+
+    Matching on the names alone patched the block. The block's forward - the
+    one that runs the router - was replaced with a three-argument expert
+    forward, and the run died on a TypeError one line later, after printing
+    that the experts had been routed sparse. Checking for nn.Parameter in
+    __init__ is closer but still a guess about how the next release spells
+    the construction; the signature is the class telling us what it does.
+    """
     if not isinstance(cls, type) or not issubclass(cls, torch.nn.Module):
         return False
     try:
         src = inspect.getsource(cls.__init__)
-    except (OSError, TypeError):
+        params = inspect.signature(cls.forward).parameters
+    except (OSError, TypeError, ValueError):
         return False
-    # Both spellings, because the release decides. One builds the container with
-    # the fused names, another builds it from input_linear and output_linear and
-    # the loaded names are the converted ones. The detector looked only for the
-    # first, so on the second release it found no container, patched nothing, and
-    # said so - and the run then trained dense while nothing in the loss curve
-    # said which of the two it was doing.
-    #
-    # The answer is still a lookup on the class, so it either finds a container
-    # that is one or it finds none, and a class binding neither pair is not one.
+
     pairs = (("gate_up_proj", "down_proj"),
              ("input_linear", "output_linear"),)
-    return any(a in src and b in src for a, b in pairs)
+    if not any(a in src and b in src for a, b in pairs):
+        return False
 
+    # self, the hidden states, and the routing: at least three, and none of
+    # them keyword-only or defaulted, which is how a block can be told apart
+    # from a container that happens to mention the same names.
+    positional = [
+        p for p in params.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    return (
+        len(positional) >= 3
+        and not any(p.default is not p.empty for p in positional)
+    )
 
 def _candidate_modules():
     """Every module GraniteMoe could have put its expert container in.
