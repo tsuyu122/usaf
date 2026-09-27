@@ -124,6 +124,12 @@ def build_parser():
                    help="Save checkpoint every N steps (0=no mid-training saves)")
     p.add_argument("--export", type=str, default="",
                    help="Export merged weights path (e.g. experts_finetuned_q4.pt)")
+    p.add_argument("--export-hf", type=str, default="",
+                   help="Write a plain HuggingFace model directory here, for "
+                        "running the result outside this project. The experts "
+                        "come back to fp16 and the trained routers replace "
+                        "the originals; --export writes the 4-bit payload "
+                        "instead, which resumes but is not a model.")
 
     p.add_argument("--eval-only", action="store_true",
                    help="Skip training, only evaluate model/checkpoint")
@@ -177,6 +183,7 @@ class TrainConfig:
     resume_path: str = ""
     save_every: int = 50
     export_path: str = ""
+    export_hf_path: str = ""
     eval_only: bool = False
     eval_datasets: str = "synthetic-cpp"
     eval_samples: int = 64
@@ -225,6 +232,7 @@ def parse_args(args=None) -> TrainConfig:
         resume_path=ns.resume,
         save_every=ns.save_every,
         export_path=ns.export,
+        export_hf_path=ns.export_hf,
         eval_only=ns.eval_only,
         eval_datasets=ns.eval_datasets,
         eval_samples=ns.eval_samples,
@@ -2024,6 +2032,44 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             )
             print(f"  >>> checkpoint saved: {ckpt_path}", flush=True)
 
+    # A run that is asked to produce a model has to leave behind the thing the
+    # model is built from. --save-every 0 means "not every N steps", and it also
+    # used to mean "never", so a long job with fewer writes finished training and
+    # left nothing to export from or resume.
+    if config.export_path or config.save_every == 0:
+        final = os.path.join(config.checkpoint_dir, "sparse_final.pt")
+        save_sparse_checkpoint(
+            final, masters, active_idx, opt.state_dict(),
+            {"model": config.model_path, "steps": STEPS, "frac": FRAC,
+             "lr": LR_PEAK, "seq_len": SEQ, "microbatch": MICROBATCH,
+             "accum": ACCUM, "train_from": config.train_from,
+             "reselect_every": RESELECT_EVERY, "save_every": config.save_every,
+             "tag": config.tag},
+            step, losses, list(train_layers), metric=step_loss,
+            routers=router_params,
+        )
+        print(f"  >>> final checkpoint saved: {final}", flush=True)
+
+        if config.export_hf_path:
+            # A plain model directory, for anyone who wants to run the result
+            # somewhere that is not this project. The 4-bit export above is for
+            # resuming and for a 4-bit runtime; it is not a model, and handing it
+            # to something that expects weights gets a file that describes
+            # numbers rather than a model that answers.
+            from usaf.export_hf import export_hf_model
+
+            try:
+                export_hf_model(
+                    config.model_path, config.quant_path, final,
+                    config.export_hf_path,
+                )
+                print(f"  >>> HF model written: {config.export_hf_path}",
+                      flush=True)
+            except Exception as e:
+                raise SystemExit(
+                    f"--export-hf was requested but the export failed: "
+                    f"{type(e).__name__}: {e}"
+                ) from e
 
     # A loss curve is evidence that something moved, not that anyone can tell.
     # The question a person actually has after a fine-tune is what the model now
