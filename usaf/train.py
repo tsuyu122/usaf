@@ -1150,6 +1150,48 @@ class _DecoderAdapter:
         return out
 
 
+def embedding_scale(cfg) -> float:
+    """What the model multiplies its embedding by, before the first layer.
+
+    GraniteMoe does this between the embedding and the first layer, not inside
+    the Embedding, so a replay of the stack that calls the embedding directly
+    hands every layer an input of the right shape and the wrong size. For this
+    checkpoint it is 12.0, and the run that left it out reported an opening
+    loss of 55.4 on a model whose real loss on the same rows is 2.46.
+
+    A missing multiplier is 1.0, which is every stack this repository has run
+    until now, and it has to be a real answer rather than an exception: the fix
+    cannot be allowed to break the models it is not for.
+
+    Zero counts as missing. A scale of zero would zero the embedding and leave
+    a model that predicts one token forever, and no config means that.
+    """
+    mult = getattr(cfg, "embedding_multiplier", None)
+    if mult is None:
+        return 1.0
+    try:
+        v = float(mult)
+    except (TypeError, ValueError):
+        return 1.0
+    return v if v > 0.0 else 1.0
+
+def scaled_embedding(embed, cfg):
+    """embed(input_ids) as the model computes it, multiplier included.
+
+    This is what the training replay calls instead of the embedding directly.
+    It is a named function so the wiring can be checked: a test that only
+    exercises embedding_scale passes with the call site reverted, which is how
+    a fix for this exact bug sat in a branch and changed nothing.
+    """
+    mult = embedding_scale(cfg)
+    if mult == 1.0:
+        return embed
+
+    def _scaled(input_ids):
+        return embed(input_ids) * mult
+
+    return _scaled
+
 def _layer_is_trainable(param_name: str, train_layers: set[int]) -> bool:
     """Return True if param_name belongs to one of the trainable layers.
 
@@ -1540,8 +1582,23 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
         LOG_PATH = os.path.join(config.log_dir, f"train_{_tag}.jsonl")
         print(f"  Log: {LOG_PATH}")
 
+    # GraniteMoe multiplies its embedding by config.embedding_multiplier - 12.0
+    # for this checkpoint - before the first layer, and the model does it inside
+    # embed_tokens.forward-equivalent, not inside the Embedding. Replaying the stack
+    # by hand without it trains a different function: the input arrives 12x too
+    # small, which put the opening loss at 55 on a model whose real loss on the
+    # same data is 2.46, and the run converged to 0.0007 by fitting the wrong
+    # function. The exported weights then went onto the real model and answered in
+    # noise. A weight-file check cannot see this - only the forward can.
+    _mult = embedding_scale(model_cfg)
+    if _mult != 1.0:
+        print(f'  embedding_multiplier: {_mult} (HF aplica antes da camada 0)')
+    embedded = scaled_embedding(embed, model_cfg)
+    _base_embed = embed
+
+
     def _prelude(input_ids):
-        hidden = embed(input_ids)
+        hidden = embedded(input_ids)
         s_len = hidden.shape[1]
         pos_ids = torch.arange(s_len, device=device).unsqueeze(0)
         # The rotary is built by the adapter, not here. A stack with one RoPE per
