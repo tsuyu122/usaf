@@ -90,3 +90,32 @@ def test_the_benign_prompts_cover_both_languages():
     n_en = sum(1 for p in BENIGN_PROMPTS if any(w in p.lower() for w in en))
     assert n_pt >= 8, 'the model is used in Portuguese and most of these are not'
     assert n_en >= 8, 'the harmful half of both datasets is English'
+from usaf.refusal_data import first_turn  # noqa: E402
+
+
+def test_a_runaway_generation_ends_at_its_own_answer():
+    # Every one of the twenty-five base generations ran to the token cap this
+    # way, most of them writing the next turn themselves. Trained on that, the
+    # model holds both sides of the conversation - and a refusal count cannot
+    # see it, because the refusal is still at the front.
+    said = ('A capital do Brasil e Brasilia.' + chr(10) * 2
+            + 'User: E a do Mexico?' + chr(10) * 2
+            + 'Assistant: A Cidade do Mexico.')
+    assert first_turn(said) == 'A capital do Brasil e Brasilia.'
+
+
+def test_an_answer_with_no_runaway_is_returned_whole():
+    said = 'O Ceu e azul porque a luz azul espalha mais no ar.'
+    assert first_turn(said) == said
+
+
+def test_the_target_itself_is_truncated():
+    # Cutting the row but not the target would leave the fabricated turn in the
+    # trained span, which is the whole problem.
+    said = ('Sim.' + chr(10) * 2 + 'User: E amanha?' + chr(10) * 2
+            + 'Assistant: Nao sei.' + chr(10) * 2 + 'User: De novo?')
+    rows = build_benign_rows(['teste'], 128, Tok(), lambda p: said)
+    assert len(rows) == 1
+    t = _trained(rows[0])
+    assert t == _ids('Sim.'), t
+    assert len(t) < len(_ids(said)), 'the fabricated turn is still trained'

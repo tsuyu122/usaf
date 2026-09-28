@@ -134,6 +134,33 @@ BENIGN_PROMPTS = [
 ]
 
 
+
+TURN_MARKERS = (chr(10) * 2 + 'User:', chr(10) * 2 + 'System:',
+                chr(10) * 2 + 'Assistant:', chr(10) + 'User:',
+                chr(10) + 'System:')
+
+
+def first_turn(text):
+    """The model's own answer, cut where its answer ends.
+
+    Generate with a prompt in this format and the model does not stop at the end
+    of its reply - it writes the next turn itself, inventing a user question and
+    then answering it. Measured on the twenty-five prompts here: every single
+    generation runs to the token cap this way, and six of the eight inspected
+    contain a fabricated "User:" line.
+
+    Trained on that, the model is being taught to hold both sides of a
+    conversation, which is a worse failure than the one this mix exists to fix,
+    and it is invisible in a refusal count because the refusal is still there at
+    the front. So the target ends where the answer ends, whatever the model chose
+    to write after it.
+    """
+    cut = len(text)
+    for m in TURN_MARKERS:
+        i = text.find(m)
+        if i != -1 and i < cut:
+            cut = i
+    return text[:cut].strip()
 def build_benign_rows(prompts, seq, tok, answer_for, prefix=SYSTEM):
     """One row per benign prompt, the target being the model's own answer.
 
@@ -147,7 +174,7 @@ def build_benign_rows(prompts, seq, tok, answer_for, prefix=SYSTEM):
     """
     rows = []
     for p in prompts:
-        a = (answer_for(p) or '').strip()
+        a = first_turn(answer_for(p) or '')
         if not a:
             continue
         head = prefix + '\n\nUser: ' + p + '\n\nAssistant:'
