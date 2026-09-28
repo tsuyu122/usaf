@@ -1192,6 +1192,20 @@ def scaled_embedding(embed, cfg):
 
     return _scaled
 
+def cache_source_key(model_path: str, cfg) -> str:
+    """What the frozen cache is keyed on, beside the samples and the layer.
+
+    The activations in that file are the output of the model's own forward up to
+    DETACH_AT, so anything that changes what the model does to an input belongs
+    in the key. The embedding multiplier is such a thing: a cache built without
+    it holds hidden states twelve times too small, and a run that reuses it is
+    training on activations no forward of this model ever produces. The
+    fingerprint decided whether a cache on disk was accepted, and it only ever
+    hashed a path - a path does not change when the arithmetic does.
+    """
+    return f"{model_path}|mult={embedding_scale(cfg)}"
+
+
 def logits_scaling(cfg) -> float:
     """What the model divides its logits by, after the output head.
 
@@ -1710,7 +1724,8 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
                 # same place the weights came from - and it does not change
                 # when the model gets wrapped.
                 _fc_train, SEQ, model_cfg.hidden_size, DETACH_AT,
-                config.model_path, _compute_hidden, _ck,
+                cache_source_key(config.model_path, model_cfg),
+                _compute_hidden, _ck,
             )
             print(f"  Frozen cache: layers 0..{DETACH_AT} for {len(_fc_train)} samples")
             # The frozen layers are no longer read by anything: the cache holds
