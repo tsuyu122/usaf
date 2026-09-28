@@ -84,6 +84,86 @@ def build_rows(prompts, seq, tok, prefix=SYSTEM):
     return rows
 
 
+# The other half of the boundary, which neither dataset carries.
+#
+# Both files are harmful prompts with no response attached, so a refusal target
+# was synthesised for all of them. That makes the training data say one thing:
+# after Assistant, say one of sixteen sentences. Granite already refuses - it
+# refuses all eight held-out harmful prompts and none of the eight benign ones -
+# and nine hundred steps of that data erased the half of the behaviour worth
+# keeping: a hundred percent of innocent prompts came back refused, and the
+# refusal itself was still followed by the model talking past its own no
+# exactly as the base does.
+#
+# A boundary is a contrast, and a dataset carrying one side of it teaches a
+# reflex. These prompts are the other side, and the target is the model's own
+# answer rather than anything written here: nothing in this list tells the
+# trainer what a good answer is, and the model already knows. That is
+# self-distillation, and its whole job is to leave what the model does on
+# ordinary questions alone while the refusal side is made uniform.
+BENIGN_PROMPTS = [
+    # Portuguese, because the model is used in Portuguese and a run that only
+    # ever saw English prompts has no reason to preserve its Portuguese.
+    'bom dia',
+    'Qual e a capital do Brasil?',
+    'Quem escreveu Dom Casmurro?',
+    'Explique o que e um algoritmo.',
+    'O que causa as mareas?',
+    'Me da uma receita de bolo de cenoura.',
+    'Escreva um poema curto sobre o mar.',
+    'Quanto e dois mais dois?',
+    'O que e machine learning e para que serve?',
+    'Me ajuda a escrever um e-mail pedindo desculpas por atrasar.',
+    'Quais sao as maiores cidades do mundo?',
+    'Traduza good morning para portugues.',
+    'Por que o ceu e azul?',
+    'Como funciona um motor a gasolina?',
+    'Escreva um resumo sobre maquinas de Turing.',
+
+    # English, for the same reason in the other direction.
+    'What is the capital of France?',
+    'Explain gravity in one paragraph.',
+    'Write a short poem about rain.',
+    'Who wrote Pride and Prejudice?',
+    'What is the difference between a list and a tuple?',
+    'Give me a simple recipe for scrambled eggs.',
+    'How does photosynthesis work?',
+    'What are the main causes of inflation?',
+    'Suggest a name for a coffee shop.',
+    'How do I change a bicycle tyre?',
+]
+
+
+def build_benign_rows(prompts, seq, tok, answer_for, prefix=SYSTEM):
+    """One row per benign prompt, the target being the model's own answer.
+
+    The shape is the one build_rows produces, so a run cannot tell a refusal row
+    from a preserved row by anything but the target: the prompt part is masked
+    the same way, and the answer is the only thing carrying a gradient.
+
+    answer_for is a callable rather than a model, so this file does not load one
+    and the test can hand it a fixed string and assert the row that comes out -
+    which is the half that cannot be checked by reading the code.
+    """
+    rows = []
+    for p in prompts:
+        a = (answer_for(p) or '').strip()
+        if not a:
+            continue
+        head = prefix + '\n\nUser: ' + p + '\n\nAssistant:'
+        u = tok(head, return_tensors=None)['input_ids']
+        t = tok(a, return_tensors=None)['input_ids']
+        if len(u) + len(t) > seq or len(t) < 2:
+            continue
+        ids = u + t
+        labels = [-100] * len(u) + t
+        pad = seq - len(ids)
+        if pad > 0:
+            ids = ids + [0] * pad
+            labels = labels + [-100] * pad
+        rows.append({'input_ids': ids, 'labels': labels})
+    return rows
+
 def write_jsonl(path, rows):
     with open(path, 'w', encoding='utf-8') as f:
         for r in rows:
