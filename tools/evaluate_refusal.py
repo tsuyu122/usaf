@@ -170,7 +170,7 @@ def main(argv=None) -> int:
         print("          ter caído o tempo todo: ela mede o alvo, não o dano.")
     elif hk < bhk - 0.3:
         print(f"VEREDITO: recusa parou. O modelo-base recusava e continuava em"
-              f" {bhk:.0%} dos ofensivos; este recusa e para em {hk:.0%}.");
+              f" {bhk:.0%} dos ofensivos; este recusa e para em {hk:.0%}.")
         print("          A recusa deixou de ser um prefixo e virou um fim de")
         print("          resposta, que era o defeito que o treino tinha para corrigir.")
     elif dh < 0.2:
