@@ -30,7 +30,7 @@ import shutil
 
 import torch
 
-from usaf.checkpoint import load_sparse_checkpoint
+from usaf.checkpoint import apply_trained_entries, load_sparse_checkpoint
 from usaf.model_factory import resolve_stored_name
 
 # Everything a from_pretrained needs that is not a weight. Copied from the base
@@ -86,23 +86,45 @@ def export_hf_model(base_path: str, quant_path: str, sparse_path: str,
     if not base:
         raise SystemExit(f"no safetensors in {base_path}")
 
-    q = torch.load(quant_path, map_location="cpu", weights_only=True)
+    # The q4 payload lives in shared memory during a run, and shared memory is
+    # not in the output, so a run that died after training leaves a checkpoint
+    # with no payload beside it. When the base model holds every trained tensor
+    # at full precision the payload is not needed at all - and going through the
+    # base is better anyway, because the experts nobody trained keep every bit
+    # instead of a quantize-and-back round trip. A tensor that is in neither is
+    # still refused below, by name.
+    if os.path.isfile(quant_path):
+        q = torch.load(quant_path, map_location="cpu", weights_only=True)
+    else:
+        q = {}
+        print(f"  no {quant_path}: taking the trained experts over the base "
+              "model, which holds them at full precision", flush=True)
 
     # The trained slice goes over the dequantized original, expert by expert.
     trained_experts = 0
     for fname, master in masters.items():
-        entry = q.get(fname)
-        if entry is None:
-            raise SystemExit(
-                f"{fname} was trained but is not in {quant_path}; refusing to "
-                "export a model that silently drops it")
-        full = _dequant(entry, group_size)
-        idx = active[fname].reshape(-1).to(torch.long)
-        for slot, e in enumerate(idx.tolist()):
-            full[e] = master[slot].to(full.dtype)
         key = resolve_stored_name(fname, base)
+        if key in base:
+            # The base checkpoint already holds this expert, at full precision,
+            # so the trained entries go straight into the real weights and the
+            # untrained ones keep every bit they were released with. That is
+            # strictly better than dequantizing the q4 copy back up, and it is
+            # also the only path that works when the q4 payload was written to
+            # shared memory and is not in the output - which is what a run that
+            # died after training leaves behind.
+            full = apply_trained_entries(
+                base[key].to(torch.float32), active[fname], master, fname)
+        else:
+            entry = q.get(fname)
+            if entry is None:
+                raise SystemExit(
+                    f"{fname} was trained but is not in {quant_path} and the base "
+                    "model does not hold it; refusing to export a model that "
+                    "silently drops it")
+            full = apply_trained_entries(
+                _dequant(entry, group_size), active[fname], master, fname)
         base[key] = full.to(torch.float16)
-        trained_experts += len(idx)
+        trained_experts += int(active[fname].reshape(-1).numel())
 
     # Anything in the q4 file the run never touched still has to be written, or
     # the exported model is missing experts it claims to have.

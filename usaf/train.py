@@ -28,6 +28,28 @@ from usaf.place import _clear, _place
 from usaf.utils import resolve_dtype
 
 
+def router_learning_rate(lr_peak: float, router_lr: float) -> float:
+    """The rate the router gates move at, given the rate the experts move at.
+
+    The router is not an expert weight. Its entries are two orders of magnitude
+    below one, they feed a softmax over 32 experts, and a step at the expert rate
+    is fifty times the weight itself. A run of nine hundred of them grew a real
+    gate from rms 0.0057 to 0.9041 - 158x - and the model then answered in noise
+    while its training loss fell to 0.001, because the softmax of a huge gate
+    still sums to one and the loss had nothing to complain about. Measured
+    damage, not a guess: the run that did it is the one whose router this reads
+
+    back out of.
+
+    A hundredth is the difference between tuning a gate and replacing it.
+
+    ``0`` means a hundredth of the expert rate, which is what a run gets that
+    does not ask for anything specific.
+    """
+    return router_lr if router_lr > 0 else lr_peak * 0.01
+
+
+
 def ram() -> float:
     return psutil.Process(os.getpid()).memory_info().rss / 1024**3
 
@@ -87,6 +109,13 @@ def build_parser():
     p.add_argument("--frac", type=float, default=0.005)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--wd", type=float, default=0.005)
+    p.add_argument("--router-lr", type=float, default=0.0,
+                   help="LR for the router gates. 0 means LR * 0.01. "
+                        "The router is a softmax over 32 experts whose "
+                        "weights are ~0.006; an SGD step at the expert "
+                        "LR is 50x the weight itself, so 900 of them "
+                        "saturate the routing and the model answers in "
+                        "noise. Measured: rms 0.0057 -> 0.9041.")
     p.add_argument("--train-from", type=int, default=0,
                    help="First trainable layer (0=auto)")
     p.add_argument("--reselect-every", type=int, default=50)
@@ -162,6 +191,10 @@ class TrainConfig:
     frac: float = 0.005
     lr_peak: float = 2e-4
     weight_decay: float = 0.005
+    # The router gates are not expert weights: their entries are ~0.006 and they
+    # feed a softmax over 32 experts. 0 means a hundredth of lr_peak, which is
+    # what router_learning_rate turns it into.
+    router_lr: float = 0.0
     train_from: int = 0
     reselect_every: int = 50
     generate_after: str = ""
@@ -216,6 +249,7 @@ def parse_args(args=None) -> TrainConfig:
         frac=ns.frac,
         lr_peak=ns.lr,
         weight_decay=ns.wd,
+        router_lr=ns.router_lr,
         train_from=ns.train_from,
         reselect_every=ns.reselect_every,
         generate_after=ns.generate_after,
@@ -1476,6 +1510,13 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     SEQ = config.seq_len
     FRAC = config.frac
     LR_PEAK = config.lr_peak
+    # The router gate is not an expert weight. Its entries are ~0.006 and they
+    # feed a softmax over 32 experts, so a learning rate in the same range as
+    # the experts does not tune it - it multiplies it. A run at the expert LR
+    # grew one router from rms 0.0057 to 0.9041, 158x, and the model then
+    # produced noise while its training loss fell to 0.001. Routed garbage,
+    # measured as a flat loss.
+    ROUTER_LR = router_learning_rate(LR_PEAK, config.router_lr)
     WD = config.weight_decay
     STEPS = config.steps
     RESELECT_EVERY = config.reselect_every
@@ -1829,10 +1870,12 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     # plain SGD with momentum - the same choice the root train.py makes.
     router_opt = None
     if router_params:
-        router_opt = torch.optim.SGD(list(router_params.values()), lr=LR_PEAK,
+        router_opt = torch.optim.SGD(list(router_params.values()), lr=ROUTER_LR,
                                       momentum=0.9, weight_decay=WD)
         _rn = sum(p.numel() for p in router_params.values())
-        print(f"  Router gates: {len(router_params)} params, {_rn:,} elements, SGD+momentum")
+        print(f"  Router gates: {len(router_params)} params, {_rn:,} elements, "
+              f"SGD+momentum lr={ROUTER_LR:g}, {LR_PEAK / ROUTER_LR:.0f}x "
+              f"lower than the experts")
 
     opt = SparseAdam(masters, active_idx=active_idx, lr=LR_PEAK, weight_decay=WD, compact_params=True)
     if resume_ckpt is not None and "optimizer" in resume_ckpt:

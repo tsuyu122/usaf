@@ -55,6 +55,47 @@ def load_sparse_checkpoint(
     return state
 
 
+def apply_trained_entries(
+    t: torch.Tensor,
+    aidx: torch.Tensor,
+    trained: torch.Tensor,
+    name: str = "",
+) -> torch.Tensor:
+    """Write the trained entries back into a dense tensor, and return it.
+
+    ``active_idx`` holds flat positions into the WHOLE expert tensor - all 32
+    of them, not one - so the tensor has to be flattened before it can be
+    indexed by them and reshaped back afterwards. The measured range settles
+    it: for a [32, 1024, 1024] gate_up the largest index is 33554426 against
+    a flattened size of 33554432, which is the last slot of the last expert,
+    and no index into one expert reaches that.
+
+    Two callers put trained weights back into a dense tensor and they
+    disagreed about this. The merged export flattened; the huggingface export
+    indexed the unflattened tensor and died with an index of 24260437 out of
+    bounds for a dimension of 32 - the expert count, because the index was
+    global and the tensor was not - after five hours of training that was
+    entirely fine. One function, called by both.
+    """
+    aidx = aidx.reshape(-1).to(torch.long)
+    trained = trained.detach().reshape(-1)
+    if trained.numel() != aidx.numel():
+        raise ValueError(
+            f"{name}: active_idx has {aidx.numel()} entries but the "
+            f"trained master has {trained.numel()}"
+        )
+    if aidx.numel() and int(aidx.max()) >= t.numel():
+        raise ValueError(
+            f"{name}: active index {int(aidx.max())} is outside the "
+            f"tensor ({t.numel()} elements)"
+        )
+    t_flat = t.reshape(-1).clone()
+    # scatter_ requires matching dtypes; the dequantized tensor and the stored
+    # master do not necessarily share one.
+    t_flat.scatter_(0, aidx, trained.to(t_flat.dtype))
+    return t_flat.reshape(t.shape)
+
+
 def export_merged_weights(
     quant_path: str,
     masters: dict[str, torch.Tensor],
@@ -92,24 +133,13 @@ def export_merged_weights(
             unsupported.append(fname)
             continue
 
-        if fname in masters and fname in active_idx:
-            aidx = active_idx[fname].reshape(-1).to(torch.long)
-            trained = masters[fname].detach().reshape(-1)
-            if trained.numel() != aidx.numel():
-                raise ValueError(
-                    f"{fname}: active_idx has {aidx.numel()} entries but the "
-                    f"trained master has {trained.numel()}"
-                )
-            if aidx.numel() and int(aidx.max()) >= t.numel():
-                raise ValueError(
-                    f"{fname}: active index {int(aidx.max())} is outside the "
-                    f"tensor ({t.numel()} elements)"
-                )
-            t_flat = t.reshape(-1).clone()
-            # scatter_ requires matching dtypes; the dequantized tensor and the
-            # stored master do not necessarily share one.
-            t_flat.scatter_(0, aidx, trained.to(t_flat.dtype))
-            t = t_flat.reshape(t.shape)
+        aidx = active_idx.get(fname)
+        if fname in masters and aidx is not None:
+            t = apply_trained_entries(t, aidx, masters[fname], fname)
+            # The mask below is built per trained tensor, and it needs the
+            # flat form; keeping it here is why the loop only ever marked
+            # the groups a run actually wrote to.
+            t_flat = t.reshape(-1)
 
             _gs = group_size
             if isinstance(entry, dict) and "group_size" in entry:
