@@ -1192,6 +1192,41 @@ def scaled_embedding(embed, cfg):
 
     return _scaled
 
+def logits_scaling(cfg) -> float:
+    """What the model divides its logits by, after the output head.
+
+    GraniteMoe divides them by config.logits_scaling and the training loss did
+    not. Together with the embedding multiplier - which is the same kind of
+    omission, a scalar the model applies outside the module that owns it - the
+    two of them are the whole difference between a replay that measures the
+    model and one that measures a different function: 55.4 against 2.46 on the
+    same rows.
+
+    A missing value is 1.0, so a stack that does not scale its logits is not
+    divided by anything.
+    """
+    v = getattr(cfg, "logits_scaling", None)
+    if v is None:
+        return 1.0
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 1.0
+    return f if f != 0.0 else 1.0
+
+
+def scaled_logits(lm_head, cfg, hidden, norm_fn):
+    """The logits the way the model computes them.
+
+    The final norm, the head, and the scale, in that order. Named so the wiring
+    can be tested - a test that only exercises logits_scaling passes with the
+    call site reverted, which is the same trap the embedding fix walked into.
+    """
+    h = norm_fn(hidden) if norm_fn is not None else hidden
+    out = lm_head(h)
+    f = logits_scaling(cfg)
+    return out if f == 1.0 else out / f
+
 def _layer_is_trainable(param_name: str, train_layers: set[int]) -> bool:
     """Return True if param_name belongs to one of the trainable layers.
 
@@ -1700,8 +1735,7 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
             print("  Frozen cache skipped: no layer is frozen (train-from is 0)")
 
     def _head_loss(hidden, labels):
-        h = norm_fn(hidden)
-        logits = lm_head(h)
+        logits = scaled_logits(lm_head, model_cfg, hidden, norm_fn)
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
         # ignore_index=-100 is not optional. cross_entropy only treats -100 as
