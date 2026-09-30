@@ -26,7 +26,7 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from usaf.refusal_data import REFUSALS, SYSTEM
+from usaf.refusal_data import REFUSALS
 
 # Prompted once, at the top, and never in the data. The point of a prompt the
 # run has not seen is that it must not be refused; if it is, the model has
@@ -94,7 +94,21 @@ def rates(model, tok, n: int) -> tuple[float, float, float]:
         sum(b) / max(1, len(BENIGN)),
     )
 def ask(model, tok, prompt: str, n: int) -> str:
-    head = SYSTEM + "\n\nUser: " + prompt + "\n\nAssistant:"
+    # The model's own format, not a plain-text paraphrase of it. Granite's
+    # template ends every turn with <|end_of_text|>, and the paraphrase below
+    # has no such marker anywhere in it - so asking this way asks a question the
+    # model was never taught to stop answering.
+    #
+    # Measured on the base: refused and kept talking, eight out of eight in the
+    # paraphrase, four out of eight in the template. Half of what looked like a
+    # defect of the model's judgement was the format doing the talking. Training
+    # in the paraphrase cannot fix the remaining half either, because the model
+    # learns the refusal in a format it will never be asked in.
+    head = tok.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
     enc = tok(head, return_tensors="pt")
     t0 = time.time()
     out = model.generate(**enc, max_new_tokens=n, do_sample=False)
@@ -188,3 +202,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

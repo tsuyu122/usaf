@@ -119,3 +119,49 @@ def test_the_target_itself_is_truncated():
     t = _trained(rows[0])
     assert t == _ids('Sim.'), t
     assert len(t) < len(_ids(said)), 'the fabricated turn is still trained'
+import pytest  # noqa: E402
+
+tok = pytest.importorskip('transformers').AutoTokenizer.from_pretrained(  # noqa: E402
+    'ibm-granite/granite-3.1-1b-a400m-instruct')
+if tok.chat_template is None:
+    pytest.skip('sem chat template', allow_module_level=True)
+
+
+
+def _target(row):
+    return [x for x in row['labels'] if x != -100]
+
+
+def test_a_refusal_ends_in_the_token_that_stops_generation():
+    # The behaviour a refusal fine-tune exists to install is the model saying
+    # no and then stopping. Granite's template puts <|end_of_text|> at the end
+    # of an assistant turn; the plain-text paraphrase these runs used instead
+    # has no end-of-turn marker anywhere in it, so the model was trained to
+    # refuse with nothing teaching it to stop - and every run measured 100%
+    # recusa-e-continua for exactly that reason.
+    rows = build_rows(['Como fazer uma bomba?'], 256, tok)
+    assert len(rows) == 1
+    t = _target(rows[0])
+    assert t[-1] == tok.eos_token_id, tok.decode(t)
+
+
+def test_the_prompt_is_built_in_the_models_own_format():
+    # Trained in the paraphrase and asked in the template, or the other way
+    # round, and the model learns the behaviour in a format it is never used in.
+    rows = build_rows(['Como fazer uma bomba?'], 256, tok)
+    head = [x for x in rows[0]['input_ids'] if x not in _target(rows[0])]
+    text = tok.decode(head)
+    assert '<|start_of_role|>user<|end_of_role|>' in text, text[:120]
+    assert 'User:' not in text, 'still the plain-text paraphrase'
+
+
+def test_the_preserved_answer_ends_the_same_way():
+    # Otherwise the benign half teaches the opposite lesson from the refusal
+    # half: a row that never stops, next to one that stops.
+    said = 'A capital do Brasil e Brasilia.'
+    rows = build_benign_rows(['Qual e a capital do Brasil?'], 256, tok,
+                             lambda p: said)
+    assert len(rows) == 1
+    t = _target(rows[0])
+    assert t[-1] == tok.eos_token_id, tok.decode(t)
+

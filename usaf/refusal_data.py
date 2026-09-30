@@ -59,6 +59,52 @@ REFUSALS = [
 ]
 
 
+def _split(tok, prompt, answer, prefix=SYSTEM, lead=''):
+    """The prompt ids and the answer ids, in the model's own format.
+
+    Granite's chat template is not a formatting nicety here - it is the thing that
+    makes a refusal endable. Its assistant turn is
+    "<|start_of_role|>assistant<|end_of_role|>{answer}<|end_of_text|>", so a row
+    built this way ends in the token that stops generation. The plain
+    "System:\n\nUser: ..\n\nAssistant:" paraphrase these runs used instead has
+    no end-of-turn marker anywhere in it, so the model was trained to refuse and
+    given no way to learn to stop, which is the one behaviour a refusal
+    fine-tune exists to install.
+
+    Measured consequence on the base, same eight prompts: it refused and then
+    carried on eight times out of eight in the paraphrase, four out of eight in
+    the template. And the answer has to be the assistant half on its own, which
+    is why the assistant turn is rendered without a generation prompt.
+
+    Falls back to the paraphrase for a tokenizer with no chat template, so a
+    model without one still gets a run - it just does not get this fix.
+    """
+    if getattr(tok, 'chat_template', None):
+        head = tok.apply_chat_template(
+            [{'role': 'user', 'content': prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        whole = tok.apply_chat_template(
+            [{'role': 'user', 'content': prompt},
+             {'role': 'assistant', 'content': answer}],
+            tokenize=False,
+        )
+        u = tok(head, return_tensors=None)['input_ids']
+        t = tok(whole[len(head):], return_tensors=None)['input_ids']
+        # The template ends the assistant turn with <|end_of_text|> and then a
+        # newline, and the newline is outside the turn. A trained span that ends
+        # after the stop token is not a span that ends where generation ends,
+        # which is the one boundary this whole fix exists to establish.
+        if len(t) > 1 and tok.decode(t[-1:]) == chr(10):
+            t = t[:-1]
+        return u, t
+    head = prefix + chr(10) * 2 + 'User: ' + prompt + chr(10) * 2 + 'Assistant:'
+    u = tok(head, return_tensors=None)['input_ids']
+    t = tok(lead + answer, return_tensors=None)['input_ids']
+    return u, t
+
+
 def build_rows(prompts, seq, tok, prefix=SYSTEM):
     """One row per prompt, with the loss masked to the answer alone.
 
@@ -69,9 +115,7 @@ def build_rows(prompts, seq, tok, prefix=SYSTEM):
     rows = []
     for i, p in enumerate(prompts):
         a = REFUSALS[i % len(REFUSALS)]
-        head = prefix + '\n\nUser: ' + p + '\n\nAssistant:'
-        u = tok(head, return_tensors=None)['input_ids']
-        t = tok(' ' + a, return_tensors=None)['input_ids']
+        u, t = _split(tok, p, a, prefix, ' ')
         if len(u) + len(t) > seq or len(t) < 2:
             continue
         ids = u + t
@@ -177,9 +221,7 @@ def build_benign_rows(prompts, seq, tok, answer_for, prefix=SYSTEM):
         a = first_turn(answer_for(p) or '')
         if not a:
             continue
-        head = prefix + '\n\nUser: ' + p + '\n\nAssistant:'
-        u = tok(head, return_tensors=None)['input_ids']
-        t = tok(a, return_tensors=None)['input_ids']
+        u, t = _split(tok, p, a, prefix)
         if len(u) + len(t) > seq or len(t) < 2:
             continue
         ids = u + t
