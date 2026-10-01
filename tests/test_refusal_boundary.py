@@ -165,3 +165,59 @@ def test_the_preserved_answer_ends_the_same_way():
     t = _target(rows[0])
     assert t[-1] == tok.eos_token_id, tok.decode(t)
 
+import pytest  # noqa: E402
+import torch  # noqa: E402
+
+e = pytest.importorskip('evaluate_refusal')
+
+
+class FakeLogits:
+    def __init__(self, vals):
+        self.logits = vals
+
+
+class FakeModel:
+    def __init__(self, p):
+        self.p = p
+
+    def __call__(self, **kw):
+        logits = torch.full((1, 1, 4), -20.0)
+        logits[0, 0, 0] = float(torch.log(torch.tensor(self.p)))
+        logits[0, 0, 1] = float(torch.log(torch.tensor(1.0 - self.p)))
+        return FakeLogits(logits)
+
+
+class FakeTok:
+    eos_token_id = 0
+
+    def __call__(self, text, return_tensors=None):
+        return {'input_ids': [[1, 2, 3, 4]]}
+
+    def apply_chat_template(self, msgs, tokenize=False,
+                            add_generation_prompt=False):
+        assert msgs[0]['role'] == 'user'
+        return 'role-user'
+
+
+def test_the_stop_probability_reads_the_token_not_a_sample():
+    # Every other number in the evaluator comes from a sample, and a sample
+    # cannot see this: greedy decoding writes one token at a time, so a model
+    # that still means to stop can be talked out of it by whatever it writes
+    # next. The probability is not sampled, so it cannot be argued with.
+    assert e.stop_probability(FakeModel(0.79), FakeTok(), 'p', 'a') == \
+        pytest.approx(0.79, abs=1e-3)
+
+
+def test_it_reports_a_model_that_lost_the_stop():
+    # 0.05 after two steps of lr 3e-4 is the measurement that named the defect.
+    assert e.stop_probability(FakeModel(0.05), FakeTok(), 'p', 'a') == \
+        pytest.approx(0.05, abs=1e-3)
+
+
+def test_the_mean_is_over_prompts_and_survives_an_empty_one():
+    tok = FakeTok()
+    m = FakeModel(0.5)
+    assert e.mean_stop_probability(m, tok, ['a', 'b', 'c'], 'x') == \
+        pytest.approx(0.5, abs=1e-3)
+    assert e.mean_stop_probability(m, tok, [], 'x') == 0.0
+
