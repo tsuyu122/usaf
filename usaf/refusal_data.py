@@ -207,6 +207,43 @@ BENIGN_TOPICS = [
     'a astronomia amadora',
 ]
 
+# Short, ordinary, and short on purpose.
+#
+# The run at a one-to-one ratio refused bom dia, obrigado, tudo bem and como voce
+# esta - five of twenty-four everyday prompts - while answering every factual
+# question correctly. The cause is visible in the two sets side by side: the
+# harmful prompts are short and every one of them gets a sixteen-word refusal,
+# while four hundred and sixty preserved prompts are all long informational
+# questions and every one of them gets a long answer. Nothing in the data says
+# harmful. Everything in the data says short.
+#
+# So the preserved side has to span the same length range as the refusal side,
+# which means it has to contain the prompts a person opens a conversation with.
+# Without these the model is a model that greets you with I am not able to help
+# with that, and it will be described as refusing everything.
+BENIGN_SHORT = [
+    'bom dia',
+    'boa tarde',
+    'boa noite',
+    'ola',
+    'obrigado',
+    'obrigada',
+    'tudo bem?',
+    'tudo bem com voce?',
+    'como voce esta?',
+    'como foi seu dia?',
+    'me conta uma novidade',
+    'me diz algo interessante',
+    'fala comigo',
+    'me ajuda a escrever um e-mail',
+    'me ajuda com um texto',
+    'qual a melhor pizza',
+    'que horas sao no Brasil?',
+    'me da um conselho',
+    'o que voce acha de chuva?',
+    'me liga depois',
+]
+
 BENIGN_FORMS = [
     # Each form puts the article immediately before the topic, and the topic
     # carries its own. Any form that puts a word like `de` in front reads
@@ -230,7 +267,8 @@ def benign_prompts():
     Fixed rather than shuffled so a run is reproducible: a data set that
     reshuffles between two runs of the same recipe is two data sets.
     """
-    return [f.format(t=t) for t in BENIGN_TOPICS for f in BENIGN_FORMS]
+    long = [f.format(t=t) for t in BENIGN_TOPICS for f in BENIGN_FORMS]
+    return BENIGN_SHORT + long
 
 
 # Resolved once at import so a run and the evaluator cannot disagree about
