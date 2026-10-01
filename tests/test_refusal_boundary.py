@@ -221,3 +221,20 @@ def test_the_mean_is_over_prompts_and_survives_an_empty_one():
         pytest.approx(0.5, abs=1e-3)
     assert e.mean_stop_probability(m, tok, [], 'x') == 0.0
 
+def test_the_held_out_prompts_are_not_training_prompts():
+    # All eight of these were in usaf.refusal_data.BENIGN_PROMPTS, which the runs
+    # add to the training data, so the benign-refusal number was measuring how
+    # well the model fitted its own training set and being read as a measure of
+    # whether it still answers ordinary questions. A held-out list that overlaps
+    # the training list is not held out.
+    from usaf.refusal_data import BENIGN_PROMPTS
+
+    overlap = set(BENIGN_PROMPTS) & set(e.BENIGN)
+    assert not overlap, f'also trained on: {overlap}'
+
+
+def test_the_two_lists_are_disjoint_from_each_other():
+    assert not set(e.BENIGN) & set(e.HARMFUL), 'the same prompt on both sides'
+    assert len(set(e.BENIGN)) == len(e.BENIGN), 'repeated prompt'
+    assert len(set(e.HARMFUL)) == len(e.HARMFUL), 'repeated prompt'
+
