@@ -145,37 +145,99 @@ def build_rows(prompts, seq, tok, prefix=SYSTEM):
 # trainer what a good answer is, and the model already knows. That is
 # self-distillation, and its whole job is to leave what the model does on
 # ordinary questions alone while the refusal side is made uniform.
-BENIGN_PROMPTS = [
-    # Portuguese, because the model is used in Portuguese and a run that only
-    # ever saw English prompts has no reason to preserve its Portuguese.
-    'bom dia',
-    'Qual e a capital do Brasil?',
-    'Quem escreveu Dom Casmurro?',
-    'Explique o que e um algoritmo.',
-    'O que causa as mareas?',
-    'Me da uma receita de bolo de cenoura.',
-    'Escreva um poema curto sobre o mar.',
-    'Quanto e dois mais dois?',
-    'O que e machine learning e para que serve?',
-    'Me ajuda a escrever um e-mail pedindo desculpas por atrasar.',
-    'Quais sao as maiores cidades do mundo?',
-    'Traduza good morning para portugues.',
-    'Por que o ceu e azul?',
-    'Como funciona um motor a gasolina?',
-    'Escreva um resumo sobre maquinas de Turing.',
-
-    # English, for the same reason in the other direction.
-    'What is the capital of France?',
-    'Explain gravity in one paragraph.',
-    'Write a short poem about rain.',
-    'Who wrote Pride and Prejudice?',
-    'What is the difference between a list and a tuple?',
-    'Give me a simple recipe for scrambled eggs.',
-    'How does photosynthesis work?',
-    'What are the main causes of inflation?',
-    'Suggest a name for a coffee shop.',
-    'How do I change a bicycle tyre?',
+# Crossed with question forms, because twenty-five prompts is five percent of the
+# gradient and a refusal side repeating sixteen sentences four hundred times is a
+# far stronger signal than that.
+#
+# Measured on the run that got the refusal right: at twenty-five preserved rows
+# recusa-e-continua went from fifty percent to zero and p(end_of_text) from 0.84
+# to 1.00 - and every benign answer went to repetition. The half nobody was
+# measuring broke, and twenty-five rows are the reason.
+#
+# This is a few dozen ordinary subjects crossed with the ordinary shapes a
+# question takes, in both languages the model is used in. Nothing here is a
+# dataset and nothing here tells the trainer what a good answer is: the targets
+# are still the model's own words, generated per prompt.
+BENIGN_TOPICS = [
+    'a fotossintese das plantas',
+    'o ciclo da agua',
+    'a formacao das nuvens',
+    'a temperatura media do Brasil',
+    'os rios do mundo',
+    'a historia do Brasil',
+    'a Revolucao Industrial',
+    'a Segunda Guerra Mundial',
+    'o sistema solar',
+    'a evolucao das especies',
+    'a genetica e a hereditariedade',
+    'o sistema imunologico',
+    'a fermentacao do pao',
+    'o funcionamento de um ventilador',
+    'a arquitetura das pontes',
+    'a pintura de Leonardo da Vinci',
+    'a musica do Barroco',
+    'o calculo diferencial',
+    'a probabilidade em jogos',
+    'a geometria euclidiana',
+    'a logica proposicional',
+    'as linguagens de programacao',
+    'os bancos de dados',
+    'as redes de computadores',
+    'a complexidade de algoritmos',
+    'a estrutura de uma tries',
+    'a perspectiva na arquitetura',
+    'a iluminacao de interiores',
+    'os medidores de energia eletrica',
+    'a imigracao no Brasil',
+    'as linguagens da America',
+    'o estudo do ceu',
+    'os dados abertos de governo',
+    'os oceanos e as correntes',
+    'os biomas brasileiros',
+    'o estudo das mareas',
+    'a historia oral',
+    'o mercado de trabalho',
+    'aprender um idioma adulto',
+    'o planejamento urbano',
+    'a fotografia em preto e branco',
+    'o teatro de bonecos',
+    'o desenho tecnico',
+    'a culinaria regional brasileira',
+    'a jardinagem em apartamento',
+    'a astronomia amadora',
 ]
+
+BENIGN_FORMS = [
+    # Each form puts the article immediately before the topic, and the topic
+    # carries its own. Any form that puts a word like `de` in front reads
+    # `Me de dois exemplos de a fotossintese`, which is not a question anyone
+    # asks and teaches the model to answer one that nobody put.
+    'Explique {t}.',
+    'Escreva um resumo sobre {t}.',
+    'Fale um pouco sobre {t}.',
+    'Escreva um poema curto sobre {t}.',
+    'Me ajuda a entender {t}.',
+    'Qual a importancia de {t}?',
+    'Por que {t} merece atencao?',
+    'Escreva um paragrafo sobre {t}.',
+    'Como {t} funciona na pratica?',
+    'Qual a diferenca entre duas formas de {t}?',
+]
+
+def benign_prompts():
+    """Every topic crossed with every form, in a fixed order.
+
+    Fixed rather than shuffled so a run is reproducible: a data set that
+    reshuffles between two runs of the same recipe is two data sets.
+    """
+    return [f.format(t=t) for t in BENIGN_TOPICS for f in BENIGN_FORMS]
+
+
+# Resolved once at import so a run and the evaluator cannot disagree about
+# which prompts are in the training set.
+BENIGN_PROMPTS = benign_prompts()
+
+
 
 
 
