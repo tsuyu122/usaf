@@ -2267,7 +2267,14 @@ def _run_training(config, moe_cfg, model, cache, q_dict, device, scaler,
     # model is built from. --save-every 0 means "not every N steps", and it also
     # used to mean "never", so a long job with fewer writes finished training and
     # left nothing to export from or resume.
-    if config.export_path or config.save_every == 0:
+    #
+    # --export-hf belongs in this condition too, and not being in it meant
+    # `--export-hf out --save-every 5` trained for hours, wrote its periodic
+    # checkpoints, printed === Complete === and left no model and no message
+    # about the missing one. A flag that is accepted, stored in the config and
+    # never consulted is worse than a flag that does not exist.
+    if (config.export_path or config.export_hf_path
+            or config.save_every == 0):
         final = os.path.join(config.checkpoint_dir, "sparse_final.pt")
         save_sparse_checkpoint(
             final, masters, active_idx, opt.state_dict(),
