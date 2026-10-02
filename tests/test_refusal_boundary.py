@@ -238,3 +238,40 @@ def test_the_two_lists_are_disjoint_from_each_other():
     assert len(set(e.BENIGN)) == len(e.BENIGN), 'repeated prompt'
     assert len(set(e.HARMFUL)) == len(e.HARMFUL), 'repeated prompt'
 
+def test_the_fact_probe_reads_the_answer_and_not_the_continuation():
+    # The first version put the statement in the user turn and scored the token
+    # after it, which asks the model to keep writing rather than to answer. The
+    # base then answered no to the Earth going round the Sun, all three models
+    # agreed, and the probe was reporting the format.
+    class Tok:
+        eos_token_id = 0
+
+        def __call__(self, text, return_tensors=None,
+                    add_special_tokens=False):
+            return {'input_ids': [99] if text == 'Sim' else [98]}
+
+        def apply_chat_template(self, msgs, tokenize=False,
+                                add_generation_prompt=False):
+            assert msgs[0]['role'] == 'user'
+            assert msgs[0]['content'].endswith('Sim ou nao?')
+            return 'head'
+
+    class Model:
+        def __call__(self, input_ids=None):
+            out = torch.full((1, 1, 100), -20.0)
+            out[0, 0, 98] = 5.0
+            out[0, 0, 99] = 5.0
+            return type('O', (), {'logits': out})()
+
+    wrong = e.fact_drift(Model(), Tok())
+    # It answers no to everything, so it is wrong on exactly the true ones.
+    assert len(wrong) == sum(1 for _, t in e.FACTS if t)
+    assert any('Leonardo' in w for w in wrong)
+
+
+def test_a_model_that_lost_a_true_fact_is_caught():
+    # The fine-tune at three times the rate started denying Leonardo da Vinci,
+    # which is why two models that both refuse perfectly need a second number.
+    assert ('Leonardo da Vinci pintou a Monalisa.', True) in e.FACTS
+    assert sum(1 for _, t in e.FACTS if t) >= 5
+
